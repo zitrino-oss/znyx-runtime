@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Python runtime dependencies
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "python"]
+
+  # GitHub Actions used in workflows
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "ci"]
+
+  # Base image in the Dockerfile
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "docker"]
+
+  # npm wrapper
+  - package-ecosystem: npm
+    directory: "/npm-runtime"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "npm"]

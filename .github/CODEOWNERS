@@ -1,0 +1,9 @@
+# Default owners for everything in the repo.
+# Requires the @zitrino-oss/maintainers team to exist in the org.
+*       @zitrino-oss/maintainers
+
+# Security-sensitive areas — keep explicit ownership.
+/.github/                 @zitrino-oss/maintainers
+/SECURITY.md              @zitrino-oss/maintainers
+/app/runtime/api/         @zitrino-oss/maintainers
+/app/shared/licensing/    @zitrino-oss/maintainers
