@@ -6,6 +6,7 @@ and field-level error reporting for structured output contracts.
 """
 import json
 import re
+# nosemgrep: python.lang.security.use-defused-xml.use-defused-xml -- ET is used only for the ET.ParseError exception type; all parsing goes through defusedxml (safe_xml_fromstring) below.
 import xml.etree.ElementTree as ET
 # Untrusted model output is parsed here: defusedxml hardens against XXE and
 # entity-expansion ("billion laughs") DoS that the stdlib parser is exposed to.
