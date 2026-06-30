@@ -1,0 +1,310 @@
+# Regional PII benchmark corpus v1.1 - labelled samples for every regional
+# identifier added in roadmap item #11.
+#
+# Coverage target (from roadmap line 1291):
+#   3+ positive samples AND 3+ near-miss negatives per shipped pattern.
+#
+# Acceptance criteria:
+#   recall >= 0.95 on positives
+#   false-positive rate <= 0.01 on negatives (ANY regional hit counts as FP)
+#
+# Run via: tests/test_regional_pii_benchmark.py
+
+dataset_name: regional-pii-v1.1
+version: 2
+created: 2026-04-19
+
+# =================================================================
+# POSITIVE SAMPLES - every pattern has at least 3. Checksum-validated
+# types use generated valid vectors (see scripts/gen_test_vectors.py).
+# =================================================================
+positive_samples:
+  # ---------- India: PAN ----------
+  - { id: in_pan-1, identifier_type: in_pan, text: "PAN: ABCPD1234E" }
+  - { id: in_pan-2, identifier_type: in_pan, text: "Customer PAN ABCTY9876K on file" }
+  - { id: in_pan-3, identifier_type: in_pan, text: "Please share your PAN (e.g. ZXCVB1111Q) for KYC" }
+  # ---------- India: Aadhaar ----------
+  - { id: in_aadhaar-1, identifier_type: in_aadhaar, text: "Aadhaar 2341 2341 2346" }
+  - { id: in_aadhaar-2, identifier_type: in_aadhaar, text: "Verified against Aadhaar 246813579019" }
+  - { id: in_aadhaar-3, identifier_type: in_aadhaar, text: "UIDAI number 3579 1113 1733 stored" }
+  # ---------- India: GSTIN ----------
+  - { id: in_gstin-1, identifier_type: in_gstin, text: "GSTIN 27AAPFU0939F1ZV" }
+  - { id: in_gstin-2, identifier_type: in_gstin, text: "Vendor GST 29ABCDE1234F1Z5 for the Maharashtra office" }
+  - { id: in_gstin-3, identifier_type: in_gstin, text: "Our registered GSTIN is 07AABCU9603R1ZN" }
+  # ---------- India: DIN ----------
+  - { id: in_din-1, identifier_type: in_din, text: "DIN 12345678 on the board resolution" }
+  - { id: in_din-2, identifier_type: in_din, text: "Director DIN: 87654321 as per MCA records" }
+  - { id: in_din-3, identifier_type: in_din, text: "din 00012345 listed in the Form DIR-12" }
+  # ---------- India: IFSC ----------
+  - { id: in_ifsc-1, identifier_type: in_ifsc, text: "IFSC HDFC0000001 for NEFT transfer" }
+  - { id: in_ifsc-2, identifier_type: in_ifsc, text: "Bank code SBIN0001234 attached to the account" }
+  - { id: in_ifsc-3, identifier_type: in_ifsc, text: "Use ICIC0000456 as the RTGS identifier" }
+  # ---------- India: UPI ----------
+  - { id: in_upi-1, identifier_type: in_upi, text: "Pay to alice@okhdfcbank via UPI" }
+  - { id: in_upi-2, identifier_type: in_upi, text: "My handle is bob123@paytm" }
+  - { id: in_upi-3, identifier_type: in_upi, text: "VPA charlie_45@axisbank - please collect" }
+
+  # ---------- UK: NINO ----------
+  - { id: uk_nino-1, identifier_type: uk_nino, text: "NINO AB123456C recorded" }
+  - { id: uk_nino-2, identifier_type: uk_nino, text: "NI number JH654321A on the P45" }
+  - { id: uk_nino-3, identifier_type: uk_nino, text: "Please confirm NI PS112233D for HMRC" }
+  # ---------- UK: UTR ----------
+  - { id: uk_utr-1, identifier_type: uk_utr, text: "UTR 1234567890 on the tax return" }
+  - { id: uk_utr-2, identifier_type: uk_utr, text: "utr: 9876543210 per HMRC" }
+  - { id: uk_utr-3, identifier_type: uk_utr, text: "Self-assessment UTR 1122334455 filed" }
+  # ---------- UK: NHS ----------
+  - { id: uk_nhs-1, identifier_type: uk_nhs, text: "NHS 943 476 5919" }
+  - { id: uk_nhs-2, identifier_type: uk_nhs, text: "Patient NHS number 102 030 4057" }
+  - { id: uk_nhs-3, identifier_type: uk_nhs, text: "Referral for NHS 246 800 2466" }
+  # ---------- UK: VAT ----------
+  - { id: uk_vat-1, identifier_type: uk_vat, text: "VAT GB123456789 on the invoice" }
+  - { id: uk_vat-2, identifier_type: uk_vat, text: "Supplier GB987654321 registered" }
+  - { id: uk_vat-3, identifier_type: uk_vat, text: "EU cross-border GB 555444333 verified" }
+
+  # ---------- EU: VAT (DE/FR/IT/NL/ES/BE) ----------
+  - { id: de_vat-1, identifier_type: de_vat, text: "Germany VAT DE123456789" }
+  - { id: de_vat-2, identifier_type: de_vat, text: "Berlin office DE987654321 on file" }
+  - { id: de_vat-3, identifier_type: de_vat, text: "DE 246813579 listed by Finanzamt" }
+  - { id: fr_vat-1, identifier_type: fr_vat, text: "France VAT FRAB123456789" }
+  - { id: fr_vat-2, identifier_type: fr_vat, text: "Paris HQ FR 12 345678901 verified" }
+  - { id: fr_vat-3, identifier_type: fr_vat, text: "FR99 987654321 from the e-invoice" }
+  - { id: it_vat-1, identifier_type: it_vat, text: "Italy VAT IT12345678901" }
+  - { id: it_vat-2, identifier_type: it_vat, text: "Milan HQ IT 98765432109" }
+  - { id: it_vat-3, identifier_type: it_vat, text: "Partita IVA IT11223344556" }
+  - { id: nl_vat-1, identifier_type: nl_vat, text: "Netherlands VAT NL123456789B01" }
+  - { id: nl_vat-2, identifier_type: nl_vat, text: "Amsterdam NL 987654321B02" }
+  - { id: nl_vat-3, identifier_type: nl_vat, text: "BTW number NL112233445B03" }
+  - { id: es_vat-1, identifier_type: es_vat, text: "Spain VAT ESA1234567B" }
+  - { id: es_vat-2, identifier_type: es_vat, text: "Madrid office ES B87654321" }
+  - { id: es_vat-3, identifier_type: es_vat, text: "ES X2345678C from AEAT portal" }
+  - { id: be_vat-1, identifier_type: be_vat, text: "Belgium VAT BE0123456789" }
+  - { id: be_vat-2, identifier_type: be_vat, text: "Brussels HQ BE 0987654321" }
+  - { id: be_vat-3, identifier_type: be_vat, text: "BTW BE0112233445" }
+  # ---------- EU: BSN ----------
+  - { id: nl_bsn-1, identifier_type: nl_bsn, text: "Dutch BSN 123456782" }
+  - { id: nl_bsn-2, identifier_type: nl_bsn, text: "Patient BSN 111222333 on file" }
+  - { id: nl_bsn-3, identifier_type: nl_bsn, text: "Customer BSN 234567880 confirmed" }
+  # ---------- EU: Italy Codice Fiscale ----------
+  - { id: it_cf-1, identifier_type: it_cf, text: "CF RSSMRA85M01H501Z" }
+  - { id: it_cf-2, identifier_type: it_cf, text: "Codice Fiscale BNCGVN90A01F205Q" }
+  - { id: it_cf-3, identifier_type: it_cf, text: "C.F. VRDLSS80H15L736X" }
+  # ---------- EU: Denmark CPR ----------
+  - { id: dk_cpr-1, identifier_type: dk_cpr, text: "CPR 150570-1234" }
+  - { id: dk_cpr-2, identifier_type: dk_cpr, text: "CPR 010185-9876" }
+  - { id: dk_cpr-3, identifier_type: dk_cpr, text: "Patient CPR 241292-5678" }
+  # ---------- EU: Romania CNP ----------
+  - { id: ro_cnp-1, identifier_type: ro_cnp, text: "Romanian CNP 1920401123456" }
+  - { id: ro_cnp-2, identifier_type: ro_cnp, text: "Client CNP 2850715234567" }
+  - { id: ro_cnp-3, identifier_type: ro_cnp, text: "Customer CNP 5010101345678" }
+  # ---------- EU: Poland PESEL ----------
+  - { id: pl_pesel-1, identifier_type: pl_pesel, text: "PESEL 44051401358" }
+  - { id: pl_pesel-2, identifier_type: pl_pesel, text: "Customer PESEL 85021512345" }
+  - { id: pl_pesel-3, identifier_type: pl_pesel, text: "Employee PESEL 92030567891" }
+  # ---------- EU: Greece AMKA ----------
+  - { id: gr_amka-1, identifier_type: gr_amka, text: "Greek AMKA 15057012345" }
+  - { id: gr_amka-2, identifier_type: gr_amka, text: "Patient AMKA 01018598765" }
+  - { id: gr_amka-3, identifier_type: gr_amka, text: "Insurance AMKA 24129267890" }
+
+  # ---------- APAC: Singapore NRIC ----------
+  - { id: sg_nric-1, identifier_type: sg_nric, text: "NRIC S1234567D" }
+  - { id: sg_nric-2, identifier_type: sg_nric, text: "FIN T9876543A on the pass" }
+  - { id: sg_nric-3, identifier_type: sg_nric, text: "Employee G5566778Z verified" }
+  # ---------- APAC: Malaysia IC ----------
+  - { id: my_ic-1, identifier_type: my_ic, text: "Malaysian IC 850101-14-1234" }
+  - { id: my_ic-2, identifier_type: my_ic, text: "Customer MyKad 920315-08-5678" }
+  - { id: my_ic-3, identifier_type: my_ic, text: "Staff IC 751230-06-9012" }
+  # ---------- APAC: Thailand ID ----------
+  - { id: th_id-1, identifier_type: th_id, text: "Thai ID 1-2345-67890-12-3" }
+  - { id: th_id-2, identifier_type: th_id, text: "Passport-linked Thai ID 3-7890-12345-67-8" }
+  - { id: th_id-3, identifier_type: th_id, text: "Citizen ID 5-5544-33221-11-9" }
+  # ---------- APAC: Philippines TIN ----------
+  - { id: ph_tin-1, identifier_type: ph_tin, text: "PH TIN 123-456-789-000" }
+  - { id: ph_tin-2, identifier_type: ph_tin, text: "BIR TIN 987-654-321-000" }
+  - { id: ph_tin-3, identifier_type: ph_tin, text: "Tax ID 555-444-333-001" }
+  # ---------- APAC: Indonesia KTP ----------
+  - { id: id_ktp-1, identifier_type: id_ktp, text: "Indonesian NIK 3201010101900001" }
+  - { id: id_ktp-2, identifier_type: id_ktp, text: "KTP 3174041505850123" }
+  - { id: id_ktp-3, identifier_type: id_ktp, text: "KTP nomor 1234561507890456" }
+  # ---------- APAC: Taiwan ID ----------
+  - { id: tw_id-1, identifier_type: tw_id, text: "Taiwan ID A123456789" }
+  - { id: tw_id-2, identifier_type: tw_id, text: "TW ROC ID B287654321" }
+  - { id: tw_id-3, identifier_type: tw_id, text: "National ID F198765432" }
+  # ---------- APAC: Japan MyNumber ----------
+  - { id: jp_mynumber-1, identifier_type: jp_mynumber, text: "MyNumber 1234 5678 9012" }
+  - { id: jp_mynumber-2, identifier_type: jp_mynumber, text: "Employee MyNumber: 987654321098" }
+  - { id: jp_mynumber-3, identifier_type: jp_mynumber, text: "個人番号 1122 3344 5566" }
+  # ---------- APAC: AU TFN (keyword-anchored) ----------
+  - { id: au_tfn-1, identifier_type: au_tfn, text: "TFN 123 456 782" }
+  - { id: au_tfn-2, identifier_type: au_tfn, text: "tfn: 112233443" }
+  - { id: au_tfn-3, identifier_type: au_tfn, text: "TFN#987654338" }
+  # ---------- APAC: AU ABN (keyword-anchored) ----------
+  - { id: au_abn-1, identifier_type: au_abn, text: "ABN 51 824 753 556" }
+  - { id: au_abn-2, identifier_type: au_abn, text: "ABN: 95678901234" }
+  - { id: au_abn-3, identifier_type: au_abn, text: "abn 53 456 789 012" }
+  # ---------- APAC: AU ACN (keyword-anchored) ----------
+  - { id: au_acn-1, identifier_type: au_acn, text: "ACN 005 036 117" }
+  - { id: au_acn-2, identifier_type: au_acn, text: "ACN: 123456780" }
+  - { id: au_acn-3, identifier_type: au_acn, text: "acn 987 654 320" }
+  # ---------- APAC: Hong Kong HKID ----------
+  - { id: hk_id-1, identifier_type: hk_id, text: "HKID A123456(7)" }
+  - { id: hk_id-2, identifier_type: hk_id, text: "Card AB987654(3)" }
+  - { id: hk_id-3, identifier_type: hk_id, text: "ID Z555443(2)" }
+
+  # ---------- Americas: Canada SIN (keyword-anchored) ----------
+  - { id: ca_sin-1, identifier_type: ca_sin, text: "SIN 046-454-286" }
+  - { id: ca_sin-2, identifier_type: ca_sin, text: "SIN: 123456782" }
+  - { id: ca_sin-3, identifier_type: ca_sin, text: "NAS 876 543 216" }
+  # ---------- Americas: Brazil CPF ----------
+  - { id: br_cpf-1, identifier_type: br_cpf, text: "CPF 111.444.777-35" }
+  - { id: br_cpf-2, identifier_type: br_cpf, text: "Cliente CPF 234.567.890-92" }
+  - { id: br_cpf-3, identifier_type: br_cpf, text: "CPF 987.654.321-00 na base" }
+  # ---------- Americas: Brazil CNPJ ----------
+  - { id: br_cnpj-1, identifier_type: br_cnpj, text: "CNPJ 11.222.333/0001-81" }
+  - { id: br_cnpj-2, identifier_type: br_cnpj, text: "Fornecedor CNPJ 23.456.789/0001-95" }
+  - { id: br_cnpj-3, identifier_type: br_cnpj, text: "Empresa CNPJ 98.765.432/0001-98" }
+  # ---------- Americas: Mexico CURP ----------
+  - { id: mx_curp-1, identifier_type: mx_curp, text: "CURP BADD110313HCMLNS09" }
+  - { id: mx_curp-2, identifier_type: mx_curp, text: "CURP RAMJ850410HDFMRR01" }
+  - { id: mx_curp-3, identifier_type: mx_curp, text: "Cliente CURP GONZ920515MDFRMR09" }
+  # ---------- Americas: Mexico RFC ----------
+  - { id: mx_rfc-1, identifier_type: mx_rfc, text: "RFC RAMJ850410K08" }
+  - { id: mx_rfc-2, identifier_type: mx_rfc, text: "Proveedor RFC ABCD120101AB9" }
+  - { id: mx_rfc-3, identifier_type: mx_rfc, text: "Empresa RFC XEXX010101000" }
+  # ---------- Americas: Spain NIF ----------
+  - { id: es_nif-1, identifier_type: es_nif, text: "NIF 12345678Z" }
+  - { id: es_nif-2, identifier_type: es_nif, text: "Cliente DNI 87654321X" }
+  - { id: es_nif-3, identifier_type: es_nif, text: "NIF 23456789D en el registro" }
+
+# =================================================================
+# NEGATIVE SAMPLES - 3 per pattern, crafted to be near-miss (wrong
+# checksum, wrong format, missing keyword for anchor-required types).
+# Strict FPR: no regional rule may fire on any of these.
+# =================================================================
+negative_samples:
+  # ---------- India ----------
+  - { id: n-in_pan-1, identifier_types: [in_pan], text: "Random code A1B2C3D4E5" }             # wrong PAN shape
+  - { id: n-in_pan-2, identifier_types: [in_pan], text: "SKU ABCDE12345" }                     # missing trailing letter
+  - { id: n-in_pan-3, identifier_types: [in_pan], text: "Product ABC1234DEF" }                 # wrong positional split
+  - { id: n-in_aadhaar-1, identifier_types: [in_aadhaar], text: "Ticket 1234 5678 9012" }      # fails Verhoeff
+  - { id: n-in_aadhaar-2, identifier_types: [in_aadhaar], text: "Order 1111 2222 3333" }      # fails Verhoeff
+  - { id: n-in_aadhaar-3, identifier_types: [in_aadhaar], text: "Batch 9999 8888 7777" }      # fails Verhoeff
+  - { id: n-in_gstin-1, identifier_types: [in_gstin], text: "Batch 27AAPFU0939F1XV" }          # position-14 must be Z
+  - { id: n-in_gstin-2, identifier_types: [in_gstin], text: "Code 27AAPFU0939F1A5" }           # still not Z at pos 14
+  - { id: n-in_gstin-3, identifier_types: [in_gstin], text: "Item XX27AAPF0939F1ZV" }          # wrong prefix shape
+  - { id: n-in_din-1, identifier_types: [in_din], text: "Invoice 12345678" }                   # no DIN keyword
+  - { id: n-in_din-2, identifier_types: [in_din], text: "SKU 87654321 fulfilled" }             # no DIN keyword
+  - { id: n-in_din-3, identifier_types: [in_din], text: "Order 00012345 confirmed" }           # no DIN keyword
+  - { id: n-in_ifsc-1, identifier_types: [in_ifsc], text: "Code HDFC1000001" }                 # position-5 must be 0
+  - { id: n-in_ifsc-2, identifier_types: [in_ifsc], text: "Code HDFC00000" }                   # too short
+  - { id: n-in_ifsc-3, identifier_types: [in_ifsc], text: "Code hdfc0000001" }                 # lowercase prefix
+  - { id: n-in_upi-1, identifier_types: [in_upi], text: "email alice@company.com" }            # handle has a dot → excluded
+  - { id: n-in_upi-2, identifier_types: [in_upi], text: "chat with @alice" }                   # no VPA shape
+  - { id: n-in_upi-3, identifier_types: [in_upi], text: "send @hn" }                           # insufficient handle
+
+  # ---------- UK ----------
+  - { id: n-uk_nino-1, identifier_types: [uk_nino], text: "ID ab12 34 56 c" }                  # lowercase
+  - { id: n-uk_nino-2, identifier_types: [uk_nino], text: "Ticket AB 12 34 56 E" }             # suffix must be A-D
+  - { id: n-uk_nino-3, identifier_types: [uk_nino], text: "Code DFAB123456C" }                 # disallowed first letter
+  # UTR negatives must not accidentally pass the NHS mod-11 check.
+  - { id: n-uk_utr-1, identifier_types: [uk_utr], text: "Invoice 1234567891" }                 # no UTR keyword, fails NHS mod-11
+  - { id: n-uk_utr-2, identifier_types: [uk_utr], text: "Tracking 9876543212 shipped" }        # no UTR keyword, fails NHS mod-11
+  - { id: n-uk_utr-3, identifier_types: [uk_utr], text: "Ref 1122334456" }                     # no UTR keyword, fails NHS mod-11
+  - { id: n-uk_nhs-1, identifier_types: [uk_nhs], text: "Ticket 111 222 3334" }                # fails mod-11
+  - { id: n-uk_nhs-2, identifier_types: [uk_nhs], text: "Code 999 888 7776" }                  # fails mod-11
+  - { id: n-uk_nhs-3, identifier_types: [uk_nhs], text: "Seq 555 666 7771" }                   # fails mod-11
+  - { id: n-uk_vat-1, identifier_types: [uk_vat], text: "Item GB12345" }                       # too short
+  - { id: n-uk_vat-2, identifier_types: [uk_vat], text: "Code gb123456789" }                   # lowercase prefix
+  - { id: n-uk_vat-3, identifier_types: [uk_vat], text: "Ref EU123456789" }                    # wrong country prefix
+
+  # ---------- EU ----------
+  - { id: n-de_vat-1, identifier_types: [de_vat], text: "Item DE12345678" }                    # only 8 digits
+  - { id: n-de_vat-2, identifier_types: [de_vat], text: "Code de123456789" }                   # lowercase
+  - { id: n-de_vat-3, identifier_types: [de_vat], text: "Ref DE1234567890" }                   # 10 digits, too long
+  - { id: n-fr_vat-1, identifier_types: [fr_vat], text: "Item FR12345678" }                    # too short
+  - { id: n-fr_vat-2, identifier_types: [fr_vat], text: "Code FRI9012345678" }                 # disallowed letter I in header
+  - { id: n-fr_vat-3, identifier_types: [fr_vat], text: "Ref fr12345678901" }                  # lowercase prefix
+  - { id: n-it_vat-1, identifier_types: [it_vat], text: "Item IT1234567890" }                  # only 10 digits
+  - { id: n-it_vat-2, identifier_types: [it_vat], text: "Code it12345678901" }                 # lowercase
+  - { id: n-it_vat-3, identifier_types: [it_vat], text: "Ref IT123456789012" }                 # 12 digits too long
+  - { id: n-nl_vat-1, identifier_types: [nl_vat], text: "Item NL12345B01" }                    # too short
+  - { id: n-nl_vat-2, identifier_types: [nl_vat], text: "Code nl123456789b01" }                # lowercase prefix
+  - { id: n-nl_vat-3, identifier_types: [nl_vat], text: "Ref NL123456789C01" }                 # must be B
+  - { id: n-es_vat-1, identifier_types: [es_vat], text: "Item ES1234567" }                     # only 7 digits after prefix
+  - { id: n-es_vat-2, identifier_types: [es_vat], text: "Code es A1234567B" }                  # lowercase prefix
+  - { id: n-es_vat-3, identifier_types: [es_vat], text: "Ref ES123456789A" }                   # digits + trailing letter, wrong length
+  - { id: n-be_vat-1, identifier_types: [be_vat], text: "Item BE12345678" }                    # only 8 digits, not 9-10
+  - { id: n-be_vat-2, identifier_types: [be_vat], text: "Code be0123456789" }                  # lowercase
+  - { id: n-be_vat-3, identifier_types: [be_vat], text: "Ref BE01234567890" }                  # 11 digits too long
+  - { id: n-nl_bsn-1, identifier_types: [nl_bsn], text: "Batch 123456789" }                    # fails 11-test
+  - { id: n-nl_bsn-2, identifier_types: [nl_bsn], text: "Seq 987654321" }                      # fails 11-test
+  - { id: n-nl_bsn-3, identifier_types: [nl_bsn], text: "Code 555666778" }                     # fails 11-test
+  - { id: n-it_cf-1, identifier_types: [it_cf], text: "Ref RSSMRA85M01H5012" }                 # extra digit
+  - { id: n-it_cf-2, identifier_types: [it_cf], text: "Tag RSSMRA85Z01H501Z" }                 # invalid month letter
+  - { id: n-it_cf-3, identifier_types: [it_cf], text: "Serial RSSMR85M01H501Z" }               # only 5 surname letters
+  - { id: n-dk_cpr-1, identifier_types: [dk_cpr], text: "Ref 320570-1234" }                    # invalid day 32
+  - { id: n-dk_cpr-2, identifier_types: [dk_cpr], text: "Code 151370-1234" }                   # invalid month 13
+  - { id: n-dk_cpr-3, identifier_types: [dk_cpr], text: "Serial 15057012" }                    # only 8 digits, wrong length
+  - { id: n-ro_cnp-1, identifier_types: [ro_cnp], text: "Ref 9920401123456" }                  # first digit 9 not allowed
+  - { id: n-ro_cnp-2, identifier_types: [ro_cnp], text: "Code 1921301123456" }                 # invalid month 13
+  - { id: n-ro_cnp-3, identifier_types: [ro_cnp], text: "Tag 1920032123456" }                  # invalid day 32
+  - { id: n-pl_pesel-1, identifier_types: [pl_pesel], text: "Ref 99999999999" }                # invalid encoded date
+  - { id: n-pl_pesel-2, identifier_types: [pl_pesel], text: "Code 85133212345" }               # invalid encoded month 33
+  - { id: n-pl_pesel-3, identifier_types: [pl_pesel], text: "Seq 85023212345" }                # invalid day 32
+  - { id: n-gr_amka-1, identifier_types: [gr_amka], text: "Tag 32057012345" }                  # invalid day 32
+  - { id: n-gr_amka-2, identifier_types: [gr_amka], text: "Ref 15137012345" }                  # invalid month 13
+  - { id: n-gr_amka-3, identifier_types: [gr_amka], text: "Ticket 15057012" }                  # too short
+
+  # ---------- APAC ----------
+  - { id: n-sg_nric-1, identifier_types: [sg_nric], text: "Ticket 1234567D" }                  # missing prefix letter
+  - { id: n-sg_nric-2, identifier_types: [sg_nric], text: "Code Q1234567D" }                   # invalid prefix Q
+  - { id: n-sg_nric-3, identifier_types: [sg_nric], text: "Tag S123456D" }                     # 6 digits, too short
+  - { id: n-my_ic-1, identifier_types: [my_ic], text: "Ref 85010112" }                         # too short
+  - { id: n-my_ic-2, identifier_types: [my_ic], text: "Code 8501-011-41234" }                  # wrong separator positions
+  - { id: n-my_ic-3, identifier_types: [my_ic], text: "Order 9220000009" }                     # 10 digits, wrong length
+  - { id: n-th_id-1, identifier_types: [th_id], text: "Ref 12-34567890-123" }                  # wrong segment widths
+  - { id: n-th_id-2, identifier_types: [th_id], text: "Code 1-2345-6789-123" }                 # wrong split (missing digits)
+  - { id: n-th_id-3, identifier_types: [th_id], text: "Order 12345678901" }                    # 11 digits, not the 13-digit shape
+  - { id: n-ph_tin-1, identifier_types: [ph_tin], text: "Ref 123-456-789" }                    # missing 4th block
+  - { id: n-ph_tin-2, identifier_types: [ph_tin], text: "Code 1234567890" }                    # 10 digits no separators
+  - { id: n-ph_tin-3, identifier_types: [ph_tin], text: "Order 12-345-678-900" }               # wrong first block width
+  - { id: n-id_ktp-1, identifier_types: [id_ktp], text: "Ref 3201013299900001" }               # invalid month 32
+  - { id: n-id_ktp-2, identifier_types: [id_ktp], text: "Code 9999999999999999" }              # date sanity fails
+  - { id: n-id_ktp-3, identifier_types: [id_ktp], text: "Tag 320101010190000" }                # 15 digits (short)
+  - { id: n-tw_id-1, identifier_types: [tw_id], text: "Code A323456789" }                      # 2nd digit must be 1 or 2
+  - { id: n-tw_id-2, identifier_types: [tw_id], text: "Ref 1A23456789" }                       # prefix letter wrong position
+  - { id: n-tw_id-3, identifier_types: [tw_id], text: "Serial A12345678" }                     # too short
+  - { id: n-jp_mynumber-1, identifier_types: [jp_mynumber], text: "Invoice 1234 5678 9012" }   # no MyNumber keyword
+  - { id: n-jp_mynumber-2, identifier_types: [jp_mynumber], text: "Receipt 987654321098" }     # no keyword
+  - { id: n-jp_mynumber-3, identifier_types: [jp_mynumber], text: "Ref 1122 3344 5566" }       # no keyword
+  - { id: n-au_tfn-1, identifier_types: [au_tfn], text: "Shipment 123 456 782" }               # no TFN keyword
+  - { id: n-au_tfn-2, identifier_types: [au_tfn], text: "Order 112233443" }                    # no TFN keyword
+  - { id: n-au_tfn-3, identifier_types: [au_tfn], text: "Batch 987 654 338" }                  # no TFN keyword
+  - { id: n-au_abn-1, identifier_types: [au_abn], text: "Quote 51 824 753 556" }               # no ABN keyword
+  - { id: n-au_abn-2, identifier_types: [au_abn], text: "Receipt 95678901234" }                # no ABN keyword
+  - { id: n-au_abn-3, identifier_types: [au_abn], text: "Ref 53 456 789 012" }                 # no ABN keyword
+  - { id: n-au_acn-1, identifier_types: [au_acn], text: "Part 005036117" }                     # no ACN keyword
+  - { id: n-au_acn-2, identifier_types: [au_acn], text: "Code 123 456 780" }                   # no ACN keyword (and passes checksum)
+  - { id: n-au_acn-3, identifier_types: [au_acn], text: "Ticket 987654320" }                   # no ACN keyword
+  - { id: n-hk_id-1, identifier_types: [hk_id], text: "Batch A123456" }                        # missing (check)
+  - { id: n-hk_id-2, identifier_types: [hk_id], text: "Code 123456(7)" }                       # missing prefix letter
+  - { id: n-hk_id-3, identifier_types: [hk_id], text: "Item AB12345(7)" }                      # too short
+
+  # ---------- Americas ----------
+  - { id: n-ca_sin-1, identifier_types: [ca_sin], text: "Order 046-454-286" }                  # no SIN keyword
+  - { id: n-ca_sin-2, identifier_types: [ca_sin], text: "Ref 123 456 782" }                    # no SIN keyword
+  - { id: n-ca_sin-3, identifier_types: [ca_sin], text: "Batch 876543216" }                    # no SIN keyword
+  - { id: n-br_cpf-1, identifier_types: [br_cpf], text: "Receipt 111.111.111-11" }             # repeating-digit guard
+  - { id: n-br_cpf-2, identifier_types: [br_cpf], text: "Code 123.456.789-00" }                # fails CPF checksum
+  - { id: n-br_cpf-3, identifier_types: [br_cpf], text: "Serial 222.222.222-22" }              # repeating-digit guard
+  - { id: n-br_cnpj-1, identifier_types: [br_cnpj], text: "Receipt 11.222.333/0001-99" }       # wrong check digit
+  - { id: n-br_cnpj-2, identifier_types: [br_cnpj], text: "Code 00.000.000/0000-00" }          # repeating-digit guard
+  - { id: n-br_cnpj-3, identifier_types: [br_cnpj], text: "Serial 23.456.789/0001-00" }        # wrong check digit
+  - { id: n-mx_curp-1, identifier_types: [mx_curp], text: "Ticket BADD1103EHCMLNS09" }         # wrong positional letters
+  - { id: n-mx_curp-2, identifier_types: [mx_curp], text: "Code BADD110313XCMLNS09" }          # wrong gender letter
+  - { id: n-mx_curp-3, identifier_types: [mx_curp], text: "Batch BADD11031HCMLNS09" }          # too short
+  - { id: n-mx_rfc-1, identifier_types: [mx_rfc], text: "Code RAMJ85041" }                     # too short
+  - { id: n-mx_rfc-2, identifier_types: [mx_rfc], text: "Ref ramj850410k08" }                  # lowercase (detector expects upper)
+  - { id: n-mx_rfc-3, identifier_types: [mx_rfc], text: "Serial ABC85041" }                    # missing check block
+  - { id: n-es_nif-1, identifier_types: [es_nif], text: "Book 12345678A" }                     # wrong NIF letter
+  - { id: n-es_nif-2, identifier_types: [es_nif], text: "Page 87654321B" }                     # wrong NIF letter
+  - { id: n-es_nif-3, identifier_types: [es_nif], text: "Seat 23456789A" }                     # wrong NIF letter

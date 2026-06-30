@@ -1,0 +1,86 @@
+name: Security
+
+# SAST, secret scanning, container image scanning, and CodeQL. Znyx Runtime is
+# a security product, so it carries deeper scanning than dependency audit alone.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Weekly Monday 6:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sast-bandit:
+    name: SAST (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install bandit
+      # Gate on HIGH severity / HIGH confidence findings.
+      - run: bandit -r app/ -lll -iii
+
+  sast-semgrep:
+    name: SAST (semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v5
+      - run: semgrep scan --config p/python --config p/security-audit --config p/secrets --error app/
+
+  secret-scan:
+    name: Secret scan (trivy fs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: secret
+          scan-ref: .
+          # config/benchmarks and config/packs hold synthetic detector test
+          # data (fake API keys / PII), not real secrets. Everything else,
+          # including config/policies.yaml and all app code, is still scanned.
+          skip-dirs: config/benchmarks,config/packs
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+
+  image-scan:
+    name: Image vuln scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t znyx-runtime:ci .
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: znyx-runtime:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          # Don't fail on base-image CVEs that have no upstream fix yet;
+          # do fail on anything fixable.
+          ignore-unfixed: "true"
+          exit-code: "1"
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node (npm-runtime wrapper)
+node_modules/
+npm-runtime/bin/znyx-bin*
+*.tgz
+
+# OS
+.DS_Store
