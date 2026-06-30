@@ -1,0 +1,8 @@
+# Build-time tooling vulnerabilities inherited from the python:3.11-slim base
+# image (setuptools' vendored copies of jaraco.context / wheel). These packages
+# are NOT used in the runtime execution path — the container only runs uvicorn —
+# and the Dockerfile already upgrades pip/setuptools/wheel. These entries cover
+# any vendored residue trivy still reports. Revisit when the base image ships
+# patched vendored versions.
+CVE-2026-23949
+CVE-2026-24049

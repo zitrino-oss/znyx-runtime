@@ -2,6 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Patch base-image build tooling: the slim base ships setuptools/wheel with
+# known HIGH CVEs (e.g. CVE-2026-24049, CVE-2026-23949). Upgrade before
+# installing dependencies. These are build-time only and not used at runtime.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
 # Install only runtime dependencies (no postgres)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

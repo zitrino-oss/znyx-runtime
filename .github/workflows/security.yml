@@ -71,6 +71,8 @@ jobs:
           # Don't fail on base-image CVEs that have no upstream fix yet;
           # do fail on anything fixable.
           ignore-unfixed: "true"
+          # Documented base-image build-tooling CVEs (not in runtime path).
+          trivyignores: .trivyignore
           exit-code: "1"
 
   codeql:
