@@ -5,7 +5,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 pyyaml>=6.0
 rapidfuzz>=3.6.0
-python-multipart>=0.0.6
+python-multipart>=0.0.32
 httpx>=0.26.0
 cryptography>=41.0.0
 # Hardened XML parsing for the structure detector (XXE / entity-expansion DoS)
