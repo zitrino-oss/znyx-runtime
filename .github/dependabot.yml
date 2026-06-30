@@ -7,24 +7,44 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
     labels: ["dependencies", "python"]
+    # Collapse minor/patch bumps into a single PR; majors stay separate so
+    # breaking changes still get individual review.
+    groups:
+      pip-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # GitHub Actions used in workflows
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     labels: ["dependencies", "ci"]
+    groups:
+      actions-all:
+        patterns: ["*"]
 
   # Base image in the Dockerfile
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     labels: ["dependencies", "docker"]
+    groups:
+      docker-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # npm wrapper
   - package-ecosystem: npm
     directory: "/npm-runtime"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     labels: ["dependencies", "npm"]
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
