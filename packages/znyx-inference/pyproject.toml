@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "znyx-inference"
+version = "1.0.0"
+description = "Znyx inference sidecar: an optional HTTP service that serves ML models for model-backed guardrail detection. Boots dependency-free on a stub runner; add the [models] extra to serve real weights."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Zitrino" }]
+keywords = ["llm", "guardrails", "inference", "ml-serving", "ai-security"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Core is intentionally light: the sidecar boots on a dependency-free stub runner
+# with no ML stack installed. The heavy model runtimes are an optional extra.
+dependencies = [
+  "znyx-core>=1.0.0",
+  "fastapi>=0.109.0",
+  "uvicorn[standard]>=0.27.0",
+  "pydantic>=2.5.0",
+  "httpx>=0.26.0",
+]
+
+[project.optional-dependencies]
+# Install with `pip install znyx-inference[models]` to serve real model weights.
+# Weights are never bundled; fetch them explicitly and sha256-pin them (see MODELS.md).
+models = [
+  "torch>=2.2,<3.0",
+  "transformers>=4.40,<5.0",
+  "sentence-transformers>=2.7,<4.0",
+  "onnxruntime>=1.17,<2.0",
+  "tokenizers>=0.19,<1.0",
+  "huggingface-hub>=0.23,<1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zitrino-oss/znyx-runtime"
+Source = "https://github.com/zitrino-oss/znyx-runtime"
+
+[tool.setuptools.packages.find]
+where = ["src"]

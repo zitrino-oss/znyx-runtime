@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+# Install the engine + the inference sidecar WITH the heavy model runtimes.
+# Model weights are NOT baked into the image: mount them at /models and pin per
+# task via env (see packages/znyx-inference/MODELS.md).
+COPY packages/znyx-core /app/packages/znyx-core
+COPY packages/znyx-inference /app/packages/znyx-inference
+RUN pip install --no-cache-dir ./packages/znyx-core "./packages/znyx-inference[models]"
+
+# Non-root. /models is the read-only mount point for fetched, sha256-pinned weights.
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /models /app/.cache/znyx && \
+    chown -R appuser:appuser /models /app/.cache
+USER appuser
+
+ENV PORT=9000
+EXPOSE 9000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"
+
+CMD ["python", "-m", "uvicorn", "znyx_inference.main:app", "--host", "0.0.0.0", "--port", "9000"]

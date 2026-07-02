@@ -3,8 +3,13 @@
 #   docker compose up
 #
 # The runtime enforces the deterministic rules path out of the box. To add
-# model-backed (ML) detection, run a Znyx inference sidecar and point the
-# runtime at it with ZNYX_INFERENCE_URL (see the commented service below).
+# model-backed (ML) detection, start the inference sidecar too:
+#
+#   docker compose --profile ml up
+#
+# and set ZNYX_INFERENCE_URL on the runtime (see below). The sidecar serves ML
+# models; weights are NOT bundled, mount your fetched+pinned weights at ./models
+# (see packages/znyx-inference/MODELS.md).
 services:
   runtime:
     build:
@@ -22,7 +27,7 @@ services:
       # Telemetry is OFF by default. Set your own receiver to opt in:
       # ZNYX_TELEMETRY: "true"
       # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
-      # Enable ML by pointing at a sidecar you run:
+      # Enable ML by pointing at the inference sidecar (started with --profile ml):
       # ZNYX_INFERENCE_URL: "http://inference:9000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
@@ -30,15 +35,25 @@ services:
       timeout: 5s
       retries: 3
 
-  # ---------------------------------------------------------------------------
-  # Optional ML: bring your own Znyx inference sidecar.
-  # The sidecar image is not part of this open-source repo. Provide your own
-  # endpoint and uncomment ZNYX_INFERENCE_URL above.
-  #
-  # inference:
-  #   image: <your-znyx-inference-image>
-  #   ports:
-  #     - "9000:9000"
-  #   volumes:
-  #     - ./models:/models:ro
-  # ---------------------------------------------------------------------------
+  # Optional ML sidecar. Only started with `--profile ml`. Serves model-backed
+  # detection; mount your fetched, sha256-pinned weights at ./models (read-only).
+  # Weights are never baked into the image. See packages/znyx-inference/MODELS.md.
+  inference:
+    profiles: ["ml"]
+    build:
+      context: ..
+      dockerfile: Dockerfile.inference
+    image: znyx/inference:latest
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./models:/models:ro
+    environment:
+      PORT: "9000"
+      # Point each task at a fetched, pinned model, e.g.:
+      # ZNYX_INFERENCE_TASKS: '{"prompt_injection":{"runner":"classifier","model_id":"protectai/deberta-v3-base-prompt-injection-v2","revision":"main","sha256":"<sha>"}}'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

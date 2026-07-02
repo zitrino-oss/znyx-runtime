@@ -1,20 +1,31 @@
 # Znyx runtime
 
+> **Part of the Znyx platform:** **Runtime & engine** (this repo) · [Client SDKs](https://github.com/zitrino-oss/znyx-sdk) · [Docs](https://znyx.ai/documentation) · [Which package do I install?](https://znyx.ai/which-package)
+
 Open-source guardrails for LLM applications that run **inside your perimeter**.
 Znyx evaluates prompts, model output, tool calls, and agent steps against a
 policy and returns an allow / warn / redact / block decision. Data never leaves
 your infrastructure.
 
-This repository holds two packages:
+This repository holds three packages:
 
 - **`znyx-core`** - the detection engine (detectors, policy resolution, scoring,
   orchestration). Importable in-process, no server required.
 - **`znyx-runtime`** - a lightweight FastAPI service that wraps the engine behind
   an HTTP API. Deliberately thin: no database, no heavy ML libraries.
+- **`znyx-inference`** - an optional sidecar that serves ML models for
+  model-backed detection. Boots dependency-free on a stub runner; add the
+  `[models]` extra to serve real weights (which are never bundled - you fetch and
+  pin them; see `packages/znyx-inference/MODELS.md`).
 
-Model-backed (ML) detection is an optional layer served by a separate Znyx
-inference sidecar over HTTP. Without a sidecar, every detector runs its
-deterministic rules path, so the runtime is fully functional out of the box.
+Model-backed (ML) detection is an optional layer served by the inference sidecar
+over HTTP. Without it, every detector runs its deterministic rules path, so the
+runtime is fully functional out of the box.
+
+Not sure which package you need? See the
+[install guide](https://znyx.ai/which-package): in short, use `znyx-core` to run
+checks in-process, or run `znyx-runtime` as a service and call it with a client
+from the [`znyx-sdk`](https://github.com/zitrino-oss/znyx-sdk) repo.
 
 ## Quickstart
 
@@ -80,14 +91,23 @@ rule hits. Endpoints exist for `input`, `output`, `tool`, `retrieval`,
 
 ## Enabling ML
 
-Run a Znyx inference sidecar (not part of this repo) and point the runtime at it:
+The `znyx-inference` sidecar (in `packages/znyx-inference`) serves ML models.
+Start it and point the runtime at it:
 
 ```bash
+# with docker compose (starts runtime + sidecar):
+docker compose --profile ml -f deploy/docker-compose.yml up
+
+# or run them separately and wire the URL:
 ZNYX_INFERENCE_URL=http://your-sidecar:9000 znyx-runtime serve
 ```
 
-The sidecar serves explicitly fetched, sha256-pinned model weights. The runtime
-reaches it only over HTTP; there is no in-process model loading here.
+The sidecar serves **explicitly fetched, sha256-pinned** model weights. **No
+weights are bundled** in this repo or its images; you fetch and pin them. See
+[`packages/znyx-inference/MODELS.md`](packages/znyx-inference/MODELS.md) for the
+model list, licenses (including which carry special terms), and the fetch-and-pin
+workflow. The runtime reaches the sidecar only over HTTP; there is no in-process
+model loading in the runtime itself.
 
 ## Configuration
 
