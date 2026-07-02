@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: znyx-runtime
+  labels:
+    app: znyx-runtime
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: znyx-runtime
+  template:
+    metadata:
+      labels:
+        app: znyx-runtime
+    spec:
+      containers:
+        - name: runtime
+          # Replace with your published image tag.
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ZNYX_MODE
+              value: "local"
+            - name: ZNYX_POLICY_PATH
+              value: "./config/policies.yaml"
+            # Secure-by-default: require auth outside local dev.
+            - name: RUNTIME_REQUIRE_AUTH
+              value: "true"
+            - name: RUNTIME_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: znyx-runtime-secrets
+                  key: RUNTIME_API_KEY
+            # Optional ML: point at a sidecar endpoint you run.
+            # - name: ZNYX_INFERENCE_URL
+            #   value: "http://znyx-inference:9000"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

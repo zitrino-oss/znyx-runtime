@@ -1,0 +1,44 @@
+# Znyx runtime, rules-only. Boots with no external dependencies.
+#
+#   docker compose up
+#
+# The runtime enforces the deterministic rules path out of the box. To add
+# model-backed (ML) detection, run a Znyx inference sidecar and point the
+# runtime at it with ZNYX_INFERENCE_URL (see the commented service below).
+services:
+  runtime:
+    build:
+      context: ..
+      dockerfile: Dockerfile.runtime
+    image: znyx/runtime:latest
+    ports:
+      - "8080:8080"
+    environment:
+      ZNYX_MODE: local
+      ZNYX_POLICY_PATH: ./config/policies.yaml
+      # Secure-by-default. Set a key and require auth in any non-local deploy:
+      # RUNTIME_REQUIRE_AUTH: "true"
+      # RUNTIME_API_KEY: "<your-key>"
+      # Telemetry is OFF by default. Set your own receiver to opt in:
+      # ZNYX_TELEMETRY: "true"
+      # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
+      # Enable ML by pointing at a sidecar you run:
+      # ZNYX_INFERENCE_URL: "http://inference:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Optional ML: bring your own Znyx inference sidecar.
+  # The sidecar image is not part of this open-source repo. Provide your own
+  # endpoint and uncomment ZNYX_INFERENCE_URL above.
+  #
+  # inference:
+  #   image: <your-znyx-inference-image>
+  #   ports:
+  #     - "9000:9000"
+  #   volumes:
+  #     - ./models:/models:ro
+  # ---------------------------------------------------------------------------

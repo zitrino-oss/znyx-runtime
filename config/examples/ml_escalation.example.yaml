@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# EXAMPLE (not seeded): deterministic → local_ml escalation (P2 unit 4)
+#
+# This shows how to upgrade a deterministic detector with a model-backed second
+# layer via the F2 strategy + F3 inference sidecar. The same blocks are produced
+# programmatically by `znyx_core.engine.ml_catalog.default_strategy_for(detector)`
+# and served to the console at GET /v1/ml/strategy-defaults.
+#
+# ⚠️  SCORECARD GATE (P2): a detector with a model-backed strategy is gated. To
+#     PUBLISH a policy/pack that contains these blocks you need a passing scorecard
+#     for the PINNED model version (advisory tier); to let the ML layer BLOCK/REDACT
+#     you need the stricter enforcement tier. Without one, publish is blocked, or the
+#     action is pinned to WARN at runtime. Benchmark the model + publish its scorecard
+#     first (POST a DetectorScorecard, then the gate clears). This file is documentation
+#     only — it is NOT seeded, so the official packs stay publishable out of the box.
+#
+# Runtime behaviour: only deterministic scores inside `deterministic_score_between`
+# escalate to the ML layer (clear lows/highs are decided deterministically). If the
+# sidecar is unreachable or slow past `timeout_ms`, `fallback_to_deterministic` keeps
+# the deterministic decision (graceful degradation).
+#
+# 🔒  in_boundary AND EGRESS — READ THIS: `in_boundary: true` means the call is treated
+#     as NOT crossing the trust boundary, so the F4 egress gate is SKIPPED entirely (no
+#     allowlist / residency / redaction / fail-closed audit). That is correct ONLY for a
+#     genuinely co-located loopback sidecar (localhost / 127.0.0.1). If you change
+#     `endpoint_url` to ANY other host, you MUST set `in_boundary: false` or raw,
+#     unredacted, unaudited content is sent off-box. The builder
+#     (`ml_catalog.default_strategy_for`) infers this safely — it only defaults
+#     `in_boundary: true` for a loopback URL and flips to `false` for an off-box one —
+#     but a hand-edited YAML like this one has no such backstop, so set it deliberately.
+# ─────────────────────────────────────────────────────────────────────────────
+
+detectors:
+  - name: jailbreak
+    enabled: true
+    config:
+      action: BLOCK                       # deterministic high-confidence still BLOCKs
+      strategy:
+        order: [local_deterministic, local_ml]
+        escalate_when:
+          deterministic_score_between: [35, 70]   # ambiguous middle → ML
+        fallback: fallback_to_deterministic
+        timeout_ms: 800
+      backends:
+        local_ml:
+          task: prompt_injection
+          model_id: protectai/deberta-v3-base-prompt-injection-v2
+          revision: main
+          threshold: 0.5
+          endpoint_url: http://localhost:8088/v1/infer/prompt_injection
+          in_boundary: true               # co-located sidecar → not an egress crossing
+          timeout_ms: 800
+
+  - name: toxicity
+    enabled: true
+    config:
+      action: WARN
+      strategy:
+        order: [local_deterministic, local_ml]
+        escalate_when:
+          deterministic_score_between: [40, 75]
+        fallback: fallback_to_deterministic
+        timeout_ms: 800
+      backends:
+        local_ml:
+          task: toxicity
+          model_id: unitary/toxic-bert
+          revision: main
+          threshold: 0.5
+          endpoint_url: http://localhost:8088/v1/infer/toxicity
+          in_boundary: true
+          timeout_ms: 800

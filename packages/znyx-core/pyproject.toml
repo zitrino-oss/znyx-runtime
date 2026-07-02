@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "znyx-core"
+version = "1.0.0"
+description = "Znyx guardrails detection engine: detectors, policy resolution, and orchestration for LLM safety, usable in-process."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Zitrino" }]
+keywords = ["llm", "guardrails", "safety", "ai-security", "prompt-injection", "pii", "content-moderation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "pydantic>=2.5.0",
+  "pyyaml>=6.0",
+  "rapidfuzz>=3.6.0",
+  "httpx>=0.26.0",
+  "cryptography>=41.0.0",
+  "defusedxml>=0.7.1",
+  "fastapi>=0.109.0",
+]
+
+[project.optional-dependencies]
+# The hallucination / groundedness detector uses sentence-transformers when
+# present, and falls back to a token-overlap heuristic when it is not installed.
+semantic = ["sentence-transformers>=2.2.0"]
+
+[project.urls]
+Homepage = "https://github.com/zitrino-oss/znyx-runtime"
+Source = "https://github.com/zitrino-oss/znyx-runtime"
+Issues = "https://github.com/zitrino-oss/znyx-runtime/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+znyx_core = ["**/*.yaml", "**/*.yml", "**/*.json"]

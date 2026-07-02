@@ -1,0 +1,55 @@
+# Publish znyx-core and znyx-runtime to PyPI, and the runtime image to a registry.
+#
+# TEMPLATE - requires repository secrets before it will run:
+#   PYPI_API_TOKEN            (PyPI token, or use Trusted Publishing / OIDC)
+#   REGISTRY_USERNAME / REGISTRY_TOKEN   (for the Docker image push)
+#
+# The first PyPI release is intended to be done manually (to claim the names and
+# verify the install). After that, tag a release to trigger this workflow so the
+# PyPI packages stay in lockstep with the Docker image.
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [packages/znyx-core, packages/znyx-runtime]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build ${{ matrix.package }}
+      - name: Check
+        run: twine check ${{ matrix.package }}/dist/*
+      - name: Publish
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload ${{ matrix.package }}/dist/*
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runtime
+          push: true
+          tags: znyx/runtime:latest,znyx/runtime:${{ github.ref_name }}

@@ -1,55 +1,43 @@
-# Contributing to Znyx Runtime
+# Contributing to Znyx runtime
 
-Thanks for your interest in contributing! This project is maintained by Zitrino
-under the `zitrino-oss` organization.
+Thanks for your interest in improving Znyx. This repository is the canonical home
+of the open-source runtime and engine; contributions are welcome here.
 
 ## Ground rules
 
-- By contributing, you agree your contributions are licensed under the project's
-  [Apache-2.0 license](./LICENSE).
-- Be respectful — see our [Code of Conduct](./CODE_OF_CONDUCT.md).
-- For **security issues, do not open a public issue** — follow [SECURITY.md](./SECURITY.md).
+- Open an issue before a large change so we can agree on the approach.
+- Keep pull requests focused. One logical change per PR.
+- All contributions are accepted under the Apache-2.0 license (see LICENSE). By
+  submitting a PR you certify you have the right to contribute the code (DCO
+  sign-off: add `Signed-off-by: Your Name <you@example.com>` to commits).
 
-## Prerequisites
-
-- **Python** 3.11+
-- Optional: **Docker** (for building/running the container image)
-
-## Getting started
+## Development setup
 
 ```bash
-git clone https://github.com/zitrino-oss/znyx-runtime.git
-cd znyx-runtime
-pip install -r requirements.txt
-# Run the server (hot reload)
-ZNYX_MODE=local uvicorn app.runtime.main:app --reload --port 8080
+# editable installs so changes are picked up immediately
+python -m venv .venv && source .venv/bin/activate
+pip install -e packages/znyx-core -e packages/znyx-runtime
+
+# run the service locally (non-prod, auth off for convenience)
+ZNYX_ENV=development RUNTIME_REQUIRE_AUTH=false znyx-runtime serve
 ```
 
-## Development workflow
+## Tests
 
-| Task | Command |
-|------|---------|
-| Run the app (hot reload) | `uvicorn app.runtime.main:app --reload --port 8080` |
-| Byte-compile (build check) | `python -m compileall app` |
-| SAST (high-severity gate) | `bandit -r app/ -lll -iii` |
-| Dependency audit | `pip-audit -r requirements.txt` |
-| Build the image | `docker build -t znyx-runtime:local .` |
+Run the test suite before opening a PR. A change to product code must come with a
+test that exercises it.
 
-## Submitting changes
+## Coding conventions
 
-1. Fork the repo and create a topic branch (`git checkout -b fix/short-description`).
-2. Keep changes focused; one logical change per pull request.
-3. Make sure CI, **Dependency Audit**, and **Security** workflows pass.
-4. Write a clear PR description and link any related issue. Fill in the PR template.
-5. Comments should describe what the code does — please avoid narrative or
-   changelog-style comments in source.
-6. A maintainer (`@zitrino-oss/maintainers`) will review.
+- Match the style of the surrounding code.
+- The engine (`znyx-core`) must stay free of any dependency on a control plane,
+  database, or the inference sidecar. It talks to the sidecar only over HTTP.
+- The runtime (`znyx-runtime`) must stay dependency-light: no database, no heavy
+  ML libraries.
+- Prefer clear, deterministic detector logic with a rules-only fallback.
 
-Do not commit secrets — real credentials belong in environment variables, never
-in the repo. Note that `config/benchmarks/` and `config/packs/` contain
-intentional **synthetic** secret/PII samples used to test the detectors.
+## Adding a detector
 
-## Reporting bugs / requesting features
-
-Use the issue templates. Include reproduction steps, expected vs. actual behavior,
-and version/commit information.
+A detector lives in `packages/znyx-core/src/znyx_core/detectors/`, is wired into
+the orchestrator, and must have a deterministic path that works without any ML
+sidecar. Include tests covering both the benign and the triggering case.
