@@ -1,0 +1,59 @@
+# Znyx runtime, rules-only. Boots with no external dependencies.
+#
+#   docker compose up
+#
+# The runtime enforces the deterministic rules path out of the box. To add
+# model-backed (ML) detection, start the inference sidecar too:
+#
+#   docker compose --profile ml up
+#
+# and set ZNYX_INFERENCE_URL on the runtime (see below). The sidecar serves ML
+# models; weights are NOT bundled, mount your fetched+pinned weights at ./models
+# (see packages/znyx-inference/MODELS.md).
+services:
+  runtime:
+    build:
+      context: ..
+      dockerfile: Dockerfile.runtime
+    image: znyx/runtime:latest
+    ports:
+      - "8080:8080"
+    environment:
+      ZNYX_MODE: local
+      ZNYX_POLICY_PATH: ./config/policies.yaml
+      # Secure-by-default. Set a key and require auth in any non-local deploy:
+      # RUNTIME_REQUIRE_AUTH: "true"
+      # RUNTIME_API_KEY: "<your-key>"
+      # Telemetry is OFF by default. Set your own receiver to opt in:
+      # ZNYX_TELEMETRY: "true"
+      # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
+      # Enable ML by pointing at the inference sidecar (started with --profile ml):
+      # ZNYX_INFERENCE_URL: "http://inference:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Optional ML sidecar. Only started with `--profile ml`. Serves model-backed
+  # detection; mount your fetched, sha256-pinned weights at ./models (read-only).
+  # Weights are never baked into the image. See packages/znyx-inference/MODELS.md.
+  inference:
+    profiles: ["ml"]
+    build:
+      context: ..
+      dockerfile: Dockerfile.inference
+    image: znyx/inference:latest
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./models:/models:ro
+    environment:
+      PORT: "9000"
+      # Point each task at a fetched, pinned model, e.g.:
+      # ZNYX_INFERENCE_TASKS: '{"prompt_injection":{"runner":"classifier","model_id":"protectai/deberta-v3-base-prompt-injection-v2","revision":"main","sha256":"<sha>"}}'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

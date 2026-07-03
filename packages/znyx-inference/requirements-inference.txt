@@ -1,0 +1,25 @@
+# ZNYX Inference Service (F3) — HEAVY dependencies, installed ONLY in the inference
+# Docker image (Dockerfile.inference). The OSS runtime and control-plane images must
+# NEVER install these; the core depends on none of them (the service boots on the
+# dependency-free StubRunner without this file).
+#
+# Install:  pip install -r requirements-inference.txt
+# The serving layer (fastapi/uvicorn/pydantic) is shared with the base app image.
+
+# --- serving (the inference image is built FROM the base app image, which already has
+#     fastapi/pydantic; uvicorn is the ASGI server for the sidecar) ---
+uvicorn[standard]>=0.30,<1.0
+
+# --- model runtimes (heavy) ---
+torch>=2.2,<3.0
+transformers>=4.40,<5.0
+sentence-transformers>=2.7,<4.0
+onnxruntime>=1.17,<2.0
+# tokenizers is pulled by transformers; pinned loosely for reproducible images
+tokenizers>=0.19,<1.0
+
+# --- model fetch (explicit, operator-run: scripts/fetch_inference_model.py) ---
+# Used only to download + sha256-pin a model into the local artifact dir; never on the
+# inference path. Already present transitively via the core `datasets` dep, pinned here so
+# the fetch tool's direct import is explicit.
+huggingface-hub>=0.23,<1.0

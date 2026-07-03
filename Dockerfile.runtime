@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Pull the latest Debian security patches so image scans do not flag stale
+# base packages (runs as root before the appuser drop below).
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+# Install the two packages. znyx-core is the engine; znyx-runtime is the thin
+# FastAPI service that depends on it. No database, no heavy ML libraries.
+COPY packages/znyx-core /app/packages/znyx-core
+COPY packages/znyx-runtime /app/packages/znyx-runtime
+RUN pip install --no-cache-dir ./packages/znyx-core ./packages/znyx-runtime
+
+# Policy configuration (YAML). Override ZNYX_POLICY_PATH to point elsewhere.
+COPY config/ /app/config/
+
+# Non-root user. Create the cache dir with correct ownership before dropping privileges.
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app/.cache/znyx && \
+    chown -R appuser:appuser /app/.cache
+USER appuser
+
+# Rules-only, no telemetry, secure-by-default. Point the runtime at a Znyx
+# inference sidecar (ZNYX_INFERENCE_URL) to enable model-backed detectors.
+ENV ZNYX_MODE=local
+ENV ZNYX_POLICY_PATH=./config/policies.yaml
+ENV PORT=8080
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"
+
+CMD ["znyx-runtime", "serve", "--host", "0.0.0.0", "--port", "8080"]
