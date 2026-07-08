@@ -9,8 +9,11 @@ works fully on its deterministic rules path.
 # boots dependency-free on a stub runner (no ML stack needed):
 pip install znyx-inference
 
-# to serve real model weights, add the heavy runtimes:
-pip install "znyx-inference[models]"
+# to serve real model weights on CPU — lean, torch-free (onnxruntime + tokenizers):
+pip install "znyx-inference[onnx]"
+
+# offline only: export + quantize a checkpoint to a pinned ONNX artifact (heavy: torch + optimum):
+pip install "znyx-inference[export]"
 ```
 
 ## Weights are never bundled

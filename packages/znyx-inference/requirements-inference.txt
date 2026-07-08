@@ -1,25 +1,26 @@
-# ZNYX Inference Service (F3) — HEAVY dependencies, installed ONLY in the inference
-# Docker image (Dockerfile.inference). The OSS runtime and control-plane images must
-# NEVER install these; the core depends on none of them (the service boots on the
-# dependency-free StubRunner without this file).
+# ZNYX Inference Service (F3) — LEAN CPU serving deps.
 #
-# Install:  pip install -r requirements-inference.txt
-# The serving layer (fastapi/uvicorn/pydantic) is shared with the base app image.
-
-# --- serving (the inference image is built FROM the base app image, which already has
-#     fastapi/pydantic; uvicorn is the ASGI server for the sidecar) ---
+# CANONICAL SOURCE: the pyproject.toml extras. Prefer `pip install "znyx-inference[onnx]"`.
+# This file mirrors the `[onnx]` extra for `pip install -r` users and for the base app image;
+# keep the two in sync. Dockerfile.inference installs the `[onnx]` extra, not this file.
+#
+# The serving stack is onnxruntime + tokenizers + numpy — NO torch / transformers / CUDA, so
+# the image is hundreds of MB, not multi-GB. The OSS runtime and control-plane images never
+# install any of this; the service boots on the dependency-free StubRunner without it.
 uvicorn[standard]>=0.30,<1.0
 
-# --- model runtimes (heavy) ---
-torch>=2.2,<3.0
-transformers>=4.40,<5.0
-sentence-transformers>=2.7,<4.0
+# --- lean CPU model runtime (serves sha256-pinned local ONNX artifacts, torch-free) ---
 onnxruntime>=1.17,<2.0
-# tokenizers is pulled by transformers; pinned loosely for reproducible images
 tokenizers>=0.19,<1.0
+numpy>=1.24
 
-# --- model fetch (explicit, operator-run: scripts/fetch_inference_model.py) ---
-# Used only to download + sha256-pin a model into the local artifact dir; never on the
-# inference path. Already present transitively via the core `datasets` dep, pinned here so
-# the fetch tool's direct import is explicit.
-huggingface-hub>=0.23,<1.0
+# --- OFFLINE export/quantize ONLY (`[export]` extra) — do NOT install in the serving image.
+#     Exports + int8-quantizes a checkpoint to a pinned ONNX artifact (the only place torch lives).
+# torch>=2.2,<3.0
+# transformers>=4.40,<5.0
+# optimum[exporters,onnxruntime]>=1.17,<2.0
+# huggingface-hub>=0.23,<1.0
+
+# --- OPT-IN generative guard (`[torch]` extra) — uncomment ONLY to enable the guard_llm runner.
+# torch>=2.2,<3.0
+# transformers>=4.40,<5.0
