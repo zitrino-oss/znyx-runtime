@@ -1,4 +1,9 @@
-# Znyx runtime
+# Znyx Runtime
+
+[![CI](https://github.com/zitrino-oss/znyx-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/zitrino-oss/znyx-runtime/actions/workflows/ci.yml)
+[![Security](https://github.com/zitrino-oss/znyx-runtime/actions/workflows/security.yml/badge.svg)](https://github.com/zitrino-oss/znyx-runtime/actions/workflows/security.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
 > **Part of the Znyx platform:** **Runtime & engine** (this repo) · [Client SDKs](https://github.com/zitrino-oss/znyx-sdk) · [Docs](https://znyx.ai/documentation) · [Which package do I install?](https://znyx.ai/which-package)
 
