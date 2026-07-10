@@ -52,7 +52,7 @@ onnx = [
 export = [
   "torch>=2.2,<3.0",
   "transformers>=4.40,<6.0",
-  "optimum[exporters,onnxruntime]>=1.17,<2.0",
+  "optimum[exporters,onnxruntime]>=1.17,<3.0",
   "huggingface-hub>=0.23,<2.0",
 ]
 
