@@ -15,9 +15,9 @@
 
 ## Checklist
 
-- [ ] `python -m compileall app` passes
-- [ ] `bandit -r app/ -lll -iii` is clean
-- [ ] `pip-audit -r requirements.txt` reports no new vulnerabilities
+- [ ] `python -m compileall packages` passes
+- [ ] `bandit -r packages/ -lll -iii` is clean
+- [ ] `pip-audit` against the package requirements reports no new vulnerabilities
 - [ ] No secrets/credentials committed (real secrets belong in env vars)
 - [ ] Docs updated if behavior changed
 - [ ] Comments describe what the code does (no narrative/changelog-style comments)

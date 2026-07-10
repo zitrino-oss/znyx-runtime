@@ -1,8 +1,14 @@
 # Publish znyx-core and znyx-runtime to PyPI, and the runtime image to a registry.
 #
-# TEMPLATE - requires repository secrets before it will run:
-#   PYPI_API_TOKEN            (PyPI token, or use Trusted Publishing / OIDC)
-#   REGISTRY_USERNAME / REGISTRY_TOKEN   (for the Docker image push)
+# PyPI uses OIDC Trusted Publishing (no long-lived token). Before the first run,
+# register each project's trusted publisher on PyPI:
+#   PyPI project -> Settings -> Publishing -> add a GitHub publisher with
+#   owner=zitrino-oss, repo=znyx-runtime, workflow=publish.yml, environment=pypi
+#
+# Docker push still uses registry credentials (Docker Hub has no OIDC path):
+#   REGISTRY_USERNAME / REGISTRY_TOKEN   (repository secrets)
+# If you move the image to GHCR, drop these and use `permissions: packages: write`
+# with the built-in GITHUB_TOKEN instead.
 #
 # The first PyPI release is intended to be done manually (to claim the names and
 # verify the install). After that, tag a release to trigger this workflow so the
@@ -14,15 +20,23 @@ on:
     types: [published]
   workflow_dispatch:
 
+# Least privilege by default; jobs opt into more only where needed.
+permissions:
+  contents: read
+
 jobs:
   pypi:
     runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # OIDC token for PyPI Trusted Publishing
     strategy:
       matrix:
         package: [packages/znyx-core, packages/znyx-runtime]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - name: Build
@@ -32,22 +46,23 @@ jobs:
       - name: Check
         run: twine check ${{ matrix.package }}/dist/*
       - name: Publish
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload ${{ matrix.package }}/dist/*
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: ${{ matrix.package }}/dist/
 
   image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Log in to registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_TOKEN }}
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile.runtime
