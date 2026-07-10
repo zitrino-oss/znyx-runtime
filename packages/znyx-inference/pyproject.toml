@@ -53,7 +53,7 @@ export = [
   "torch>=2.2,<3.0",
   "transformers>=4.40,<5.0",
   "optimum[exporters,onnxruntime]>=1.17,<2.0",
-  "huggingface-hub>=0.23,<1.0",
+  "huggingface-hub>=0.23,<2.0",
 ]
 
 # --- [torch] — OPT-IN escape hatch. Adds the eager PyTorch stack so the generative
