@@ -24,8 +24,10 @@ services:
       # Secure-by-default. Set a key and require auth in any non-local deploy:
       # RUNTIME_REQUIRE_AUTH: "true"
       # RUNTIME_API_KEY: "<your-key>"
-      # Telemetry is OFF by default. Set your own receiver to opt in:
+      # Telemetry is OFF by default (see TELEMETRY.md). Opt in with:
       # ZNYX_TELEMETRY: "true"
+      # Optionally redirect heartbeats to a self-hosted receiver: ** ONLY FOR SELF HOST **
+      # (default: https://cp.znyx.ai/v1/install-telemetry — see TELEMETRY.md):
       # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
       # Enable ML by pointing at the inference sidecar (started with --profile ml):
       # ZNYX_INFERENCE_URL: "http://inference:9000"

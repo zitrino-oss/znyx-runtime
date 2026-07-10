@@ -7,8 +7,9 @@ Sends a daily anonymous ping with non-sensitive metadata:
 - detector count, total evaluation count, run_count
 
 No PII, no request content, no tenant data.
-Opt-in: set ZNYX_TELEMETRY=true and ZNYX_HEARTBEAT_URL (off by default; the
-runtime never phones home unless you point it at your own receiver).
+Opt-in: off by default; the runtime sends nothing unless ZNYX_TELEMETRY=true.
+ZNYX_HEARTBEAT_URL overrides the destination, e.g. for a self-hosted receiver.
+See TELEMETRY.md at the repo root for the exact payload and endpoint.
 """
 import asyncio
 import logging
@@ -22,10 +23,11 @@ from znyx_runtime.install_state import get_install_id
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_ENDPOINT = os.getenv(
-    # Opt-in only. Empty by default so the runtime never phones home. Set
-    # ZNYX_HEARTBEAT_URL to your own telemetry receiver to enable heartbeats.
+    # Destination only — this does not enable anything. Sending is gated on
+    # ZNYX_TELEMETRY (off by default). Set ZNYX_HEARTBEAT_URL to redirect
+    # heartbeats to a self-hosted receiver.
     "ZNYX_HEARTBEAT_URL",
-    "",
+    "https://cp.znyx.ai/v1/install-telemetry",
 )
 HEARTBEAT_INTERVAL = 86400  # 24 hours
 VERSION = "1.0.0"
@@ -60,7 +62,7 @@ def _build_payload(
 class Heartbeat:
     """Anonymous heartbeat that sends a daily ping."""
 
-    def __init__(self, enabled: bool = True, mode: str = "local"):
+    def __init__(self, enabled: bool = False, mode: str = "local"):
         self.enabled = enabled
         self.mode = mode
         self.install_id = get_install_id() if enabled else ""
@@ -127,5 +129,5 @@ class Heartbeat:
             logger.debug(f"Heartbeat failed (non-fatal): {e}")
 
     async def send_first_run_ping(self, run_count: int = 1) -> None:
-        """Send a one-shot first_run ping (called from installer, not the loop)."""
+        """Send a one-shot first_run ping (fired once, on an install's first startup)."""
         await self._send_ping(event_type="first_run", run_count=run_count)

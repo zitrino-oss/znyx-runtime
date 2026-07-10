@@ -60,9 +60,10 @@ def _build_welcome_banner(version: str, console_url: str, inner_width: int = 54)
         line("Want a policy editor, traces, and analytics?"),
         line(f"-> {console_url}"),
         blank,
-        line("No telemetry by default - the runtime never phones home."),
+        line("No telemetry by default - never phones home."),
         line("Opt in to anonymous install heartbeats:"),
-        line("  export ZNYX_TELEMETRY=true ZNYX_HEARTBEAT_URL=<your-endpoint>"),
+        line("  export ZNYX_TELEMETRY=true"),
+        line("  (ZNYX_HEARTBEAT_URL overrides the destination)"),
         bot,
     ])
 
@@ -98,7 +99,7 @@ async def lifespan(app: FastAPI):
     )
     await telemetry.start()
 
-    # Initialize anonymous heartbeat (opt-in: set ZNYX_TELEMETRY=true and ZNYX_HEARTBEAT_URL - off by default)
+    # Initialize anonymous heartbeat (opt-in: set ZNYX_TELEMETRY=true - off by default)
     heartbeat = Heartbeat(enabled=config.heartbeat_enabled, mode=config.mode)
     await heartbeat.start()
 

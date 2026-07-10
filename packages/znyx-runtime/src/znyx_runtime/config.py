@@ -47,7 +47,7 @@ class RuntimeConfig:
     # Per-evaluation telemetry (events sent to control plane)
     telemetry_enabled: bool = False
 
-    # Anonymous install heartbeat (daily ping to Zitrino - opt-out)
+    # Anonymous install heartbeat (daily ping to Zitrino - opt-in, off by default)
     heartbeat_enabled: bool = False
 
     # Egress audit sink. Backend: "spool" (durable local JSON-lines, drained
@@ -111,7 +111,9 @@ class RuntimeConfig:
                 "GUARDRAILS_TELEMETRY_ENABLED",
                 "true" if mode == "managed" else "false",
             ).lower() == "true",
-            heartbeat_enabled=_env("ZNYX_TELEMETRY", "GUARDRAILS_TELEMETRY", "false").lower() not in ("false", "0", "no"),
+            # Opt-in must be affirmative: only explicit truthy values enable the
+            # heartbeat. Empty strings, typos, or "off" all stay disabled.
+            heartbeat_enabled=_env("ZNYX_TELEMETRY", "GUARDRAILS_TELEMETRY", "false").lower() in ("true", "1", "yes", "on"),
             audit_sink_mode=_env("ZNYX_AUDIT_SINK_MODE", "GUARDRAILS_AUDIT_SINK_MODE", "spool"),
             audit_fail_mode=_env("ZNYX_AUDIT_FAIL_MODE", "GUARDRAILS_AUDIT_FAIL_MODE", "closed"),
             audit_spool_path=_env("ZNYX_AUDIT_SPOOL_PATH", "GUARDRAILS_AUDIT_SPOOL_PATH", ""),

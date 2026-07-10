@@ -89,8 +89,9 @@ rule hits. Endpoints exist for `input`, `output`, `tool`, `retrieval`,
 - **Auth on by default.** The evaluate endpoints require an API key. In
   production auth cannot be disabled. Set `RUNTIME_API_KEY`, and
   `RUNTIME_REQUIRE_AUTH=false` only toggles it in non-production.
-- **No telemetry by default.** The runtime never phones home. Set
-  `ZNYX_TELEMETRY=true` and `ZNYX_HEARTBEAT_URL=<your receiver>` to opt in.
+- **No telemetry by default.** The runtime never phones home. Opt in with
+  `ZNYX_TELEMETRY=true` — see [TELEMETRY.md](TELEMETRY.md) for exactly what is
+  sent and where.
 - **Empty CORS by default.** Set `ALLOWED_ORIGINS` explicitly.
 - **Fail-secure ML.** If a configured sidecar is unreachable, detectors fall
   back to rules per the policy's fallback mode.
@@ -127,8 +128,17 @@ Key environment variables:
 | `RUNTIME_API_KEY` | (unset) | The runtime API key |
 | `ALLOWED_ORIGINS` | (empty) | CORS allowlist, comma separated |
 | `ZNYX_INFERENCE_URL` | (unset) | Sidecar endpoint for ML detection |
-| `ZNYX_TELEMETRY` | `false` | Opt in to anonymous heartbeats |
-| `ZNYX_HEARTBEAT_URL` | (empty) | Your telemetry receiver |
+| `ZNYX_TELEMETRY` | `false` | Opt in to anonymous install heartbeats |
+| `ZNYX_HEARTBEAT_URL` | `https://cp.znyx.ai/v1/install-telemetry` | Override the heartbeat receiver (self-hosting) |
+
+## Telemetry
+
+Telemetry is **opt-in and off by default** — the runtime sends nothing unless
+you set `ZNYX_TELEMETRY=true`. When enabled, it sends a daily anonymous install
+heartbeat: a random install id plus version, mode, OS, and coarse usage
+counters. No PII, no request content, no tenant data. Every field, the exact
+endpoint, and how to point heartbeats at a self-hosted receiver are documented
+in [TELEMETRY.md](TELEMETRY.md).
 
 ## Client SDKs
 
