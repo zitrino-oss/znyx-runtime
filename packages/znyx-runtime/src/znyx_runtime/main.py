@@ -16,12 +16,12 @@ Usage:
 import os
 import logging
 from contextlib import asynccontextmanager
-from typing import Callable
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file if present
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -60,9 +60,9 @@ def _build_welcome_banner(version: str, console_url: str, inner_width: int = 54)
         line("Want a policy editor, traces, and analytics?"),
         line(f"-> {console_url}"),
         blank,
-        line("Anonymous install telemetry is ON by default."),
-        line("Opt out:"),
-        line("  export ZNYX_TELEMETRY=false"),
+        line("No telemetry by default - the runtime never phones home."),
+        line("Opt in to anonymous install heartbeats:"),
+        line("  export ZNYX_TELEMETRY=true ZNYX_HEARTBEAT_URL=<your-endpoint>"),
         bot,
     ])
 
@@ -75,7 +75,7 @@ bundle_manager: BundleManager = None
 telemetry: TelemetryEmitter = None
 heartbeat: Heartbeat = None
 evaluator: GuardrailsEvaluator = None
-runtime_judge = None  # RuntimeJudgeAudit (P3 Option C) — durable judge audit + cached budget
+runtime_judge = None  # RuntimeJudgeAudit — durable judge audit + cached budget
 
 
 @asynccontextmanager
@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI):
     )
     await telemetry.start()
 
-    # Initialize anonymous heartbeat (opt-out: ZNYX_TELEMETRY=false - on by default, disclosed in welcome banner)
+    # Initialize anonymous heartbeat (opt-in: set ZNYX_TELEMETRY=true and ZNYX_HEARTBEAT_URL - off by default)
     heartbeat = Heartbeat(enabled=config.heartbeat_enabled, mode=config.mode)
     await heartbeat.start()
 
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     plugin_registry = PluginRegistry()
     init_plugins()
 
-    # F4 egress audit: durable, fail-closed spool sink the escalation gate writes to
+    # Egress audit: durable, fail-closed spool sink the escalation gate writes to
     # BEFORE any boundary-crossing call (no DB in the runtime → spool; the control
     # plane drains it / telemetry ships it). A failed audit write denies the egress.
     from znyx_runtime.audit_sink import make_audit_egress_sink, make_audit_sink
@@ -127,7 +127,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.egress_audit_sink = audit_sink
 
-    # P3 Option C: runtime-local judge audit (durable spool the CP drains) + cached
+    #: runtime-local judge audit (durable spool the CP drains) + cached
     # deny-of-wallet (bundle-delivered caps vs the runtime's own spend tally). Lets a
     # co-located judge run on the stateless path while still feeding the central audit
     # trail + budgets. Judges run unaudited/unbudgeted only if explicitly disabled.
@@ -262,25 +262,34 @@ app.add_middleware(MetricsMiddleware, collector=MetricsCollector())
 
 
 @app.get("/metrics", include_in_schema=False)
-async def runtime_metrics():
+async def runtime_metrics(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None),
+):
     """Prometheus exposition.
 
     Unauthenticated by default — same as CP's pre-auth posture for /metrics
     in dev. Production deploys should put a network policy in front of this
-    or set ZNYX_METRICS_REQUIRE_KEY=true to gate it.
+    or set ZNYX_METRICS_REQUIRE_KEY=true to require the runtime API key.
     """
     from starlette.responses import Response as _Response
 
     if os.getenv("ZNYX_METRICS_REQUIRE_KEY", "false").lower() in ("1", "true", "yes"):
-        # Minimal key check — kept inline to avoid pulling the full auth
-        # stack into the runtime's import surface.
-        # Re-resolve dependency manually since this route was registered
-        # without it. Cheap.
-        return _Response(
-            content="metrics endpoint requires X-API-Key in this deployment\n",
-            status_code=401,
-            media_type="text/plain",
-        )
+        # Actually validate the key against RUNTIME_API_KEY (timing-safe), the
+        # same credential the evaluation routes use. Accept X-API-Key or a
+        # Bearer token. Kept inline to avoid the full auth dependency stack.
+        import hmac as _hmac
+
+        expected = os.getenv("RUNTIME_API_KEY", "").strip()
+        token = x_api_key
+        if not token and authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+        if not expected or not token or not _hmac.compare_digest(token, expected):
+            return _Response(
+                content="metrics endpoint requires a valid X-API-Key in this deployment\n",
+                status_code=401,
+                media_type="text/plain",
+            )
     body = MetricsCollector().format_prometheus()
     return _Response(content=body, media_type="text/plain; version=0.0.4")
 

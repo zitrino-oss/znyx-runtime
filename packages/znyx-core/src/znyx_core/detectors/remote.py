@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
-from znyx_core.net_guard import assert_safe_egress_url, UnsafeEgressURL
+from znyx_core.net_guard import resolve_egress_target, UnsafeEgressURL
 
 logger = logging.getLogger(__name__)
 
@@ -102,17 +102,17 @@ class RemoteDetector:
         self.output_decision_field = config.get("output_decision_field", "decision")
         self.output_score_field = config.get("output_score_field", "risk_score")
         self.output_message_field = config.get("output_message_field", "message")
-        # F0.5: model-backed confidence contract field paths.
+        # model-backed confidence contract field paths.
         self.output_confidence_field = config.get("output_confidence_field", "confidence")
         self.output_calibrated_field = config.get("output_calibrated_field", "calibrated_score")
         self.output_label_scores_field = config.get("output_label_scores_field", "label_scores")
         self.output_model_version_field = config.get("output_model_version_field", "model_version")
-        # F0.5: richer request payload (inference task + pinned model).
+        # richer request payload (inference task + pinned model).
         self.task = config.get("task")
         self.model_id = config.get("model_id")
         self.model_revision = config.get("model_revision") or config.get("revision")
         self.timeout = config.get("timeout_seconds", 10.0)
-        # F0.5: total wall-clock deadline across retries (None = per-attempt only).
+        # total wall-clock deadline across retries (None = per-attempt only).
         self.total_deadline = config.get("total_deadline_seconds")
         self.max_retries = config.get("max_retries", 2)
         self.retry_backoff = config.get("retry_backoff", 0.5)
@@ -126,7 +126,7 @@ class RemoteDetector:
 
     def _build_payload(self, text: str) -> Dict[str, Any]:
         """Build the request body. Keeps the back-compat ``{input_field: text}``
-        shape and adds the F0.5 task/model pins only when configured."""
+        shape and adds the task/model pins only when configured."""
         payload: Dict[str, Any] = {self.input_field: text}
         if self.task:
             payload["task"] = self.task
@@ -170,7 +170,7 @@ class RemoteDetector:
     async def detect_async(self, text: str) -> DetectorResult:
         """Native async entrypoint — no thread hop.
 
-        Preferred from already-async callers (e.g. the F2 escalation path), which
+        Preferred from already-async callers (e.g. the escalation path), which
         can reuse the running event loop instead of paying the thread-per-call cost
         of the sync ``detect()`` wrapper.
         """
@@ -182,16 +182,20 @@ class RemoteDetector:
         if not self.endpoint_url:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
-        # Total budget across retries (F0.5). None → per-attempt timeout only.
+        # Total budget across retries. None → per-attempt timeout only.
         deadline = (time.monotonic() + self.total_deadline) if self.total_deadline else None
 
         # SSRF guard: never let a configured endpoint reach the cloud-metadata
         # service / link-local range (credential theft). Private/internal IPs
         # are permitted because remote detectors may be self-hosted on an
-        # internal network. The DNS resolution is blocking, so run it off the
-        # event loop.
+        # internal network. Resolve+validate DNS ONCE here and connect to the
+        # pinned IP below, so a rebinding attacker can't flip the name to a
+        # metadata IP between this check and the connection. Resolution is
+        # blocking, so run it off the event loop.
         try:
-            await asyncio.to_thread(assert_safe_egress_url, self.endpoint_url, allow_private=True)
+            target = await asyncio.to_thread(
+                resolve_egress_target, self.endpoint_url, allow_private=True
+            )
         except UnsafeEgressURL as e:
             logger.warning("Remote detector endpoint blocked by SSRF guard: %s", e)
             return self._fail_result(f"Endpoint blocked: {e}")
@@ -219,7 +223,10 @@ class RemoteDetector:
             try:
                 async with httpx.AsyncClient(timeout=attempt_timeout) as client:
                     resp = await client.post(
-                        self.endpoint_url, json=payload, headers=headers,
+                        target.connect_url,
+                        json=payload,
+                        headers={**headers, "Host": target.host_header},
+                        extensions={"sni_hostname": target.sni_hostname},
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -272,7 +279,7 @@ class RemoteDetector:
             risk_score=min(100, max(0, risk_score)),
             rule_hits=rule_hits,
             developer_message=str(message) if message else None,
-            # F0.5 confidence contract (all optional; absent fields stay None).
+            # confidence contract (all optional; absent fields stay None).
             confidence=self._coerce_float(self._get_nested(data, self.output_confidence_field)),
             calibrated_score=self._coerce_float(self._get_nested(data, self.output_calibrated_field)),
             label_scores=self._coerce_label_scores(self._get_nested(data, self.output_label_scores_field)),

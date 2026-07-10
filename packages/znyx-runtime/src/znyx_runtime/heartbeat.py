@@ -7,7 +7,8 @@ Sends a daily anonymous ping with non-sensitive metadata:
 - detector count, total evaluation count, run_count
 
 No PII, no request content, no tenant data.
-Opt-out: set ZNYX_TELEMETRY=false  (on by default; disclosed in the first-run welcome banner shown by app/runtime/main.py).
+Opt-in: set ZNYX_TELEMETRY=true and ZNYX_HEARTBEAT_URL (off by default; the
+runtime never phones home unless you point it at your own receiver).
 """
 import asyncio
 import logging
