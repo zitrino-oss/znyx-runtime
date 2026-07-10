@@ -1,4 +1,4 @@
-# ZNYX Inference Service (F3) — LEAN CPU serving deps.
+# ZNYX Inference Service — LEAN CPU serving deps.
 #
 # CANONICAL SOURCE: the pyproject.toml extras. Prefer `pip install "znyx-inference[onnx]"`.
 # This file mirrors the `[onnx]` extra for `pip install -r` users and for the base app image;

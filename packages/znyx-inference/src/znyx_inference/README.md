@@ -1,8 +1,8 @@
-# ZNYX Inference Service (F3)
+# ZNYX Inference Service
 
 An **optional, separately-deployable** FastAPI sidecar that hosts local ML models
 (transformer classifiers, embeddings, NLI cross-encoders, an optional guard-LLM) behind
-the stable scoring contract the runtime's extended `RemoteDetector` (F0.5) speaks.
+the stable scoring contract the runtime's remote-detector client speaks.
 
 **The core OSS runtime and control plane gain zero heavy dependencies.** The serving image
 installs the LEAN CPU stack only — the `[onnx]` extra: `onnxruntime` + `tokenizers` + `numpy`
@@ -28,7 +28,7 @@ the serving image. GPU, when you want it, is an onnxruntime Execution Provider s
 |--------|------|---------|
 | POST | `/v1/infer/{task}` | Score `{text}` (or `{texts}`) → confidence contract |
 | GET | `/healthz` | Liveness |
-| GET | `/v1/models` | Loaded models + availability (feeds the control-plane model registry) |
+| GET | `/v1/models` | Loaded models + availability (model_id / revision / sha256 per task) |
 | GET | `/v1/stats` | Cache + batcher metrics |
 
 The contract: `{decision, risk_score, confidence, label_scores, calibrated_score,
@@ -38,11 +38,11 @@ threshold, model_version, latency_ms}`. `decision` is the canonical ZNYX set
 ## Run
 
 ```bash
-# Dev (StubRunner, no ML deps, port 8086):
-uvicorn znyx_inference.main:app --port 8086
+# Dev (StubRunner, no ML deps, port 9000):
+uvicorn znyx_inference.main:app --port 9000
 
 # Container (opt-in profile; mount pinned models at ./models):
-docker compose -f deploy/docker-compose.inference.yml --profile inference up
+docker compose -f deploy/docker-compose.yml --profile ml up
 ```
 
 CPU works out of the box (`[onnx]`, no GPU required). For **GPU**, swap the CPU wheel for
@@ -95,8 +95,8 @@ service.
 ## Privacy posture
 
 - **No telemetry, no egress.** The sidecar makes no outbound calls.
-- Weights are operator-supplied and pinned; provenance (model_id/revision/sha256) flows
-  into the control-plane `model_registry_entries` (feeds the model card).
-- The caller's runtime decides whether a call to this service counts as egress
-  (`inference.in_boundary`, F4): a co-located sidecar is in-boundary; a networked one is
-  gated/audited like any remote endpoint.
+- Weights are operator-supplied and pinned; provenance (model_id/revision/sha256) is
+  reported per model on `/v1/models`.
+- The caller's runtime decides whether a call to this service counts as egress: a
+  co-located sidecar is in-boundary; a networked one is gated/audited like any remote
+  endpoint.

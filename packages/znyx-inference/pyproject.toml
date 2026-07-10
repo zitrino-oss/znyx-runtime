@@ -69,6 +69,7 @@ torch = [
 [project.urls]
 Homepage = "https://github.com/zitrino-oss/znyx-runtime"
 Source = "https://github.com/zitrino-oss/znyx-runtime"
+Issues = "https://github.com/zitrino-oss/znyx-runtime/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

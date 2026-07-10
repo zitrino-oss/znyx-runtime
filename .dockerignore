@@ -1,0 +1,45 @@
+# Keep the Docker build context minimal and secret-free. Even though the
+# Dockerfiles COPY selectively, this prevents local secrets / VCS history / caches
+# from ever entering the build context sent to the daemon.
+.git
+.gitignore
+.github
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+
+# Local model weights — must be mounted at runtime, never baked into the image
+models/
+*.onnx
+*.safetensors
+*.bin
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+
+# Docs and CI that don't belong in the runtime image.
+# NOTE: do NOT exclude packages/*/README.md — each pyproject declares
+# `readme = "README.md"`, so pip install needs them in the build context.
+docs/
+deploy/
+/*.md
