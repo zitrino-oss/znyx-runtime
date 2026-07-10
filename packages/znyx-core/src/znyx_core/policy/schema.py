@@ -15,7 +15,7 @@ from znyx_core.core.models import ExecutionMode, Stage
 logger = logging.getLogger(__name__)
 
 
-# ── Per-detector strategy/egress config (F2/F4) ──────────────────────────────
+# ── Per-detector strategy/egress config ──────────────────────────────
 # These are TYPED (and the nested blocks forbid unknown keys) so a malformed
 # strategy/egress config is a strict-validation BLOCKER instead of being silently
 # accepted under the base DetectorConfig's extra="allow". ExecutionMode is the
@@ -46,7 +46,7 @@ class EscalateWhen(BaseModel):
 
 
 class StrategyConfig(BaseModel):
-    """Per-detector multi-mode execution strategy (the F2 backend resolves it)."""
+    """Per-detector multi-mode execution strategy (the backend resolves it)."""
     model_config = ConfigDict(extra="forbid")
     order: Optional[List[ExecutionMode]] = None
     escalate_when: Optional[EscalateWhen] = None
@@ -67,7 +67,7 @@ class StrategyConfig(BaseModel):
 
 
 class RedactBeforeEgress(BaseModel):
-    """What to scrub before any boundary-crossing call (F4)."""
+    """What to scrub before any boundary-crossing call."""
     model_config = ConfigDict(extra="forbid")
     pii: bool = True
     secrets: bool = True
@@ -75,9 +75,9 @@ class RedactBeforeEgress(BaseModel):
 
 
 class BackendModeConfig(BaseModel):
-    """Per-execution-mode backend config (F2): how the escalation path reaches a
+    """Per-execution-mode backend config: how the escalation path reaches a
     given mode's model/judge/vendor. endpoint_url is where the (extended) RemoteDetector
-    transport posts; model pins feed F3's model registry; auth_value is a F0.3
+    transport posts; model pins feed the inference model registry; auth_value is a
     secret:// sentinel, never a raw key."""
     model_config = ConfigDict(extra="forbid")
     endpoint_url: Optional[str] = None
@@ -94,9 +94,9 @@ class BackendModeConfig(BaseModel):
     judge: Optional[bool] = None           # marks backend as a judge call
     timeout_ms: Optional[int] = Field(default=None, ge=0)
     auth_type: Optional[str] = None
-    auth_value: Optional[str] = None       # secret://<id> sentinel (F0.3)
-    region: Optional[str] = None           # destination region for residency checks (F4)
-    # F4 egress semantics: a co-located/in-boundary sidecar is NOT egress. Defaults
+    auth_value: Optional[str] = None       # secret://<id> sentinel
+    region: Optional[str] = None           # destination region for residency checks
+    # egress semantics: a co-located/in-boundary sidecar is NOT egress. Defaults
     # True for local_* sidecar modes (self-host posture); set False for a hosted/
     # network inference endpoint. Ignored for remote_llm/remote_api (always egress).
     in_boundary: Optional[bool] = None
@@ -115,7 +115,7 @@ class BackendModeConfig(BaseModel):
 
 
 class DetectorBackendsConfig(BaseModel):
-    """Per-mode backend blocks (F2), one optional sub-block per ExecutionMode. The
+    """Per-mode backend blocks, one optional sub-block per ExecutionMode. The
     strategy's `order` selects which of these run; this block says how to reach each."""
     model_config = ConfigDict(extra="forbid")
     local_deterministic: Optional[BackendModeConfig] = None
@@ -127,9 +127,9 @@ class DetectorBackendsConfig(BaseModel):
 
 
 class RuntimePolicyConfig(BaseModel):
-    """Top-level runtime/egress policy (F2 lint reads it now; F4 enforces it).
+    """Top-level runtime/egress policy (lint now; enforced at egress).
 
-    extra="allow" so F4 can grow this without breaking forward-compat, and so it is
+    extra="allow" so this can grow without breaking forward-compat, and so it is
     accepted by strict validation today rather than flagged as an unknown key."""
     model_config = ConfigDict(extra="allow")
     no_external_calls: bool = False
@@ -146,10 +146,10 @@ class DetectorConfig(BaseModel):
     enabled: bool = False
     action: Optional[str] = None
     # Restrict this detector to specific pipeline stages. None = use orchestrator
-    # default. Accepts the full per-request stage taxonomy (F0.6): input, output,
+    # default. Accepts the full per-request stage taxonomy: input, output,
     # retrieval, tool, agent_plan, agent_loop, memory_write.
     stages: Optional[List[Stage]] = None
-    # Model-backed execution strategy + egress controls (F2/F4). Typed so a
+    # Model-backed execution strategy + egress controls. Typed so a
     # malformed block (e.g. strategy.timeout_ms="bad") is rejected at publish time
     # rather than silently kept by extra="allow".
     strategy: Optional[StrategyConfig] = None
@@ -223,7 +223,7 @@ class ExfiltrationConfig(DetectorConfig):
 
 
 class SensitiveBusinessDataConfig(DetectorConfig):
-    """P1a (LLM02): confidential business-data dictionaries + allowlist."""
+    """(LLM02): confidential business-data dictionaries + allowlist."""
     action: str = "WARN"
     categories: Optional[Dict[str, List[str]]] = None
     allowlist: Optional[List[str]] = None
@@ -232,7 +232,7 @@ class SensitiveBusinessDataConfig(DetectorConfig):
 
 
 class CitationIntegrityConfig(DetectorConfig):
-    """P1a (LLM09): validate cited URLs/source-ids + quote spans against grounding."""
+    """(LLM09): validate cited URLs/source-ids + quote spans against grounding."""
     action: Literal["BLOCK", "WARN"] = "WARN"          # only BLOCK/WARN are honoured
     block_threshold: int = Field(default=60, ge=0, le=100)
     require_sources: bool = False
@@ -248,7 +248,7 @@ class SystemPromptFingerprintEntry(BaseModel):
 
 
 class SystemPromptLeakageConfig(DetectorConfig):
-    """P1a (LLM07): match output against registered system-prompt fingerprints by keyed
+    """(LLM07): match output against registered system-prompt fingerprints by keyed
     shingle-hash overlap (hash-only; no raw prompts). ``fingerprint_key`` + the keyed
     hash sets are delivered into the resolved policy from the fingerprint registry."""
     action: Literal["BLOCK", "WARN"] = "BLOCK"         # leaked prompts are blocked/warned, never redacted
@@ -314,7 +314,7 @@ class CustomDetectorRef(BaseModel):
     on_fail: Optional[str] = None
     # Stages this custom detector runs in. None = the default input/output stages only,
     # so a webhook/remote custom detector doesn't start receiving retrieval chunks, agent
-    # plans, or memory writes (and egressing them) just because the new P1b stages exist.
+    # plans, or memory writes (and egressing them) just because the new stages exist.
     # Opt a custom detector into a new stage explicitly by listing it here.
     stages: Optional[List[Stage]] = None
 
@@ -413,16 +413,16 @@ class HallucinationConfig(DetectorConfig):
     min_claim_words: int = 3
 
 
-# ── P1b new-stage / lifecycle gap detectors (OWASP LLM01 / LLM06 / LLM10 / LLM03) ──
+# ── new-stage / lifecycle gap detectors (OWASP LLM01 / LLM06 / LLM10 / LLM03) ──
 
 class RetrievalChunkInjectionConfig(DetectorConfig):
-    """P1b (LLM01): scan retrieved RAG chunks for injection markers (``retrieval`` stage)."""
+    """(LLM01): scan retrieved RAG chunks for injection markers (``retrieval`` stage)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=50, ge=0, le=100)
 
 
 class ToolOutputInjectionConfig(DetectorConfig):
-    """P1b (LLM01): scan tool-result text re-entering context (``tool`` stage)."""
+    """(LLM01): scan tool-result text re-entering context (``tool`` stage)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=50, ge=0, le=100)
 
@@ -437,7 +437,7 @@ class EmbeddingIntegrityConfig(DetectorConfig):
 
 
 class UnboundedConsumptionConfig(DetectorConfig):
-    """P1b (LLM10): per-session token/cost budgets + agent-loop depth caps."""
+    """(LLM10): per-session token/cost budgets + agent-loop depth caps."""
     action: Literal["BLOCK", "WARN"] = "BLOCK"
     max_session_tokens: int = Field(default=200_000, ge=0)
     max_session_cost_usd: float = Field(default=10.0, ge=0)
@@ -447,7 +447,7 @@ class UnboundedConsumptionConfig(DetectorConfig):
 
 
 class ExcessiveAgencyConfig(DetectorConfig):
-    """P1b (LLM06): risk-score agent plans / agent-loop step actions (``agent_plan``/``agent_loop``)."""
+    """(LLM06): risk-score agent plans / agent-loop step actions (``agent_plan``/``agent_loop``)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     # 50 so a single HIGH-severity action reaches BLOCK when action=BLOCK (matches the detector).
     block_threshold: int = Field(default=50, ge=0, le=100)
@@ -456,13 +456,13 @@ class ExcessiveAgencyConfig(DetectorConfig):
 
 
 class MemoryWritePoisoningConfig(DetectorConfig):
-    """P1b (LLM01): scan agent memory writes for persistent injection (``memory_write``)."""
+    """(LLM01): scan agent memory writes for persistent injection (``memory_write``)."""
     action: Literal["BLOCK", "WARN"] = "BLOCK"
     block_threshold: int = Field(default=50, ge=0, le=100)
 
 
 class McpManifestScannerConfig(DetectorConfig):
-    """P1b (LLM01/LLM03): scan tool/MCP manifests at registration (``tool_registration`` hook)."""
+    """(LLM01/LLM03): scan tool/MCP manifests at registration (``tool_registration`` hook)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=50, ge=0, le=100)
     allowed_domains: Optional[List[str]] = None
@@ -470,13 +470,13 @@ class McpManifestScannerConfig(DetectorConfig):
 
 
 class NumericalConsistencyConfig(DetectorConfig):
-    """Deferred backlog §B: deterministic arithmetic-equation consistency (output)."""
+    """Deferred backlog: deterministic arithmetic-equation consistency (output)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=60, ge=0, le=100)
 
 
 class DocumentMetadataLeakageConfig(DetectorConfig):
-    """Deferred backlog §B: deterministic document-artifact / hidden-text leakage."""
+    """Deferred backlog: deterministic document-artifact / hidden-text leakage."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=60, ge=0, le=100)
 
@@ -505,11 +505,11 @@ class PolicySchema(BaseModel):
     copyright: Optional[CopyrightConfig] = None
     code_safety: Optional[CodeSafetyConfig] = None
     hallucination: Optional[HallucinationConfig] = None
-    # P1a deterministic gap detectors (OWASP LLM02 / LLM09 / LLM07)
+    # deterministic gap detectors (OWASP LLM02 / LLM09 / LLM07)
     sensitive_business_data: Optional[SensitiveBusinessDataConfig] = None
     citation_integrity: Optional[CitationIntegrityConfig] = None
     system_prompt_leakage: Optional[SystemPromptLeakageConfig] = None
-    # P1b new-stage / lifecycle gap detectors (OWASP LLM01 / LLM06 / LLM10 / LLM03)
+    # new-stage / lifecycle gap detectors (OWASP LLM01 / LLM06 / LLM10 / LLM03)
     retrieval_chunk_injection: Optional[RetrievalChunkInjectionConfig] = None
     embedding_integrity: Optional[EmbeddingIntegrityConfig] = None
     tool_output_injection: Optional[ToolOutputInjectionConfig] = None
@@ -527,7 +527,7 @@ class PolicySchema(BaseModel):
     custom_detectors: Optional[List[CustomDetectorRef]] = None
     # Per-detector on_fail remediation fallback
     on_fail: Optional[str] = None
-    # Top-level runtime/egress policy (F2 lint + F4 enforcement)
+    # Top-level runtime/egress policy (lint + enforcement)
     runtime_policy: Optional[RuntimePolicyConfig] = None
 
 
@@ -565,7 +565,7 @@ def validate_policy(policy_dict: dict) -> PolicySchema:
             return PolicySchema()
 
 
-# ── Strict validation (F0.2): editor warnings vs publish blockers ───────────
+# ── Strict validation: editor warnings vs publish blockers ───────────
 
 # Top-level keys that are not detector slots but legitimately appear in stored /
 # resolved policies (injected by the resolver, used as detector aliases, or
@@ -616,7 +616,7 @@ def validate_policy_strict(policy_dict: dict) -> PolicyValidationResult:
 
     Unlike :func:`validate_policy` -- which silently drops invalid keys so the
     forward-compatible runtime YAML load never crashes -- this surfaces every
-    problem so a policy can be *rejected* at upsert/publish time (F0.2):
+    problem so a policy can be *rejected* at upsert/publish time:
 
     * **blockers** are typed fields that fail schema validation (wrong types,
       an empty ``stages`` list, a malformed detector block). Today these are

@@ -1,4 +1,4 @@
-"""ZNYX Inference Service (F3) — optional sidecar FastAPI app.
+"""ZNYX Inference Service — optional sidecar FastAPI app.
 
 Endpoints:
   POST /v1/infer/{task}  → the confidence contract (cached + batched)
@@ -58,7 +58,7 @@ def _result(out, model_version: str) -> InferResult:
 
 
 def _assert_pin(req: InferRequest, model_version: str) -> None:
-    """If the caller pinned model_id/revision, the loaded model MUST match (F3 model
+    """If the caller pinned model_id/revision, the loaded model MUST match (model
     pinning) — otherwise the caller could be silently scored by the wrong model. The
     loaded identity is ``model_id@revision``; compare each pinned component against it."""
     if not req.model_id:

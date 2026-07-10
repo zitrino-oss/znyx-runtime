@@ -1,8 +1,8 @@
-"""Remote-API vendor moderation/safety adapters (plan P4).
+"""Remote-API vendor moderation/safety adapters.
 
-Each adapter maps a vendor's response onto the F1 ``DetectorResult`` contract. A
+Each adapter maps a vendor's response onto the ``DetectorResult`` contract. A
 ``remote_api`` detector backend selects one via its ``provider`` field (e.g.
-``openai_moderation``). The escalation path applies the F4 egress gate + audit
+``openai_moderation``). The escalation path applies the egress gate + audit
 before invoking the adapter; the adapter only builds the request, posts, and maps.
 
 Implemented vendors: OpenAI Moderation, Azure AI Content Safety, and AWS Bedrock

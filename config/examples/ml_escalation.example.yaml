@@ -47,7 +47,7 @@ detectors:
           model_id: protectai/deberta-v3-base-prompt-injection-v2
           revision: main
           threshold: 0.5
-          endpoint_url: http://localhost:8088/v1/infer/prompt_injection
+          endpoint_url: http://localhost:9000/v1/infer/prompt_injection
           in_boundary: true               # co-located sidecar → not an egress crossing
           timeout_ms: 800
 
@@ -67,6 +67,6 @@ detectors:
           model_id: unitary/toxic-bert
           revision: main
           threshold: 0.5
-          endpoint_url: http://localhost:8088/v1/infer/toxicity
+          endpoint_url: http://localhost:9000/v1/infer/toxicity
           in_boundary: true
           timeout_ms: 800

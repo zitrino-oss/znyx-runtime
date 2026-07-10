@@ -1,4 +1,4 @@
-"""Dynamic batching (F3 / roadmap §4): a bounded-latency queue that coalesces concurrent
+"""Dynamic batching: a bounded-latency queue that coalesces concurrent
 /v1/infer calls into batches handed to a runner. A single worker drains the queue so
 model inference is serialized (no re-entrancy), batches form up to ``max_batch_size``
 within a ``max_wait_ms`` window, and the service stays within a per-task latency budget —

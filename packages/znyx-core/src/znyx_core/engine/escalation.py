@@ -1,13 +1,13 @@
-"""Escalation engine (F2): run a detector's strategy deterministic → ml → llm.
+"""Escalation engine: run a detector's strategy deterministic → ml → llm.
 
 ``run_with_strategy`` takes the already-computed deterministic result and, guided by
 the strategy's ``order`` + ``escalate_when`` predicates, optionally calls the next
 backend (ml/llm/remote) through the extended RemoteDetector transport. Every attempt
-is recorded as a ``LayerResult`` (F1) with the final one flagged ``selected``; the
+is recorded as a ``LayerResult`` with the final one flagged ``selected``; the
 ``fallback`` policy (fail_open / fail_closed / fallback_to_deterministic) governs what
 happens when a backend can't be reached, recorded in ``fallback_path``.
 
-F4 will insert the central egress gate (no_external_calls / allowlist / residency)
+The central egress gate (no_external_calls / allowlist / residency) will be inserted
 immediately before any boundary-crossing backend call here.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def _caller_accepts_gate(fn) -> bool:
 
 _ML_MODES = {"local_ml", "local_embedding"}
 _LLM_MODES = {"local_llm", "remote_llm"}
-# Egress-gate denial reasons that become the fallback_path verbatim (F4). Includes
+# Egress-gate denial reasons that become the fallback_path verbatim. Includes
 # the two fail-closed reasons: a configured redactor that couldn't run, and an audit
 # write that couldn't be durably persisted — both DENY the outbound call.
 _GATE_REASONS = {
@@ -71,7 +71,7 @@ def _normalize_kind(mode: str) -> str:
 
 
 def _call_backend(backend: DetectorBackend, text: str, timeout_ms: Optional[int]) -> DetectorResult:
-    """Invoke a backend via the extended RemoteDetector transport (F0.5).
+    """Invoke a backend via the extended RemoteDetector transport.
 
     Raises BackendUnavailable on a transport failure so the caller can apply the
     strategy fallback. (Tests inject their own backend_caller and never hit this.)
@@ -81,7 +81,7 @@ def _call_backend(backend: DetectorBackend, text: str, timeout_ms: Optional[int]
 
     timeout = timeout_ms or backend.timeout_ms
 
-    # P4: a remote_api backend may name a vendor moderation adapter (provider), whose
+    # a remote_api backend may name a vendor moderation adapter (provider), whose
     # response shape the generic field-path RemoteDetector can't map. Route to it.
     if backend.mode == "remote_api" and backend.provider:
         from znyx_core.detectors.adapters import get_adapter
@@ -249,7 +249,7 @@ def run_with_strategy(
             logger.warning("escalation: %s — no backend for mode %s, falling back", detector_key, mode)
             break
 
-        # F4 egress sequence (gate → redact → fail-closed audit), shared verbatim with the
+        # egress sequence (gate → redact → fail-closed audit), shared verbatim with the
         # custom webhook path. The endpoint is resolved to the provider's REAL host so
         # auditing/allowlisting/residency see the true destination (not None → "(unknown)",
         # which the provider would later default to OpenAI/etc.). For a judge consensus
@@ -316,7 +316,7 @@ def run_with_strategy(
     return selected_result.model_copy(update={
         "execution_mode": selected_mode,
         "fallback_path": fallback_path,
-        # Scalar mirrors the F1 contract: "True if any content left the boundary."
+        # Scalar mirrors the contract: "True if any content left the boundary."
         "external_egress": any(lyr.external_egress for lyr in layers),
         "layer_results": layers,
     })

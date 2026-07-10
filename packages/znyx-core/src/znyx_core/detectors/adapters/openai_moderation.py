@@ -1,7 +1,7 @@
-"""OpenAI Moderation remote_api adapter (plan P4).
+"""OpenAI Moderation remote_api adapter.
 
 Maps the OpenAI Moderation API response — a stable, public, industry-standard
-contract — onto the F1 DetectorResult. The response shape is:
+contract — onto the DetectorResult. The response shape is:
 
     {"id": "...", "model": "omni-moderation-latest",
      "results": [{"flagged": bool,
@@ -12,7 +12,7 @@ The egress gate + audit are applied by the escalation path BEFORE this runs, so
 the adapter only builds the request, posts, and maps the reply. The HTTP poster
 is injectable so the mapper can be contract-tested against recorded JSON with no
 network. A flagged result returns BLOCK (model-backed → the scorecard gate keeps
-it advisory/WARN until a passing scorecard, per P2)."""
+it advisory/WARN until a passing scorecard)."""
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional, Tuple

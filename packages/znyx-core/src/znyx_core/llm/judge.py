@@ -1,4 +1,4 @@
-"""LLM-judge runtime (P3, roadmap §5/§6).
+"""LLM-judge runtime.
 
 A thin judge layer on top of ``shared/llm/providers.py``:
 
@@ -12,8 +12,8 @@ A thin judge layer on top of ``shared/llm/providers.py``:
 * **token accounting + latency** — carried straight from the provider's ``CompletionResult``.
 
 Remote providers (openai/anthropic/google/custom) go through ``providers.py``. Egress
-gating (F4), cost/rate budgets, and the durable audit row are applied at the CALL SITE
-(the evaluator / escalation engine, P3 units 3–5), which inject the caller — this module
+gating, cost/rate budgets, and the durable audit row are applied at the CALL SITE
+(the evaluator / escalation engine), which inject the caller — this module
 is pure runtime and makes no policy decisions of its own.
 """
 import asyncio
@@ -203,7 +203,7 @@ async def run_judge(req: JudgeRequest, api_key: str, *,
                     timeout: float = 20.0, max_retries: int = 1) -> JudgeResult:
     """Run a single judge call, returning a structured ``JudgeResult``.
 
-    ``caller`` is injectable so the evaluator/escalation can route through the F4 egress
+    ``caller`` is injectable so the evaluator/escalation can route through the egress
     gate (and tests can avoid real network calls); it defaults to the provider adapter.
     A malformed (non-JSON / non-conforming) reply is retried up to ``max_retries`` times
     with a tightening nudge; if it still fails, ``verdict`` is None and ``error`` is set

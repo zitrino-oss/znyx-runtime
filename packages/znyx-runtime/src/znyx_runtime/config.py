@@ -50,15 +50,15 @@ class RuntimeConfig:
     # Anonymous install heartbeat (daily ping to Zitrino - opt-out)
     heartbeat_enabled: bool = False
 
-    # Egress audit sink (F0.4). Backend: "spool" (durable local JSON-lines, drained
+    # Egress audit sink. Backend: "spool" (durable local JSON-lines, drained
     # by the control plane) or "noop" (opt-out). fail_mode "closed" makes a failed
     # audit write deny the egress (no silent un-audited egress); "open" logs and
-    # proceeds. Used by the F4 egress gate before any boundary-crossing call.
+    # proceeds. Used by the egress gate before any boundary-crossing call.
     audit_sink_mode: str = "spool"
     audit_fail_mode: str = "closed"
     audit_spool_path: str = ""  # empty → ~/.znyx/egress-audit.spool
 
-    # Judge audit (P3 Option C). The runtime spools each local-judge call to a durable
+    # Judge audit. The runtime spools each local-judge call to a durable
     # JSON-lines file the control plane drains into judge_audit_events; the same path
     # backs the cached deny-of-wallet spend tally. enabled=False = no judge audit/budget
     # on the runtime path (judges still run). empty path → ~/.znyx/judge-audit.spool.
@@ -126,13 +126,44 @@ class RuntimeConfig:
         )
 
     def __post_init__(self) -> None:
-        """Emit security warnings for dangerous configuration combinations."""
+        """Emit security warnings (and, in production, hard errors) for dangerous
+        configuration combinations."""
+        from znyx_core.utils.env import is_production
+
         if self.bundle_public_key and not self.require_signed_bundles:
             logger.warning(
                 "ZNYX_BUNDLE_PUBLIC_KEY is set but ZNYX_REQUIRE_SIGNED_BUNDLES is False. "
                 "Bundle signatures will not be enforced — set ZNYX_REQUIRE_SIGNED_BUNDLES=true "
                 "to enable verification."
             )
+
+        # Managed mode: the runtime token + policy bundle travel over
+        # control_plane_url. A plaintext http:// endpoint exposes the X-API-Key
+        # and lets a MITM inject a policy that disables every detector. Require
+        # https in production (http://localhost stays allowed for local dev).
+        if self.mode == "managed" and self.control_plane_url:
+            from urllib.parse import urlparse
+
+            cp = urlparse(self.control_plane_url)
+            is_local = (cp.hostname or "") in ("localhost", "127.0.0.1", "::1")
+            if cp.scheme != "https" and not is_local:
+                msg = (
+                    f"ZNYX_CONTROL_PLANE_URL must use https:// (got '{self.control_plane_url}'). "
+                    "The runtime token and policy bundle are exposed over plaintext otherwise."
+                )
+                if is_production():
+                    raise RuntimeError(msg)
+                logger.warning("%s Allowed only because this is not a production environment.", msg)
+
+            # In production without a verifying public key, bundle integrity
+            # rests entirely on transport trust — flag it loudly.
+            if is_production() and not self.require_signed_bundles:
+                logger.warning(
+                    "Managed mode in production without signed bundles: bundle integrity "
+                    "relies on TLS transport alone. Set ZNYX_BUNDLE_PUBLIC_KEY and "
+                    "ZNYX_REQUIRE_SIGNED_BUNDLES=true for end-to-end policy signing."
+                )
+
         if self.cache_dir.startswith("/tmp"):
             logger.warning(
                 "Bundle cache is stored in /tmp (%s), which is world-readable. "

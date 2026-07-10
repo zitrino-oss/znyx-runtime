@@ -21,7 +21,7 @@ import httpx
 
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
 from znyx_core.detectors.remote import RemoteDetector as _RemoteDetectorImpl
-from znyx_core.net_guard import UnsafeEgressURL, assert_safe_egress_url
+from znyx_core.net_guard import EgressTarget, UnsafeEgressURL, resolve_egress_target
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +98,11 @@ class WebhookDetector(BaseCustomDetector):
         # internal-network or cloud-metadata probe. Fail SAFE: skip the call on a bad
         # URL rather than fail-open into an unguarded request.
         url = config.get("url", "")
+        # Resolve+validate DNS ONCE and connect to the pinned IP below, so a
+        # rebinding attacker can't flip a public name to an internal/metadata IP
+        # between this check and the request.
         try:
-            assert_safe_egress_url(url, allow_private=False)
+            target = resolve_egress_target(url, allow_private=False)
         except UnsafeEgressURL as e:
             logger.error("Webhook detector blocked unsafe URL (%s): %s", url, e)
             return DetectorResult()
@@ -111,19 +114,24 @@ class WebhookDetector(BaseCustomDetector):
             if loop.is_running():
                 # We're inside an async context - can't use asyncio.run
                 # Use a sync httpx client instead
-                return self._detect_sync(text, config)
-            return asyncio.run(self._detect_async(text, config))
+                return self._detect_sync(text, config, target)
+            return asyncio.run(self._detect_async(text, config, target))
         except RuntimeError:
-            return self._detect_sync(text, config)
+            return self._detect_sync(text, config, target)
 
-    def _detect_sync(self, text: str, config: Dict[str, Any]) -> DetectorResult:
+    def _detect_sync(self, text: str, config: Dict[str, Any], target: EgressTarget) -> DetectorResult:
         url = config.get("url", "")
         timeout = config.get("timeout", 5)
         headers = config.get("headers", {})
 
         try:
             with httpx.Client(timeout=timeout) as client:
-                response = client.post(url, json={"text": text, "config": config}, headers=headers)
+                response = client.post(
+                    target.connect_url,
+                    json={"text": text, "config": config},
+                    headers={**headers, "Host": target.host_header},
+                    extensions={"sni_hostname": target.sni_hostname},
+                )
                 if response.status_code == 200:
                     return self._parse_response(response.json())
         except Exception as e:
@@ -132,14 +140,19 @@ class WebhookDetector(BaseCustomDetector):
         # Fail open - return no hits
         return DetectorResult()
 
-    async def _detect_async(self, text: str, config: Dict[str, Any]) -> DetectorResult:
+    async def _detect_async(self, text: str, config: Dict[str, Any], target: EgressTarget) -> DetectorResult:
         url = config.get("url", "")
         timeout = config.get("timeout", 5)
         headers = config.get("headers", {})
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, json={"text": text, "config": config}, headers=headers)
+                response = await client.post(
+                    target.connect_url,
+                    json={"text": text, "config": config},
+                    headers={**headers, "Host": target.host_header},
+                    extensions={"sni_hostname": target.sni_hostname},
+                )
                 if response.status_code == 200:
                     return self._parse_response(response.json())
         except Exception as e:

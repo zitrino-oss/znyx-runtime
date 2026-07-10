@@ -58,7 +58,7 @@ class GuardrailsEvaluator:
         self.plugin_registry = plugin_registry
 
         self._registry = registry or default_registry
-        # F4: pass-through egress audit sink to the orchestrator (escalation engine) AND
+        # pass-through egress audit sink to the orchestrator (escalation engine) AND
         # the quality NLI scorer, so every boundary-crossing call is gated + audited.
         self._egress_sink = egress_sink
         self._orchestrator = DetectorOrchestrator(
@@ -94,7 +94,7 @@ class GuardrailsEvaluator:
             context: "input" or "output"
             policy: Pre-resolved policy dict. If None, resolved via policy_resolver or DB.
             db: Optional DB session for legacy DB-mode resolution
-            judge_ctx: Optional JudgeExecutionContext (P3). When a composition root injects
+            judge_ctx: Optional JudgeExecutionContext. When a composition root injects
                 it, escalation judges run multi-judge consensus and quality judges record
                 audit + honour deny-of-wallet budgets. None = judges use the plain transport
                 with no CP enforcement (zero behaviour change for current callers).
@@ -108,7 +108,7 @@ class GuardrailsEvaluator:
 
         policy_version = policy.get('policy_version', 'unknown')
 
-        # Run detector pipeline. Generalized stage dispatch (F0.6): route by the
+        # Run detector pipeline. Generalized stage dispatch: route by the
         # actual stage (input/output/retrieval/tool/agent_plan/agent_loop/memory_write)
         # rather than the old input-vs-output branch, so a new stage's detectors are
         # selected correctly instead of the stage being treated as output.
@@ -141,9 +141,9 @@ class GuardrailsEvaluator:
         # Quality scoring - output context only, informational (never blocks)
         quality_config = policy.get("quality_scoring", {})
         if context == "output" and quality_config.get("enabled", False):
-            # Optional NLI-backed groundedness via the F3 inference sidecar; None when
+            # Optional NLI-backed groundedness via the inference sidecar; None when
             # the quality config doesn't opt in → deterministic token-overlap fallback.
-            # The scorer routes through the F4 egress gate (no_external_calls / allowlist
+            # The scorer routes through the egress gate (no_external_calls / allowlist
             # / residency / redact + fail-closed audit) via the same sink as detectors.
             from znyx_core.engine.quality.nli_client import nli_scorer_from_config
             nli_scorer = nli_scorer_from_config(
@@ -153,14 +153,14 @@ class GuardrailsEvaluator:
                 egress_sink=self._egress_sink,
                 request=request,
             )
-            # P3: LLM-judge evaluators (opt-in via judge_mode + a `judge` config block).
-            # Each routes through the same F4 egress sink; rubrics default to the built-in
+            # LLM-judge evaluators (opt-in via judge_mode + a `judge` config block).
+            # Each routes through the same egress sink; rubrics default to the built-in
             # set (a control-plane caller can pass the org's registered rubrics). Falls back
             # to the deterministic scorer per-metric when a judge call is denied/unavailable.
             judge_evaluators = None
             if quality_config.get("judge_mode") and isinstance(quality_config.get("judge"), dict):
                 from znyx_core.engine.quality.judge_evaluator import build_judge_evaluators
-                # P3: an injected judge_ctx supplies the org's registered rubrics, the
+                # an injected judge_ctx supplies the org's registered rubrics, the
                 # deny-of-wallet budget check, the audit sink, and (runtime/test) the
                 # provider caller. Absent it, the evaluators run with built-in rubrics and
                 # no CP enforcement (unchanged).
@@ -227,7 +227,7 @@ class GuardrailsEvaluator:
             tool_result = tool_detector.detect(request.tool_name, request.tool_args)
             results.append(tool_result)
 
-        # P1b (LLM01): if the caller supplied the tool RESULT text, scan it through the
+        # (LLM01): if the caller supplied the tool RESULT text, scan it through the
         # generalized pipeline at context="tool" (tool_output_injection + any enabled
         # content detectors), so it gets the SAME treatment as every other stage — per-
         # detector timings, strategy escalation, and scorecard-gate handling — rather than
@@ -295,13 +295,13 @@ class GuardrailsEvaluator:
     async def evaluate_stage(self, scoped, stage: str,
                              policy: Optional[Dict[str, Any]] = None,
                              db=None, *, judge_ctx=None) -> EvaluationResponse:
-        """Evaluate a typed per-stage request (P1b new stages: retrieval / agent_plan /
+        """Evaluate a typed per-stage request (new stages: retrieval / agent_plan /
         agent_loop / memory_write).
 
         Flattens the typed ``_ScopedRequest`` into a text ``EvaluationRequest`` — folding
         the stage-specific structured payload into metadata so detectors that need more
         than flat text (e.g. ``unbounded_consumption`` budget signals) can read it — then
-        dispatches through the generalized stage pipeline (F0.6)."""
+        dispatches through the generalized stage pipeline."""
         if stage not in {s.value for s in Stage}:
             raise ValueError(f"Unknown evaluation stage '{stage}'")
         eval_request = self._to_eval_request(scoped, stage)

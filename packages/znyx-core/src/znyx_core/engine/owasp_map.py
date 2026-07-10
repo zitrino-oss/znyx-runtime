@@ -1,4 +1,4 @@
-"""OWASP-LLM-2025 coverage map (P0).
+"""OWASP-LLM-2025 coverage map.
 
 A static, honest mapping of ZNYX detectors to the OWASP LLM Top-10 (2025): which
 detectors are a *dedicated* control for a category vs *adjacent* (partial) coverage,
@@ -8,7 +8,7 @@ claim blanket LLM01–LLM10 coverage.
 
 ``compute_coverage(enabled)`` joins an org's enabled detectors against this map and
 returns a per-category status (full / partial / uncovered) + recommended controls.
-Recommendations may name not-yet-implemented detectors (P1b/P2) — flagged via
+Recommendations may name not-yet-implemented detectors — flagged via
 ``DETECTOR_META[...].implemented`` — so gaps point at the planned control.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List, Optional
 class DetectorMeta:
     stages: List[str]
     languages: List[str]          # ["*"] = language-agnostic (pattern/structural)
-    implemented: bool = True       # False = planned (P1b/P2), shown only as a recommendation
+    implemented: bool = True       # False = planned, shown only as a recommendation
 
 
 # Detector → where it runs + languages + whether it exists today. Planned controls
@@ -54,7 +54,7 @@ DETECTOR_META: Dict[str, DetectorMeta] = {
     "gibberish":                DetectorMeta(["input"], ["*"]),
     "language":                 DetectorMeta(["input"], ["*"]),
     "copyright":                DetectorMeta(["output"], ["en"]),
-    # P1b new-stage / lifecycle gap detectors — now implemented (registered + wired).
+    # new-stage / lifecycle gap detectors — now implemented (registered + wired).
     "retrieval_chunk_injection": DetectorMeta(["retrieval"], ["en"]),
     "tool_output_injection":     DetectorMeta(["tool"], ["en"]),
     "memory_write_poisoning":    DetectorMeta(["memory_write"], ["en"]),

@@ -1,4 +1,4 @@
-"""Canonical label / score semantics (F1 → P0).
+"""Canonical label / score semantics.
 
 The single source of truth for how ZNYX labels things, so every layer, the aggregator,
 the trace UI, scorecards, model cards, and benchmark scoring agree:
@@ -9,7 +9,7 @@ the trace UI, scorecards, model cards, and benchmark scoring agree:
   * **Score normalization** — mapping each layer's native score onto one 0–100 scale.
 
 Documented for humans in ``docs/label-semantics.md`` (keep the two in sync — the doc
-quotes these constants). Answers the roadmap research question "how to normalize scores
+quotes these constants). Answers the research question "how to normalize scores
 across layers".
 """
 from __future__ import annotations
@@ -111,7 +111,7 @@ def normalize_risk(value: float, kind: str = "deterministic") -> int:
 
     - ``deterministic`` / ``judge``: already a 0..100 risk score — clamp.
     - ``ml`` / ``embedding`` / ``probability``: a 0..1 probability — ×100 then clamp
-      (roadmap §11 "ML probability ×100"). Probabilities are clamped to [0,1] upstream.
+      ( "ML probability ×100"). Probabilities are clamped to [0,1] upstream.
 
     Keeps the aggregator's "worst decision wins" intact while letting each layer
     record both its native and normalized score for divergence analysis.

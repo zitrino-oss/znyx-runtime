@@ -100,14 +100,14 @@ def _build_default_registry() -> DetectorRegistry:
     registry.register("sensitive_business_data", SensitiveBusinessDataDetector)
     registry.register("citation_integrity", CitationIntegrityDetector)
     registry.register("system_prompt_leakage", SystemPromptLeakageDetector)
-    # P1b new-stage detectors (retrieval / tool / agent_loop / agent_plan / memory_write)
+    # new-stage detectors (retrieval / tool / agent_loop / agent_plan / memory_write)
     registry.register("retrieval_chunk_injection", RetrievalChunkInjectionDetector)
     registry.register("embedding_integrity", EmbeddingIntegrityDetector)
     registry.register("tool_output_injection", ToolOutputInjectionDetector)
     registry.register("unbounded_consumption", UnboundedConsumptionDetector)
     registry.register("excessive_agency", ExcessiveAgencyDetector)
     registry.register("memory_write_poisoning", MemoryWritePoisoningDetector)
-    # P1b lifecycle hook (tool_registration) — registered for the hook path, NOT in
+    # lifecycle hook (tool_registration) — registered for the hook path, NOT in
     # _DETECTOR_PIPELINE (it does not run per request).
     registry.register("mcp_manifest_scanner", McpManifestScannerDetector)
     registry.register("numerical_consistency", NumericalConsistencyDetector)

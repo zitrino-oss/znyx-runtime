@@ -14,9 +14,10 @@ This repository holds three packages:
 - **`znyx-runtime`** - a lightweight FastAPI service that wraps the engine behind
   an HTTP API. Deliberately thin: no database, no heavy ML libraries.
 - **`znyx-inference`** - an optional sidecar that serves ML models for
-  model-backed detection. Boots dependency-free on a stub runner; add the
-  `[models]` extra to serve real weights (which are never bundled - you fetch and
-  pin them; see `packages/znyx-inference/MODELS.md`).
+  model-backed detection. Boots dependency-free on a stub runner; add the lean
+  CPU `[onnx]` extra (onnxruntime + tokenizers, no torch/CUDA) to serve real
+  weights (which are never bundled - you export, quantize, and pin them offline;
+  see `packages/znyx-inference/MODELS.md`).
 
 Model-backed (ML) detection is an optional layer served by the inference sidecar
 over HTTP. Without it, every detector runs its deterministic rules path, so the

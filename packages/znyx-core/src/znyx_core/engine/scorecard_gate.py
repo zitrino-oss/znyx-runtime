@@ -1,4 +1,4 @@
-"""Scorecard gate (P2) — a machine-checkable quality bar a model-backed detector
+"""Scorecard gate — a machine-checkable quality bar a model-backed detector
 (``ml_model`` / ``llm_judge``) must clear before it can be published, installed, or used
 in *enforcement* (BLOCK/REDACT). "Enforce, don't just display."
 
@@ -8,7 +8,7 @@ Two tiers:
     that clears advisory but not enforcement is install-able but pinned to WARN.
 
 Pure + dependency-free (stdlib only) so the SAME gate is evaluated at every enforcement
-point: hub publish, org install, policy validation (F0.2), bundle publish, and runtime
+point: hub publish, org install, policy validation, bundle publish, and runtime
 action resolution. A missing metric fails the gate — you can't certify what you didn't
 measure.
 """
@@ -35,14 +35,14 @@ class ScorecardGateError(ValueError):
 
 
 # Execution modes that make a detector "model-backed" (everything but pure deterministic).
-# A detector whose F2 strategy.order includes one of these is gated.
+# A detector whose strategy.order includes one of these is gated.
 MODEL_BACKED_MODES = {"local_ml", "local_embedding", "local_llm", "remote_llm", "remote_api"}
 # Actions that require the stricter ENFORCEMENT gate (vs advisory).
 ENFORCING_ACTIONS = {"BLOCK", "REDACT"}
 
 
 def is_model_backed(config: Any) -> bool:
-    """True if a detector's policy config escalates to a model layer (F2 strategy with a
+    """True if a detector's policy config escalates to a model layer (strategy with a
     model-backed mode in its order) — i.e. it is subject to the scorecard gate."""
     if not isinstance(config, dict):
         return False

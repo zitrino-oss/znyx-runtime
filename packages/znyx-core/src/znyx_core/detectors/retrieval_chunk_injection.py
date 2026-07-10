@@ -1,9 +1,9 @@
-"""Retrieval-chunk injection detector (P1b, OWASP LLM01 — indirect prompt injection).
+"""Retrieval-chunk injection detector (OWASP LLM01 — indirect prompt injection).
 
 Scans retrieved RAG chunks for instruction-injection markers BEFORE they enter the
 model context: "ignore previous instructions", role-switch text, forged chat turns,
 prompt-boundary tokens, and tool-invocation lures planted in a document. Deterministic
-markers only; the ML classifier escalation is P2 (wired via the detector ``strategy``).
+markers only; the ML classifier escalation is wired via the detector ``strategy``.
 
 Runs in the ``retrieval`` stage (POST /v1/evaluate/retrieval).
 """

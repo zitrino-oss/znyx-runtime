@@ -1,12 +1,12 @@
-"""Inference-backed NLI scorer for groundedness (P2 unit 3).
+"""Inference-backed NLI scorer for groundedness.
 
 Builds the ``nli_scorer`` callable ``(premise, hypotheses) -> list[float]`` that
 ``score_groundedness``/``QualityScorer`` use for entailment-based grounding. It talks to
-the F3 inference sidecar's ``POST /v1/infer/{task}`` (default task ``nli``) using the
+the inference sidecar's ``POST /v1/infer/{task}`` (default task ``nli``) using the
 same JSON ``{"premise", "hypothesis"}`` pair the ``NliRunner`` expects, and converts the
 contract's ``risk_score`` back into an entailment probability.
 
-**Egress (F4):** the premise (caller-provided sources) and hypotheses (model output
+**Egress:** the premise (caller-provided sources) and hypotheses (model output
 claims) are content that may leave the trust boundary, so EVERY call is routed through
 the shared ``prepare_and_audit_egress`` gate — the same one the model-backed escalation
 and custom-webhook paths use. A co-located sidecar (``in_boundary=True``, the default) is
@@ -35,12 +35,12 @@ logger = logging.getLogger(__name__)
 
 
 class EgressBlocked(RuntimeError):
-    """The F4 egress gate denied / could not audit the NLI call → fall back to overlap."""
+    """The egress gate denied / could not audit the NLI call → fall back to overlap."""
 
 
 @dataclass
 class NliEgressPolicy:
-    """The F4 boundary controls applied to NLI sidecar calls. Defaults describe a
+    """The boundary controls applied to NLI sidecar calls. Defaults describe a
     co-located in-boundary sidecar (no crossing, no redaction/audit needed)."""
     in_boundary: Optional[bool] = True       # None/True → co-located; False → hosted (gated)
     no_external_calls: bool = False
@@ -88,7 +88,7 @@ def make_inference_nli_scorer(
     request: Any = None,
 ) -> Callable[[str, List[str]], List[float]]:
     """Return a synchronous ``(premise, hypotheses) -> list[float]`` entailment scorer
-    backed by the inference sidecar, with F4 egress controls applied per call.
+    backed by the inference sidecar, with egress controls applied per call.
 
     One entailment probability is returned per hypothesis. The callable raises on
     transport / contract / egress errors (including a result-count mismatch) so
@@ -114,7 +114,7 @@ def make_inference_nli_scorer(
         # loopback is permitted, but the cloud-metadata / link-local range is blocked).
         assert_safe_egress_url(url, allow_private=True)
 
-        # F4 gate (single fail-closed authority): decision + strict redaction + audit on
+        # egress gate (single fail-closed authority): decision + strict redaction + audit on
         # the full payload content. In-boundary sidecar → not egress, proceeds untouched.
         joined = premise + "\n" + "\n".join(hypotheses)
         prep = prepare_and_audit_egress(
@@ -196,7 +196,7 @@ def nli_scorer_from_config(
             auth_value: <secret>
             timeout_ms: 5000
 
-    The F4 boundary controls (``no_external_calls`` / ``allowed_regions``) come from the
+    The boundary controls (``no_external_calls`` / ``allowed_regions``) come from the
     ``runtime_policy``; PII/secrets redaction configs from the full ``policy`` so egress
     redaction matches the org's in-pipeline redaction. Returns None (→ token-overlap
     fallback) when the block is missing, disabled, or has no ``endpoint_url``."""

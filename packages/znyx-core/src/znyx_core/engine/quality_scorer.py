@@ -83,7 +83,7 @@ class QualityScorer:
         self.metrics: List[str] = config.get("metrics", _DEFAULT_METRICS)
         self.weights: Dict[str, float] = {**_DEFAULT_WEIGHTS, **config.get("weights", {})}
         self.judge_mode: bool = config.get("judge_mode", False)
-        # P3: per-instance judge evaluators (built per-request from policy.quality_scoring.judge,
+        # per-instance judge evaluators (built per-request from policy.quality_scoring.judge,
         # carrying the org's rubric/provider/egress). Take precedence over the global
         # register_judge_evaluator registry. Their judge-only metrics are scored too.
         self._judge_evaluators: Dict[str, Callable] = judge_evaluators or {}
@@ -93,7 +93,7 @@ class QualityScorer:
         self.judge_model: Optional[str] = config.get(
             "judge_model", os.getenv("QUALITY_JUDGE_MODEL"),
         )
-        # Optional F3 inference NLI task for entailment-based groundedness.
+        # Optional inference NLI task for entailment-based groundedness.
         # ``(premise, hypotheses) -> list[float]`` entailment probs; None → token overlap.
         self.nli_scorer = nli_scorer
 

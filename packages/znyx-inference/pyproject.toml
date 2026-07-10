@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "znyx-inference"
 version = "1.0.0"
-description = "Znyx inference sidecar: an optional HTTP service that serves ML models for model-backed guardrail detection. Boots dependency-free on a stub runner; add the [models] extra to serve real weights."
+description = "Znyx inference sidecar: an optional HTTP service that serves ML models for model-backed guardrail detection. Boots dependency-free on a stub runner; add the [onnx] extra to serve real weights on CPU."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -34,20 +34,42 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Install with `pip install znyx-inference[models]` to serve real model weights.
-# Weights are never bundled; fetch them explicitly and sha256-pin them (see MODELS.md).
-models = [
-  "torch>=2.2,<3.0",
-  "transformers>=4.40,<5.0",
-  "sentence-transformers>=2.7,<4.0",
+# --- [onnx] — the DEFAULT serving extra. CPU-only, torch-free. This is what the
+# inference Docker image installs. Serves sha256-pinned local ONNX artifacts via
+# onnxruntime + the standalone Rust `tokenizers` (no transformers, no torch, no CUDA).
+# Weights are never bundled; export + pin them offline with the [export] extra (see MODELS.md).
+#   pip install znyx-inference[onnx]
+onnx = [
   "onnxruntime>=1.17,<2.0",
   "tokenizers>=0.19,<1.0",
+  "numpy>=1.24",
+]
+
+# --- [export] — OFFLINE, operator/CI only. Never installed in the serving image. Pulls a
+# vetted checkpoint and exports + dynamically-quantizes it to a pinned ONNX artifact
+# (scripts/fetch_inference_model.py). This is the ONLY place torch lives in the normal flow.
+#   pip install znyx-inference[export]
+export = [
+  "torch>=2.2,<3.0",
+  "transformers>=4.40,<5.0",
+  "optimum[exporters,onnxruntime]>=1.17,<2.0",
   "huggingface-hub>=0.23,<1.0",
+]
+
+# --- [torch] — OPT-IN escape hatch. Adds the eager PyTorch stack so the generative
+# guard_llm runner (Llama-Guard-style causal LM) can serve, and so un-exported HF weights
+# can be run directly. Heavy (pulls the torch CPU/GPU wheel); most detection is covered by
+# the CPU-ONNX runners above, so install this only if you need generative guard.
+#   pip install znyx-inference[torch]
+torch = [
+  "torch>=2.2,<3.0",
+  "transformers>=4.40,<5.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/zitrino-oss/znyx-runtime"
 Source = "https://github.com/zitrino-oss/znyx-runtime"
+Issues = "https://github.com/zitrino-oss/znyx-runtime/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

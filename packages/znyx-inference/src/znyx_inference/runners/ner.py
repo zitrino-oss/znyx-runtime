@@ -1,7 +1,8 @@
-"""Token-classification (NER) runner (F3) — detects UNSTRUCTURED PII entities (names,
+"""Token-classification (NER) runner — detects UNSTRUCTURED PII entities (names,
 addresses, etc.) that the deterministic regex/checksum PII detector can't catch. Backed
-by a token-classification model (e.g. piiranha). Heavy deps (torch + transformers) import
-only in ``load()``; weights load from the verified local artifact dir, never the network.
+by a token-classification model (e.g. piiranha). Served on CPU via onnxruntime + tokenizers
+(torch-free); the ONNX graph loads only in ``load()`` from the verified local artifact dir,
+never the network.
 
 risk = the max probability assigned to any PII (non-"outside") entity token; ``label_scores``
 carries the per-entity-type max confidence so the caller sees WHICH PII types were found.
@@ -11,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from znyx_inference.runners._heavy import HeavyRunner, require
+from znyx_inference.runners._heavy import OnnxTextRunner
 from znyx_inference.runners.base import InferOutput
 
 # Labels meaning "not a PII entity" (outside), compared case-insensitively AFTER stripping
@@ -20,19 +21,8 @@ _OUTSIDE_LABELS = {"o", "outside", "none", "label_0", ""}
 _BIO_PREFIX = re.compile(r"^[biloue][-_](.+)$", re.IGNORECASE)
 
 
-class NerRunner(HeavyRunner):
+class NerRunner(OnnxTextRunner):
     runner_kind = "ner"
-
-    def _import_stack(self) -> None:
-        self._torch = require(lambda: __import__("torch"), "torch")
-        require(lambda: __import__("transformers"), "transformers")
-
-    def _build(self, path: str) -> None:
-        from transformers import AutoModelForTokenClassification, AutoTokenizer
-        self._tok = AutoTokenizer.from_pretrained(path, local_files_only=True)
-        self._model = AutoModelForTokenClassification.from_pretrained(path, local_files_only=True)
-        self._model.eval()
-        self._id2label = dict(getattr(self._model.config, "id2label", {}) or {})
 
     def _entity_type(self, raw_label: str) -> Optional[str]:
         """PII entity type for a token label, or None if it's the outside/non-entity label.
@@ -59,20 +49,18 @@ class NerRunner(HeavyRunner):
         return self._output(unsafe, types or None)
 
     def infer_batch(self, texts: List[str]) -> List[InferOutput]:
-        torch = self._torch
-        enc = self._tok(list(texts), padding=True, truncation=True, max_length=512,
-                        return_tensors="pt")
-        with torch.no_grad():
-            probs = torch.softmax(self._model(**enc).logits, dim=-1)   # [B, T, L]
-        mask = enc.get("attention_mask")
+        np = self._np
+        logits, encs = self._forward(list(texts))          # [B, T, L]
+        probs = self._softmax(logits, axis=-1)
         outs: List[InferOutput] = []
         for b in range(probs.shape[0]):
+            mask = encs[b].attention_mask
             token_top: List[Tuple[str, float]] = []
             for t in range(probs.shape[1]):
-                if mask is not None and int(mask[b][t]) == 0:
+                if t < len(mask) and mask[t] == 0:
                     continue                       # skip padding
                 row = probs[b][t]
-                idx = int(torch.argmax(row))
+                idx = int(np.argmax(row))
                 token_top.append((str(self._id2label.get(idx, f"LABEL_{idx}")), float(row[idx])))
             outs.append(self._aggregate(token_top))
         return outs

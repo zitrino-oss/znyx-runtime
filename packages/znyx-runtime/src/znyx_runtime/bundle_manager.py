@@ -171,12 +171,23 @@ class BundleManager:
             len(self._BOOT_RETRY_DELAYS), last_err,
         )
 
-        # Fall back to cached bundle on disk.
+        # Fall back to cached bundle on disk. Validate it with the SAME checks
+        # as a freshly-fetched bundle — anyone who can write the cache file must
+        # not be able to poison the policy (e.g. disable every detector). An
+        # invalid/tampered cache is treated as "no bundle" and falls through to
+        # the fail-mode handling below rather than being trusted.
         cache_path = self._cache_path()
         if Path(cache_path).exists():
-            self._bundle = load_bundle_from_file(cache_path)
-            logger.info(f"Loaded cached bundle from {cache_path}")
-            return
+            cached = load_bundle_from_file(cache_path)
+            if validate_bundle(
+                cached,
+                public_key_pem=self.config.bundle_public_key or None,
+                require_signature=self.config.require_signed_bundles,
+            ):
+                self._bundle = cached
+                logger.info(f"Loaded cached bundle from {cache_path}")
+                return
+            logger.error("Cached bundle failed validation (ignoring): %s", cache_path)
 
         # No bundle available.
         if self.config.fail_mode == "open":
@@ -234,7 +245,9 @@ class BundleManager:
                 logger.warning(f"Bundle poll failed: {e}")
 
     def _cache_path(self) -> str:
-        Path(self.config.cache_dir).mkdir(parents=True, exist_ok=True)
+        # 0700: the cached bundle is trusted policy; don't let other local users
+        # read the runtime token path or write a poisoned bundle into it.
+        Path(self.config.cache_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
         return str(Path(self.config.cache_dir) / "bundle_cache.json")
 
     @staticmethod

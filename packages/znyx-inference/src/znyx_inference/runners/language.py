@@ -1,9 +1,9 @@
-"""Language-aware runner (F3) — closes the gap where the generic ClassifierRunner scored
+"""Language-aware runner — closes the gap where the generic ClassifierRunner scored
 0 for language-ID labels (language identification is multi-class, not binary harm, so the
 "unsafe-prob" heuristic never fired). Loads a language-identification sequence-classification
 model (e.g. XLM-R language-detection) and maps the predicted language to an allow/block
-decision using ``allowed_languages`` / ``blocked_languages`` from the runner spec. Heavy
-deps import only in ``load()``.
+decision using ``allowed_languages`` / ``blocked_languages`` from the runner spec. Served
+on CPU via onnxruntime + tokenizers (torch-free); the ONNX graph loads only in ``load()``.
 
 risk = the predicted language's probability WHEN that language is blocked (or outside the
 allowed set); else 0. ``label_scores`` carries the full language distribution, so the
@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from znyx_inference.runners._heavy import HeavyRunner, require
+from znyx_inference.runners._heavy import OnnxTextRunner
 from znyx_inference.runners.base import InferOutput
 
 
-class LanguageRunner(HeavyRunner):
+class LanguageRunner(OnnxTextRunner):
     runner_kind = "language"
 
     def __init__(self, task: str, spec: Dict[str, Any]):
@@ -28,17 +28,6 @@ class LanguageRunner(HeavyRunner):
         # is exempt from the allowed-list check.
         self._allowed = {str(s).lower() for s in (spec.get("allowed_languages") or [])}
         self._blocked = {str(s).lower() for s in (spec.get("blocked_languages") or [])}
-
-    def _import_stack(self) -> None:
-        self._torch = require(lambda: __import__("torch"), "torch")
-        require(lambda: __import__("transformers"), "transformers")
-
-    def _build(self, path: str) -> None:
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-        self._tok = AutoTokenizer.from_pretrained(path, local_files_only=True)
-        self._model = AutoModelForSequenceClassification.from_pretrained(path, local_files_only=True)
-        self._model.eval()
-        self._id2label = dict(getattr(self._model.config, "id2label", {}) or {})
 
     def _decide(self, lang_probs: Dict[str, float]) -> InferOutput:
         """Pure: given a language→probability distribution, apply the allow/block policy.
@@ -56,13 +45,10 @@ class LanguageRunner(HeavyRunner):
         return self._output(unsafe, lang_probs)
 
     def infer_batch(self, texts: List[str]) -> List[InferOutput]:
-        torch = self._torch
-        enc = self._tok(list(texts), padding=True, truncation=True, max_length=512,
-                        return_tensors="pt")
-        with torch.no_grad():
-            probs = torch.softmax(self._model(**enc).logits, dim=-1).tolist()
+        logits, _ = self._forward(list(texts))       # [B, L]
+        probs = self._softmax(logits, axis=-1)
         outs: List[InferOutput] = []
-        for row in probs:
+        for row in probs.tolist():
             lang_probs = {str(self._id2label.get(i, f"LABEL_{i}")).lower(): float(p)
                           for i, p in enumerate(row)}
             outs.append(self._decide(lang_probs))

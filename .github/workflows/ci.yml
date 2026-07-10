@@ -21,15 +21,19 @@ jobs:
     name: Compile & import check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install packages
+        # Install the shippable packages so the import check exercises real deps.
+        run: pip install ./packages/znyx-core ./packages/znyx-runtime
 
       - name: Byte-compile
-        run: python -m compileall -q app
+        run: python -m compileall -q packages
+
+      - name: Import check
+        run: python -c "import znyx_core, znyx_runtime"

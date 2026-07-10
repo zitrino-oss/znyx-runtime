@@ -127,7 +127,9 @@ def _ngram_fingerprints(text: str, n: int = 8) -> Set[str]:
     fingerprints = set()
     for i in range(len(words) - n + 1):
         ngram = " ".join(words[i:i + n])
-        fp = hashlib.md5(ngram.encode()).hexdigest()[:12]
+        # Non-cryptographic content fingerprint (dedup key), not a security
+        # signature — usedforsecurity=False documents that and satisfies SAST.
+        fp = hashlib.md5(ngram.encode(), usedforsecurity=False).hexdigest()[:12]
         fingerprints.add(fp)
     return fingerprints
 

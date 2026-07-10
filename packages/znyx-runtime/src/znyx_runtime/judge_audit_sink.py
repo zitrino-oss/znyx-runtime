@@ -1,9 +1,9 @@
-"""Runtime-side judge audit + cached deny-of-wallet (P3 — Option C).
+"""Runtime-side judge audit + cached deny-of-wallet.
 
 The stateless runtime can run a co-located judge (a local_llm sidecar reached at a
 localhost endpoint in its policy), but it has no DB to write the judge audit trail or to
 read CP-wide budget spend. This module is the runtime counterpart of the CP judge bridge,
-built on the SAME durable-spool + CP-drain transport F4 uses for egress audit:
+built on the SAME durable-spool + CP-drain transport used for egress audit:
 
 * ``JudgeAuditSpool`` — a durable append-only JSON-lines spool (fsync per line), mirroring
   ``runtime.audit_sink.SpoolAuditSink`` but carrying judge-call event dicts. The control
@@ -15,7 +15,7 @@ built on the SAME durable-spool + CP-drain transport F4 uses for egress audit:
   reconciles it) — the documented trade-off of judging on the stateless path.
 
 Audit here is POST-call (the judge already ran), so a spool write failure is logged and
-swallowed rather than denying anything — unlike the F4 egress gate, which is pre-call.
+swallowed rather than denying anything — unlike the egress gate, which is pre-call.
 """
 from __future__ import annotations
 

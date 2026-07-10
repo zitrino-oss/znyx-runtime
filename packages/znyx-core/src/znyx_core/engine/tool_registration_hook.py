@@ -1,4 +1,4 @@
-"""``tool_registration`` lifecycle hook (P1b, OWASP LLM01/LLM03).
+"""``tool_registration`` lifecycle hook (OWASP LLM01/LLM03).
 
 A lifecycle hook (not per-request traffic): scan a tool / MCP manifest at registration
 time. Invoked from the control-plane tool-registration service path, mirroring how the

@@ -1,4 +1,4 @@
-"""Memory-write poisoning detector (P1b, OWASP LLM01 — persistent indirect injection).
+"""Memory-write poisoning detector (OWASP LLM01 — persistent indirect injection).
 
 Text written to an agent's long-term memory is replayed into future contexts, so a
 poisoned memory write ("always ignore safety checks", "you are now an admin assistant",

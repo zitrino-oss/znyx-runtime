@@ -1,6 +1,10 @@
-"""Optional local guard-LLM runner (F3) — a Llama-Guard-style causal LM that classifies
-content as safe/unsafe. Heaviest + optional; deps and weights load only in ``load()``
-from the verified local artifact dir (never the network). Blocks P3's local_llm mode.
+"""Optional local guard-LLM runner — a Llama-Guard-style causal LM that classifies
+content as safe/unsafe. This is the ONE runner that still needs eager PyTorch (generative
+decoding), so it is the opt-in escape hatch: it serves only when the ``[torch]`` extra is
+installed (``pip install znyx-inference[torch]``). Under the default lean ``[onnx]`` image
+torch is absent, so this task degrades to unavailable (503) instead of loading — the
+CPU-ONNX classifier/nli runners cover the common guard cases. Deps and weights load only in
+``load()`` from the verified local artifact dir (never the network); blocks the local_llm mode.
 """
 from __future__ import annotations
 
@@ -18,8 +22,9 @@ class GuardLlmRunner(HeavyRunner):
     runner_kind = "guard_llm"
 
     def _import_stack(self) -> None:
-        self._torch = require(lambda: __import__("torch"), "torch")
-        require(lambda: __import__("transformers"), "transformers")
+        # Needs the [torch] extra; absent under the lean [onnx] image → RunnerUnavailable.
+        self._torch = require(lambda: __import__("torch"), "torch ([torch] extra)")
+        require(lambda: __import__("transformers"), "transformers ([torch] extra)")
 
     def _build(self, path: str) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer

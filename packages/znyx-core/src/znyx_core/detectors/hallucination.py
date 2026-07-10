@@ -105,7 +105,7 @@ class HallucinationDetector:
         # Embedding model (lazy loaded)
         self._embed_model = None
 
-        # NLI groundedness (P2/F3): an entailment scorer (premise, hypotheses) -> list[float].
+        # NLI groundedness: an entailment scorer (premise, hypotheses) -> list[float].
         # Auto-wired by the orchestrator from the detector's `nli` config block (set as an
         # instance attribute post-construction); also accepts a directly-injected scorer via
         # config for tests. None → deterministic token-overlap / embedding path. A claim is
@@ -206,7 +206,7 @@ class HallucinationDetector:
         if not claims:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
-        # Preferred path: NLI entailment via the F3 inference service (one batched call per
+        # Preferred path: NLI entailment via the inference service (one batched call per
         # source). Falls back to embedding / token-overlap when no scorer or on error.
         nli_scores = self._nli_claim_scores(claims)
         used_nli = nli_scores is not None

@@ -10,10 +10,17 @@ license of any model you deploy for your use case.
 
 ## Fetch-and-pin workflow
 
-1. Fetch a vetted checkpoint and print its sha256 to pin:
-   `python -m znyx_inference.runners._fetch --task prompt_injection` (operator-run, the only step that touches the network).
-2. Mount the local weights read-only and wire the task (model_id, revision, sha256) via env / compose.
-3. Run the sidecar. It loads local, sha256-verified weights only, and fails closed.
+Export runs **offline** (the heavy `[export]` extra: torch + optimum); serving is lean
+(`[onnx]`: onnxruntime + tokenizers). The torch/CUDA payload never ships in the image.
+
+1. Export + int8-quantize a vetted checkpoint to a pinned ONNX artifact and print its sha256:
+   `python -m scripts.fetch_inference_model --task prompt_injection` (operator-run, the only
+   step that touches the network; needs `pip install 'znyx-inference[export]'`). It writes
+   `model.onnx` (+ `model_quantized.onnx`) and `tokenizer.json` into the artifact dir.
+   (Generative `guard_llm` models are snapshotted as raw weights instead of exported, and
+   serve only under the `[torch]` extra.)
+2. Mount the local artifact read-only and wire the task (model_id, revision, sha256) via env / compose.
+3. Run the sidecar with `[onnx]` installed. It loads local, sha256-verified ONNX only, and fails closed.
 
 ## Default models (what a task pins out of the box)
 

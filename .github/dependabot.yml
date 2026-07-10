@@ -1,8 +1,11 @@
 version: 2
 updates:
-  # Python runtime dependencies
+  # Python dependencies — one entry per package (manifests live under packages/*).
   - package-ecosystem: pip
-    directory: "/"
+    directories:
+      - "/packages/znyx-core"
+      - "/packages/znyx-runtime"
+      - "/packages/znyx-inference"
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
@@ -25,26 +28,15 @@ updates:
       actions-all:
         patterns: ["*"]
 
-  # Base image in the Dockerfile
+  # Base images in the Dockerfiles (non-standard names → list explicitly).
   - package-ecosystem: docker
-    directory: "/"
+    directories:
+      - "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
     labels: ["dependencies", "docker"]
     groups:
       docker-minor-patch:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
-
-  # npm wrapper
-  - package-ecosystem: npm
-    directory: "/npm-runtime"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
-    labels: ["dependencies", "npm"]
-    groups:
-      npm-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]

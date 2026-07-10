@@ -144,7 +144,7 @@ def create_detector_span(detector_name: str, stage: Optional[str] = None):
     """Create a child span for a detector execution.
 
     Returns a context manager span, or a no-op if OTel is unavailable.
-    ``stage`` (F0.6) records which pipeline stage the detector ran in
+    ``stage`` records which pipeline stage the detector ran in
     (input/output/retrieval/tool/agent_plan/agent_loop/memory_write).
 
     Usage:

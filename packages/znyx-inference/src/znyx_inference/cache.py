@@ -1,4 +1,4 @@
-"""Content-hash decision cache (F3 / roadmap §4): normalize → sha256 → LRU of recent
+"""Content-hash decision cache: normalize → sha256 → LRU of recent
 results. Two identical normalized inputs to the same model hit the cache. Dependency-free.
 """
 from __future__ import annotations

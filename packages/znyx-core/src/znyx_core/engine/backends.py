@@ -1,4 +1,4 @@
-"""DetectorBackend resolver + escalation strategy (F2).
+"""DetectorBackend resolver + escalation strategy.
 
 Turns a detector's policy ``strategy`` + per-mode ``backends`` config into a typed
 ``BackendStrategy`` the escalation engine runs (deterministic → ml → llm). The six
@@ -63,7 +63,7 @@ class BackendStrategy:
     # survives while the ML layer adds what it alone catches (unstructured PII, language).
     additive: bool = False
     backends: Dict[str, DetectorBackend] = field(default_factory=dict)
-    # Egress policy (F4): per-detector allowlist/redaction + resolved runtime_policy.
+    # Egress policy: per-detector allowlist/redaction + resolved runtime_policy.
     no_external_calls: bool = False
     allowed_regions: Optional[List[str]] = None
     egress_allowlist: Optional[List[str]] = None
@@ -148,9 +148,9 @@ def build_strategy(detector_config: Dict[str, Any],
                    policy: Optional[Dict[str, Any]] = None,
                    org_default: Optional[Dict[str, Any]] = None) -> Optional[BackendStrategy]:
     """Build a BackendStrategy from a (raw, runtime) detector policy dict + the
-    top-level runtime_policy (for the F4 egress gate). ``policy`` is the full effective
+    top-level runtime_policy (for the egress gate). ``policy`` is the full effective
     policy, read only for the org's PII/secrets configs so egress redaction matches
-    the org's in-pipeline redaction. ``org_default`` (F2 optional) is the org-level
+    the org's in-pipeline redaction. ``org_default`` (optional) is the org-level
     default {strategy, backends} for this detector — layered UNDER the policy: used only
     when the policy doesn't set its own ``strategy``.
 
@@ -224,7 +224,7 @@ def should_escalate(escalate_when: Optional[Dict[str, Any]], current_mode: str,
     # ml / embedding → next (llm)
     threshold = escalate_when.get("ml_confidence_below")
     if threshold is not None:
-        # Fail SAFE: confidence is optional in the F1 contract, so a missing/unparsed
+        # Fail SAFE: confidence is optional in the contract, so a missing/unparsed
         # confidence escalates to the stronger layer rather than silently stopping.
         return current_confidence is None or current_confidence < threshold
     return True

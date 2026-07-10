@@ -1,6 +1,6 @@
 """Shared adversarial-text normalization for evasion-resistant keyword matching.
 
-Detectors that match untrusted text against keyword/marker banks (toxicity, the P1b
+Detectors that match untrusted text against keyword/marker banks (toxicity, the
 prompt-injection bank) must defend against the same evasion class: Unicode homoglyphs,
 zero-width characters, fullwidth forms, and leetspeak. This module is the single source
 of truth for those normalizers so the detectors stay consistent — previously only

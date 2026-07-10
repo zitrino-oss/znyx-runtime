@@ -36,7 +36,7 @@ def _normalize_unicode(text: str) -> str:
 class ToxicityDetector:
     """Detects toxic language in text"""
 
-    # P0 CRITICAL: Significantly expanded toxic terms database
+    # CRITICAL: Significantly expanded toxic terms database
     # Organized by category for enterprise-grade detection
     TOXIC_TERMS = {
         # ===== HIGH SEVERITY =====
@@ -1560,7 +1560,7 @@ class ToxicityDetector:
 
     def detect(self, text: str) -> DetectorResult:
         """
-        Detect toxic language in text with P0 enhancements:
+        Detect toxic language in text with the following enhancements:
         - Evasion detection (leetspeak, spacing)
         - Context awareness (educational vs attack)
 
@@ -1577,7 +1577,7 @@ class ToxicityDetector:
         force_block_triggered = False
         text_lower = text.lower()
 
-        # P0 CRITICAL: Normalize text for evasion detection
+        # CRITICAL: Normalize text for evasion detection
         # First normalize Unicode homoglyphs, then apply leetspeak normalization
         unicode_normalized = _normalize_unicode(text)
         normalized_texts = self._normalize_for_evasion(unicode_normalized) if self.detect_evasion else [text_lower]

@@ -131,7 +131,7 @@ SCHEDULER_SUBSCRIPTION_INTERVAL_SECONDS: int = _int(
 )
 # Auto-invoice generation: how often to check for ended billing periods.
 SCHEDULER_BILLING_INTERVAL_SECONDS: int = _int("SCHEDULER_BILLING_INTERVAL", 3600)
-# F4 egress audit: how often to fold the durable egress spool into egress_events rows
+# egress audit: how often to fold the durable egress spool into egress_events rows
 # (read endpoints also drain on demand; this keeps the table fresh without a read).
 SCHEDULER_EGRESS_DRAIN_INTERVAL_SECONDS: int = _int("SCHEDULER_EGRESS_DRAIN_INTERVAL", 60)
 

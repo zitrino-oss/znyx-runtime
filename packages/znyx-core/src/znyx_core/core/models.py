@@ -18,8 +18,8 @@ class Severity(str, Enum):
 
 
 class ExecutionMode(str, Enum):
-    """The six detector execution modes (roadmap §4). Defined here (the dependency-free
-    core models module) so the policy schema, the F2 backend, and LayerResult all share
+    """The six detector execution modes. Defined here (the dependency-free
+    core models module) so the policy schema, the backend, and LayerResult all share
     one definition."""
     local_deterministic = "local_deterministic"
     local_ml = "local_ml"
@@ -46,7 +46,7 @@ def _ensure_unit_range_scores(v: Optional[Dict[str, float]], field: str = "label
 def _ensure_valid_execution_mode(v: Optional[str]) -> Optional[str]:
     """Validate an execution_mode string against ExecutionMode. Shared by the
     per-layer LayerResult and the final selected-mode scalar on DetectorResult /
-    DetectorTimingResult (which F2 persists into the trace)."""
+    DetectorTimingResult (which the backend persists into the trace)."""
     if v is not None and v not in _EXECUTION_MODE_VALUES:
         raise ValueError(f"execution_mode {v!r} is not a valid ExecutionMode")
     return v
@@ -59,11 +59,11 @@ class RuleHit(BaseModel):
 
 
 class LayerResult(BaseModel):
-    """One execution-mode attempt within a single detector (F1).
+    """One execution-mode attempt within a single detector.
 
-    F2's escalation appends one entry per backend it runs (deterministic → ml → llm)
+    The escalation appends one entry per backend it runs (deterministic → ml → llm)
     and flags the ``selected`` (final) one. Persisting every attempt is what makes the
-    roadmap's per-layer decision-divergence metric and the trace layer-comparison UI
+    per-layer decision-divergence metric and the trace layer-comparison UI
     computable directly from a stored trace, with no re-evaluation. All fields optional
     so a deterministic-only detector simply never produces a LayerResult.
     """
@@ -131,7 +131,7 @@ class ToolEvaluationRequest(BaseModel):
     tool_result: Optional[str] = Field(
         default=None,
         description="Optional tool-result text re-entering context. When present, it is "
-                    "scanned for prompt injection (tool_output_injection, P1b/LLM01).",
+                    "scanned for prompt injection (tool_output_injection, LLM01).",
     )
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata")
     trace_id: Optional[str] = Field(default=None, description="Distributed trace ID for correlation")
@@ -140,7 +140,7 @@ class ToolEvaluationRequest(BaseModel):
 
 
 class Stage(str, Enum):
-    """Per-request evaluation stages (F0.6). The orchestrator filters detectors by
+    """Per-request evaluation stages. The orchestrator filters detectors by
     the active stage; new stages route through the generalized dispatcher instead of
     being treated as output."""
     input = "input"
@@ -159,7 +159,7 @@ class HookStage(str, Enum):
 
 
 class _ScopedRequest(BaseModel):
-    """Common scope/trace fields shared by the per-stage request models (F0.6)."""
+    """Common scope/trace fields shared by the per-stage request models."""
     request_id: str
     tenant_id: str
     app_id: str
@@ -224,7 +224,7 @@ class DetectorTimingResult(BaseModel):
     latency_ms: int = 0
     rule_hits: List[RuleHit] = Field(default_factory=list)
     transformed: bool = False
-    # Model-backed enrichment (F1) — final/aggregated scalars + the per-layer attempts.
+    # Model-backed enrichment — final/aggregated scalars + the per-layer attempts.
     # All additive with safe defaults so existing SDK consumers are unaffected; the
     # waterfall/layer-comparison UI renders from layer_results without re-evaluation.
     confidence: Optional[float] = None
@@ -254,9 +254,9 @@ class QualityScore(BaseModel):
     score: float = Field(..., ge=0.0, le=1.0)
     details: str = ""
     sub_scores: Optional[Dict[str, float]] = None
-    # P2: per-claim grounding evidence (NLI-backed groundedness) — [{claim, source_id, support}]
+    # per-claim grounding evidence (NLI-backed groundedness) — [{claim, source_id, support}]
     evidence_spans: Optional[List[Dict[str, Any]]] = None
-    # P3: optional LLM-judge evaluator fields (additive/back-compat; None for deterministic scorers).
+    # optional LLM-judge evaluator fields (additive/back-compat; None for deterministic scorers).
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     label: Optional[str] = None
     rationale: Optional[str] = None
@@ -266,7 +266,7 @@ class QualityScore(BaseModel):
 
 
 class JudgeVerdict(BaseModel):
-    """Structured output of an LLM-judge DETECTOR call (P3, roadmap §5).
+    """Structured output of an LLM-judge DETECTOR call.
 
     A judge returns this for detector-style evaluation (block/allow with a risk score and
     rationale). All fields beyond ``decision`` are optional so a terse judge reply still
@@ -288,7 +288,7 @@ class JudgeVerdict(BaseModel):
 
 
 class EvaluatorVerdict(BaseModel):
-    """Structured output of an LLM-judge EVALUATOR call (P3, roadmap §6) — a quality
+    """Structured output of an LLM-judge EVALUATOR call — a quality
     metric score with rationale + judge provenance. Maps onto a QualityScore."""
     metric: str
     score: float = Field(..., ge=0.0, le=1.0)
@@ -382,21 +382,21 @@ class DetectorResult(BaseModel):
     user_message: Optional[str] = None
     developer_message: Optional[str] = None
     field_errors: List[FieldError] = Field(default_factory=list)
-    # Model-backed detection contract (F0.5/F1). All optional with safe defaults so
+    # Model-backed detection contract. All optional with safe defaults so
     # the 19 deterministic built-ins and every SDK keep working untouched; populated
     # by the RemoteDetector when an inference service / judge returns them.
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Model confidence 0..1 in the decision")
     calibrated_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Calibrated probability 0..1 (post-calibration)")
     label_scores: Optional[Dict[str, float]] = Field(default=None, description="Per-label probabilities (0..1) from a classifier")
     model_version: Optional[str] = Field(default=None, description="model_id@revision that produced this result")
-    # F1 final/aggregated fields + per-layer attempts. F2's escalation populates
+    # Final/aggregated fields + per-layer attempts. The escalation populates
     # execution_mode/fallback_path/external_egress and appends layer_results.
     execution_mode: Optional[str] = Field(default=None, description="The mode that produced the selected result")
     fallback_path: Optional[str] = Field(default=None, description="Why a fallback fired (e.g. no_external_calls, residency_denied, timeout)")
     external_egress: bool = Field(default=False, description="True if any content left the trust boundary for this detector")
     threshold: Optional[float] = Field(default=None, description="Decision threshold applied to the selected layer")
     calibration_dataset_id: Optional[str] = Field(default=None, description="Dataset id the calibration was fit on")
-    layer_results: List[LayerResult] = Field(default_factory=list, description="One entry per execution-mode attempt (F2 escalation)")
+    layer_results: List[LayerResult] = Field(default_factory=list, description="One entry per execution-mode attempt (escalation)")
 
     @field_validator("label_scores")
     @classmethod

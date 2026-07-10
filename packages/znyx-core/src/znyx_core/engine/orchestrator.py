@@ -21,7 +21,7 @@ from znyx_core.middleware.otel import create_detector_span
 
 logger = logging.getLogger(__name__)
 
-# Valid per-request stages (F0.6) — the dispatcher rejects anything else.
+# Valid per-request stages — the dispatcher rejects anything else.
 _VALID_STAGES = frozenset(s.value for s in Stage)
 
 
@@ -41,7 +41,7 @@ class OrchestrationResult:
 # context_filter: None      => runs in every dispatched stage (input/output and, when
 #                              explicitly dispatched, the new stages)
 #                 "output"   => runs only in the output stage
-#                 (a, b, ...) => a tuple/list runs only in any of those stages (P1b
+#                 (a, b, ...) => a tuple/list runs only in any of those stages (
 #                              multi-stage detectors, e.g. agent_plan + tool)
 # can_transform:  if True, a REDACT/TRANSFORM result updates current_text
 # ---------------------------------------------------------------------------
@@ -86,13 +86,13 @@ _DETECTOR_PIPELINE: List[tuple] = [
     ("copyright",         False, "output", False),
     ("code_safety",       False, None,     False),
     ("hallucination",     False, "output", False),
-    # 7b. P1a deterministic gap detectors (LLM02 / LLM09 / LLM07).
+    # 7b. deterministic gap detectors (LLM02 / LLM09 / LLM07).
     ("sensitive_business_data", False, None,     True),
     ("citation_integrity",      False, "output", False),
     ("system_prompt_leakage",   False, "output", False),
     ("numerical_consistency",   False, "output", False),
     ("document_metadata_leakage", False, None,   False),
-    # 7c. P1b new-stage gap detectors (LLM01 / LLM06 / LLM10). Each is scoped to its
+    # 7c. new-stage gap detectors (LLM01 / LLM06 / LLM10). Each is scoped to its
     # stage(s) via the ctx_filter (a tuple = runs in any of those stages). They are
     # default-disabled and only fire on their stage's evaluate endpoint / benchmark
     # dispatch. mcp_manifest_scanner is a tool_registration HOOK, not in this pipeline.
@@ -134,8 +134,8 @@ class DetectorOrchestrator:
                  egress_sink=None, scorecard_public_key: Optional[str] = None):
         self.registry = registry
         self.plugin_registry = plugin_registry
-        # F4: optional callback(EgressEvent) for boundary-crossing calls. The runtime
-        # wires a durable sink (F0.4); the control plane writes egress_events rows;
+        # optional callback(EgressEvent) for boundary-crossing calls. The runtime
+        # wires a durable sink; the control plane writes egress_events rows;
         # None = no emission (default — zero behaviour change for current callers).
         self.egress_sink = egress_sink
         # Tamper-evident scorecard stamps (console-less tier): when an Ed25519 public key
@@ -163,7 +163,7 @@ class DetectorOrchestrator:
         self, text: str, policy: Dict[str, Any],
         request: "EvaluationRequest", context: str = "input", *, judge_ctx=None,
     ) -> OrchestrationResult:
-        """Generalized stage dispatch (F0.6).
+        """Generalized stage dispatch.
 
         Runs the detector pipeline filtered to ``context``, where ``context`` is any
         per-request stage (input / output / retrieval / tool / agent_plan /
@@ -180,9 +180,9 @@ class DetectorOrchestrator:
         self, text: str, policy: Dict[str, Any],
         request: "EvaluationRequest", context: str, *, judge_ctx=None,
     ) -> OrchestrationResult:
-        # Dispatcher boundary (F0.6): the stage must be a known Stage value. Reject
+        # Dispatcher boundary: the stage must be a known Stage value. Reject
         # arbitrary strings so an unknown stage can't silently run the default
-        # (ctx_filter=None) detectors. Callers pass a fixed Stage; P1b endpoints will
+        # (ctx_filter=None) detectors. Callers pass a fixed Stage; new-stage endpoints will
         # bind typed stage requests to these same values.
         if context not in _VALID_STAGES:
             raise ValueError(
@@ -217,14 +217,14 @@ class DetectorOrchestrator:
                     continue
 
             # Grounding-aware detectors get the request's source_context /
-            # grounding_sources merged into their config (hallucination + P1a citation_integrity).
+            # grounding_sources merged into their config (hallucination + citation_integrity).
             if policy_key in ("hallucination", "citation_integrity"):
                 config = self._enrich_hallucination_config(config, request)
 
             detector = self.registry.get_or_create(policy_key, config)
 
             # NLI groundedness wiring: build the per-request NLI scorer from the detector's
-            # `nli` config block (same factory + F4 egress gate as the quality scorer) and set
+            # `nli` config block (same factory + egress gate as the quality scorer) and set
             # it on the instance. The callable can't live in `config` (the registry caches by
             # json.dumps(config)), so it's an instance attribute set after creation — always
             # set (None when no nli block) so a cached instance never keeps a stale scorer.
@@ -236,13 +236,13 @@ class DetectorOrchestrator:
                 if span:
                     span.set_attribute("detector.decision", result.decision.value if result.decision else "ALLOW")
                     span.set_attribute("detector.risk_score", result.risk_score)
-            # F2: if the detector's policy carries a model-backed `strategy`, escalate
+            # if the detector's policy carries a model-backed `strategy`, escalate
             # (deterministic → ml → llm) from the deterministic result. No strategy →
             # deterministic-only path unchanged (zero behaviour change for current policies).
             strategy = build_strategy(config, runtime_policy=effective_policy.get("runtime_policy"),
                                       policy=effective_policy)
             if strategy is not None:
-                # P3: when a composition root injected a judge context AND this strategy
+                # when a composition root injected a judge context AND this strategy
                 # escalates to a judge mode, build the multi-judge consensus caller (audit +
                 # deny-of-wallet budget wired in). Otherwise judge_caller stays None and the
                 # escalation uses the generic backend transport — zero behaviour change.
@@ -258,7 +258,7 @@ class DetectorOrchestrator:
                     request=request, egress_sink=self.egress_sink,
                     judge_caller=judge_caller,
                 )
-            # P2 runtime action resolution: a model-backed detector whose enforcement
+            # runtime action resolution: a model-backed detector whose enforcement
             # gate didn't pass (stamped into the policy at publish via `_scorecard_gate`)
             # has its BLOCK/REDACT downgraded to WARN. Defence in depth — the publish-time
             # blocker is primary; this protects DB-less runtimes honouring a stamped bundle.
@@ -275,7 +275,7 @@ class DetectorOrchestrator:
             elif (can_transform and context in ("input", "output")
                   and result.decision in (Decision.REDACT, Decision.TRANSFORM)
                   and result.sanitized_text):
-                # Only rewrite text on the input/output stages. On the new P1b stages
+                # Only rewrite text on the input/output stages. On the new stages
                 # (retrieval / agent_plan / agent_loop / memory_write) a legacy
                 # transform-capable detector (e.g. pii REDACT) must NOT silently mutate
                 # the retrieved chunk / plan / memory value — it still flags (WARN/BLOCK),
@@ -290,7 +290,7 @@ class DetectorOrchestrator:
                 latency_ms=elapsed_ms,
                 rule_hits=result.rule_hits,
                 transformed=transformed,
-                # F1: carry the model-backed enrichment + per-layer attempts into the
+                # carry the model-backed enrichment + per-layer attempts into the
                 # persisted timing record so the trace renders them without re-eval.
                 confidence=result.confidence,
                 calibrated_score=result.calibrated_score,
@@ -303,7 +303,7 @@ class DetectorOrchestrator:
                 layer_results=result.layer_results,
             ))
 
-        # Standalone model-backed / vendor detectors (P4): an enabled policy key that is NOT a
+        # Standalone model-backed / vendor detectors: an enabled policy key that is NOT a
         # built-in pipeline detector but carries a model-backed `strategy` + `backends` — e.g. an
         # installed remote_api vendor moderation detector. The vendor IS the detector, so the
         # deterministic base is a pass-through ALLOW and the strategy runs the configured backend
@@ -473,8 +473,8 @@ class DetectorOrchestrator:
 
     def _build_nli_scorer(self, config: Dict[str, Any], effective_policy: Dict[str, Any],
                           request: "EvaluationRequest"):
-        """Build the F3 inference NLI scorer ``(premise, hypotheses) -> list[float]`` from a
-        detector's ``nli`` config block, routed through the F4 egress gate — the same factory
+        """Build the inference NLI scorer ``(premise, hypotheses) -> list[float]`` from a
+        detector's ``nli`` config block, routed through the egress gate — the same factory
         the quality scorer uses. None when the detector has no enabled ``nli`` block (the
         detector then keeps its deterministic token-overlap / fuzzy-overlap path)."""
         from znyx_core.engine.quality.nli_client import nli_scorer_from_config
@@ -498,13 +498,13 @@ class DetectorOrchestrator:
             # Stage filter: a custom detector runs only in its declared `stages`, or — when
             # none are declared — the default input/output stages. This stops a custom
             # webhook/remote detector from receiving (and egressing) retrieval chunks,
-            # agent plans, or memory writes just because the P1b stages now exist.
+            # agent plans, or memory writes just because the new stages now exist.
             cfg_stages = custom_cfg.get('stages')
             allowed_stages = cfg_stages if cfg_stages else ("input", "output")
             if context not in allowed_stages:
                 continue
             try:
-                # F4: a custom detector that declares an egress URL POSTs the text to
+                # a custom detector that declares an egress URL POSTs the text to
                 # an external endpoint — a boundary-crossing egress. Route it through
                 # the SAME gate as model backends (no_external_calls / allowlist /
                 # residency / redact + fail-closed audit). A denial skips the detector
@@ -548,7 +548,7 @@ class DetectorOrchestrator:
                     detector_name, call_text, detector_config
                 )
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                # F4: the plugin itself rarely sets external_egress, so reflect the
+                # the plugin itself rarely sets external_egress, so reflect the
                 # boundary crossing the gate just performed onto both the result and
                 # the trace timing — otherwise the audited egress shows external_egress
                 # =False end-to-end.
@@ -559,7 +559,7 @@ class DetectorOrchestrator:
                 # layer_results, OR a boundary crossing (so a no-hit egress still
                 # leaves a visible timing row for trace/UI consumers). A no-hit BLOCK
                 # (or a remote/ML plugin returning scores without rule hits) must still
-                # count toward the decision and be persisted with its full F1 contract;
+                # count toward the decision and be persisted with its full contract;
                 # previously a rule_hits-only gate silently dropped it.
                 meaningful = (
                     (custom_result.decision is not None and custom_result.decision != Decision.ALLOW)
@@ -577,7 +577,7 @@ class DetectorOrchestrator:
                         latency_ms=elapsed_ms,
                         rule_hits=custom_result.rule_hits,
                         transformed=False,
-                        # F1: preserve the model-backed contract for custom/remote plugins.
+                        # preserve the model-backed contract for custom/remote plugins.
                         confidence=custom_result.confidence,
                         calibrated_score=custom_result.calibrated_score,
                         label_scores=custom_result.label_scores,
