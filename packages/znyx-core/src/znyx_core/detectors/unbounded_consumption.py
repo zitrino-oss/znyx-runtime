@@ -1,4 +1,4 @@
-"""Unbounded-consumption detector (P1b, OWASP LLM10).
+"""Unbounded-consumption detector (OWASP LLM10).
 
 Caps runaway resource use: per-session cumulative token and cost budgets, agent-loop
 iteration (depth) caps, and tool-call depth caps. Stateful per (tenant, app, session) —

@@ -1,6 +1,6 @@
-"""AWS Bedrock Guardrails remote_api adapter (plan P4).
+"""AWS Bedrock Guardrails remote_api adapter.
 
-Maps the Bedrock Runtime ``ApplyGuardrail`` response onto the F1 DetectorResult.
+Maps the Bedrock Runtime ``ApplyGuardrail`` response onto the DetectorResult.
 Unlike OpenAI/Azure (header-key auth) this API requires AWS SigV4 request signing,
 implemented here with the stdlib (hashlib/hmac) so the runtime gains no new
 dependency.

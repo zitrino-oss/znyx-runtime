@@ -1,10 +1,10 @@
-"""Policy contradiction / lint analysis (F2).
+"""Policy contradiction / lint analysis.
 
 Beyond schema validation (which catches malformed values), this flags *logical*
 contradictions a schema-valid policy can still contain — most importantly a detector
 whose strategy requests a remote execution mode while the policy forbids external
 calls, so that mode could never run. Surfaced by POST /v1/policies/validate for the
-console editor's inline lint; also the basis for P1's policy_contradiction hook.
+console editor's inline lint; also the basis for the policy_contradiction hook.
 """
 from __future__ import annotations
 

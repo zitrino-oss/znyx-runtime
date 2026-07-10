@@ -1,9 +1,9 @@
-"""Egress audit sink (F0.4).
+"""Egress audit sink.
 
-The zero-DB runtime cannot write control-plane tables, but F4 requires that every
+The zero-DB runtime cannot write control-plane tables, but the egress contract requires that every
 boundary-crossing call (remote_llm / remote_api / a hosted inference sidecar) is
 audited — and that a *failed* audit write never silently permits an un-audited
-egress. This module defines the runtime-side abstraction the F4 egress gate calls
+egress. This module defines the runtime-side abstraction the egress gate calls
 *before* any such call:
 
     event = EgressAuditEvent(...metadata only...)
@@ -14,7 +14,7 @@ Backends (selectable, see ``make_audit_sink``):
   * ``SpoolAuditSink``  — durable append-only JSON-lines spool on local disk
         (default ``~/.znyx/egress-audit.spool``). Works without a database, so it
         is valid in OSS/local mode. The control plane drains the spool into
-        ``egress_events`` rows and hash-chain-signs them (F4).
+        ``egress_events`` rows and hash-chain-signs them.
   * ``NoopAuditSink``   — explicit opt-out (records nothing).
 
 Failure semantics: in ``fail_mode="closed"`` (the default) a write failure raises
@@ -80,7 +80,7 @@ class AuditSink(ABC):
 
     @abstractmethod
     def record_sync(self, event: EgressAuditEvent) -> None:
-        """Synchronous durable record, for the (synchronous) F4 escalation gate which
+        """Synchronous durable record, for the (synchronous) escalation gate which
         cannot await. MUST raise in fail-closed mode if it cannot durably persist, so
         the gate denies the egress."""
         ...
@@ -105,7 +105,7 @@ class SpoolAuditSink(AuditSink):
     """Durable append-only JSON-lines spool on local disk.
 
     Each ``record`` appends one JSON line and fsyncs before returning, so a recorded
-    event survives a crash. The control plane drains and signs the spool (F4).
+    event survives a crash. The control plane drains and signs the spool.
     """
 
     def __init__(self, spool_path: Optional[str] = None, fail_mode: str = "closed"):
@@ -137,7 +137,7 @@ class SpoolAuditSink(AuditSink):
             self._handle_failure(exc)
 
     def read_all(self) -> List[dict]:
-        """Read every spooled event (used by the F4 control-plane drainer / tests).
+        """Read every spooled event (used by the control-plane drainer / tests).
 
         Resilient to a single corrupt/partial line (e.g. an interrupted write): a
         line that won't parse is logged and skipped so one bad record can't abort the
@@ -171,7 +171,7 @@ def make_audit_sink(
 
 
 def make_audit_egress_sink(sink: "AuditSink"):
-    """Adapt an F0.4 ``AuditSink`` to the (synchronous) egress-gate callback the
+    """Adapt an ``AuditSink`` to the (synchronous) egress-gate callback the
     escalation engine calls before any boundary-crossing call.
 
     The escalation engine passes an ``znyx_core.engine.egress.EgressEvent``; we map

@@ -1,8 +1,8 @@
-"""Runner registry (F3): builds one runner + batcher per configured task, isolating
+"""Runner registry: builds one runner + batcher per configured task, isolating
 load failures (heavy deps / missing pinned artifacts → RunnerUnavailable → the task is
 marked unavailable and returns 503, the service stays up). Powers GET /v1/models.
 
-Heavy runner kinds register their factory here on import (unit 2); the dependency-free
+Heavy runner kinds register their factory here on import; the dependency-free
 ``stub`` kind is always available.
 """
 from __future__ import annotations

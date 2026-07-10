@@ -1,4 +1,4 @@
-"""Token-classification (NER) runner (F3) — detects UNSTRUCTURED PII entities (names,
+"""Token-classification (NER) runner — detects UNSTRUCTURED PII entities (names,
 addresses, etc.) that the deterministic regex/checksum PII detector can't catch. Backed
 by a token-classification model (e.g. piiranha). Served on CPU via onnxruntime + tokenizers
 (torch-free); the ONNX graph loads only in ``load()`` from the verified local artifact dir,

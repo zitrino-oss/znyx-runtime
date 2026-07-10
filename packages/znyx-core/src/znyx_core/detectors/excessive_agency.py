@@ -1,11 +1,11 @@
-"""Excessive-agency detector (P1b, OWASP LLM06).
+"""Excessive-agency detector (OWASP LLM06).
 
 Risk-scores a proposed agent plan, or a single agent-loop step's action, by the kind of
 actions it takes: destructive/irreversible operations, financial or external
 side-effects, privilege/scope escalation, and raw code execution. High-risk plans are
 blocked; medium-risk plans WARN (which an org can route to human review via on_fail
-remediation — the roadmap's "ASK_HUMAN" maps onto the existing review queue, since the
-core Decision set has no dedicated ASK_HUMAN value). LLM-judge escalation is P3.
+remediation — the "ASK_HUMAN" outcome maps onto the existing review queue, since the
+core Decision set has no dedicated ASK_HUMAN value). LLM-judge escalation is planned.
 
 Runs in the ``agent_plan`` stage (plan JSON) and the ``agent_loop`` stage (a live step's
 action). It is deliberately NOT scoped to the ``tool`` stage: that stage carries

@@ -1,6 +1,6 @@
-"""ZNYX Inference Service (F3) — an OPTIONAL, separately-deployable sidecar that hosts
+"""ZNYX Inference Service — an OPTIONAL, separately-deployable sidecar that hosts
 local transformer/embedding/NLI/guard-LLM models behind a stable scoring contract
-spoken by the extended RemoteDetector transport (F0.5).
+spoken by the extended RemoteDetector transport.
 
 Hard rule: the core OSS runtime and control plane gain ZERO heavy dependencies. The
 heavy stack (torch/transformers/sentence-transformers/onnxruntime) lives only in this

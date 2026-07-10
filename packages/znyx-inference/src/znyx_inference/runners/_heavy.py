@@ -1,4 +1,4 @@
-"""Shared skeleton for heavy (ML) runners (F3). Keeps the no-egress / fail-closed
+"""Shared skeleton for heavy (ML) runners. Keeps the no-egress / fail-closed
 posture in one place: lazy-import the stack (missing → RunnerUnavailable), resolve the
 LOCAL pinned artifact dir, verify its sha256, then build the model with
 ``local_files_only=True``. No heavy import at module load — only inside ``load()``.

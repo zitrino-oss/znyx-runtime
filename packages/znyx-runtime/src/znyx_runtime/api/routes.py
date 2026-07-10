@@ -86,7 +86,7 @@ def _get_runtime_judge():
 
 
 def _runtime_judge_ctx(policy, scoped):
-    """Build the per-request judge context (P3 Option C) for a runtime evaluation, or None
+    """Build the per-request judge context for a runtime evaluation, or None
     when judges aren't used / judge audit is off. Stamps the request's tenant as org_scope
     so the CP drain can attribute the spooled rows."""
     rj = _get_runtime_judge()
@@ -188,10 +188,10 @@ async def evaluate_tool(request: ToolEvaluationRequest) -> EvaluationResponse:
         raise HTTPException(status_code=500, detail="Tool evaluation failed")
 
 
-# ── P1b new-stage evaluate endpoints (generalized stage dispatch, F0.6) ──────
+# ── New-stage evaluate endpoints (generalized stage dispatch) ──────
 
 async def _evaluate_stage_runtime(scoped, stage: str) -> EvaluationResponse:
-    """Shared runtime handler for the P1b per-stage endpoints: resolve the bundle
+    """Shared runtime handler for the per-stage endpoints: resolve the bundle
     policy for the request scope and dispatch through the generalized stage pipeline."""
     bm = _get_bundle_manager()
     if bm.effective_env:

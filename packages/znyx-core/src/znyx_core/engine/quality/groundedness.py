@@ -1,7 +1,7 @@
 """Groundedness scorer - measures how well output claims are grounded in source context.
 
 Default: token overlap between output sentences and grounding sources (no deps).
-P2 upgrade: when an ``nli_scorer`` is provided (the F3 inference service's NLI/cross-
+Upgrade: when an ``nli_scorer`` is provided (the inference service's NLI/cross-
 encoder task, wired by the caller), each atomic claim is checked for *entailment* by the
 sources and per-claim ``evidence_spans`` are returned. Falls back to token overlap when
 no scorer is supplied or it errors — preserving current behaviour when the service is
@@ -126,7 +126,7 @@ def score_groundedness(
 ) -> QualityScore:
     """Score groundedness of output against provided source context.
 
-    When ``nli_scorer`` is supplied (F3 inference NLI task), score by per-claim
+    When ``nli_scorer`` is supplied (inference NLI task), score by per-claim
     entailment and return ``evidence_spans``. Otherwise — or if the scorer errors
     — fall back to the deterministic token-overlap heuristic (no deps)."""
     metadata = metadata or {}

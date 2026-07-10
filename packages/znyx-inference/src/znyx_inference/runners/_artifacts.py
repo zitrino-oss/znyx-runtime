@@ -1,4 +1,4 @@
-"""Pinned-artifact helpers for heavy runners (F3 warnbox: no implicit downloads).
+"""Pinned-artifact helpers for heavy runners (no implicit downloads).
 
 A runner must load weights ONLY from operator-supplied local files, and verify the
 pinned sha256 before use — failing closed (RunnerUnavailable) on a missing dir or a

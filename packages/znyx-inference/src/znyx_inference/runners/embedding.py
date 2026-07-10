@@ -1,6 +1,6 @@
-"""Embedding-similarity runner (F3) — a centroid of operator-supplied unsafe examples;
+"""Embedding-similarity runner — a centroid of operator-supplied unsafe examples;
 risk = max cosine similarity to that centroid. Used for fuzzy/semantic escalation (e.g.
-system_prompt_leakage in P2). Served on CPU via onnxruntime + tokenizers (torch-free): the
+system_prompt_leakage). Served on CPU via onnxruntime + tokenizers (torch-free): the
 model is an ONNX feature-extraction graph (``ORTModelForFeatureExtraction`` export) whose
 token hidden-states we masked-mean-pool and L2-normalize into a sentence embedding — the
 sentence-transformers default pooling, with no torch at serve time. The ONNX graph loads

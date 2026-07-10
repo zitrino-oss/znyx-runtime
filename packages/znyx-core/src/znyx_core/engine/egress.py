@@ -1,4 +1,4 @@
-"""Central egress gate + redaction (F4).
+"""Central egress gate + redaction.
 
 Evaluated in `escalation.run_with_strategy` immediately before any boundary-crossing
 backend call. "Boundary-crossing" = remote_llm / remote_api always, or a local_*
@@ -12,7 +12,7 @@ egress; a hosted/network one is). The gate runs IN ORDER:
      egress event.
 
 The decision (skip/deny) is synchronous here; the durable egress_events row is written
-by the injected sink (F0.4) so the zero-DB runtime never touches control-plane tables.
+by the injected sink so the zero-DB runtime never touches control-plane tables.
 """
 from __future__ import annotations
 

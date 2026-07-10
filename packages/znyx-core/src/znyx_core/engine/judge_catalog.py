@@ -1,10 +1,10 @@
-"""LLM-judge detector candidates (P3 unit 5, roadmap §5).
+"""LLM-judge detector candidates.
 
-The roadmap's judge-backed DETECTOR candidates, each carrying its §5 *intended* enforcement
+The judge-backed DETECTOR candidates, each carrying its *intended* enforcement
 action — the action it takes ONCE GATED. **Gating rule:** every candidate ships
 advisory-only (pinned to WARN) by default; its intended action becomes active only after
 the judge has a ``detector_scorecard`` passing the enforcement-tier ``scorecard_gate``
-(the P2 gate, reused verbatim for ``llm_judge`` — the runtime ``orchestrator._apply_
+(the same gate, reused verbatim for ``llm_judge`` — the runtime ``orchestrator._apply_
 scorecard_gate`` already downgrades a model-backed BLOCK/REDACT→WARN when the stamped gate
 isn't passed, so these are advisory-by-default with no extra code). Crisis/self-harm and
 regulated-advice additionally require an expert-labelled suite before enforcement.
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 # Default judge escalation band: invoke the judge when the deterministic/ML layer is
-# uncertain (low confidence) — "low-confidence escalation" (roadmap §5).
+# uncertain (low confidence) — "low-confidence escalation".
 _DEFAULT_ESCALATE = {"deterministic_score_between": [35, 70], "ml_confidence_below": 0.75}
 
 
@@ -25,7 +25,7 @@ _DEFAULT_ESCALATE = {"deterministic_score_between": [35, 70], "ml_confidence_bel
 class JudgeCandidate:
     key: str
     rubric: str
-    intended_action: str            # the §5 action once a passing enforcement gate exists
+    intended_action: str            # the action once a passing enforcement gate exists
     requires_expert_suite: bool = False
     owasp: List[str] = field(default_factory=list)
     note: Optional[str] = None

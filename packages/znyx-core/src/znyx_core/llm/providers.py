@@ -486,7 +486,7 @@ def supported_providers() -> List[str]:
 
 # Default destination per provider/adapter — the host the call ACTUALLY hits when no
 # explicit endpoint_url is given (the provider would otherwise default it internally). The
-# F4 egress gate must see this so it audits + allowlists + residency-checks the real
+# egress gate must see this so it audits + allowlists + residency-checks the real
 # destination instead of recording "(unknown)". 'custom' has no default (it requires an
 # endpoint_url), so it resolves to None and the gate correctly sees no host.
 _DEFAULT_ENDPOINTS: Dict[str, str] = {

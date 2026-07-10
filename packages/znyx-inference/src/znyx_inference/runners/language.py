@@ -1,4 +1,4 @@
-"""Language-aware runner (F3) — closes the gap where the generic ClassifierRunner scored
+"""Language-aware runner — closes the gap where the generic ClassifierRunner scored
 0 for language-ID labels (language identification is multi-class, not binary harm, so the
 "unsafe-prob" heuristic never fired). Loads a language-identification sequence-classification
 model (e.g. XLM-R language-detection) and maps the predicted language to an allow/block

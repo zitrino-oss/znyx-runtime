@@ -64,7 +64,7 @@ class JailbreakDetector:
         (r'new\s+instructions?:', Severity.MEDIUM, "Instruction injection"),
         (r'(start|begin)\s+new\s+(instructions?|prompt|rules?)', Severity.MEDIUM, "New instruction attempt"),
 
-        # P0 CRITICAL ADDITIONS: Hypothetical framing
+        # CRITICAL ADDITIONS: Hypothetical framing
         (r'in\s+a\s+(movie|story|fiction|novel|book|hypothetical\s+scenario)(?!.*(?:I\'?m?\s+(?:writing|working\s+on)|I\s+wrote|I\s+am\s+writing))', Severity.HIGH, "Hypothetical framing jailbreak"),
         (r'(?:write|tell|create)\s+a\s+story\s+(?:where|about|in\s+which)', Severity.HIGH, "Narrative jailbreak attempt"),
         (r'hypothetically\s+speaking', Severity.MEDIUM, "Hypothetical scenario framing"),
@@ -1156,7 +1156,7 @@ class JailbreakDetector:
         rule_hits: List[RuleHit] = []
         texts_to_check = [text]
 
-        # P0 CRITICAL: Detect encoded content
+        # CRITICAL: Detect encoded content
         if self.detect_encoding:
             decoded_texts = self._detect_encoded_content(text)
             if decoded_texts:
@@ -1243,7 +1243,7 @@ class JailbreakDetector:
             # Calculate risk score
             risk_score = self._calculate_risk_score(rule_hits)
 
-            # P0 CRITICAL: Track conversation history for escalation
+            # CRITICAL: Track conversation history for escalation
             if self.track_conversation and conversation_id:
                 risk_score = self._apply_conversation_history(conversation_id, risk_score)
 

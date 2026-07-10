@@ -5,7 +5,7 @@ from znyx_core.core.risk import calculate_risk_score
 
 
 class TopicDetector:
-    """Detects restricted topics in text with P1 enhancements:
+    """Detects restricted topics in text with the following enhancements:
     - Synonym expansion for comprehensive coverage
     - Context understanding (advisory vs informational)
     - Severity differentiation based on intent
@@ -21,7 +21,7 @@ class TopicDetector:
         "animal cruelty",
     ]
 
-    # P1: Synonym database for common blocked topics
+    # Synonym database for common blocked topics
     # Two categories:
     #   "phrases" - always block when found (strong signal)
     #   "broad_terms" - only block when paired with advisory/instructional context
@@ -1244,7 +1244,7 @@ class TopicDetector:
         self.config = config
         self.enabled = config.get('enabled', True)
 
-        # P1: Synonym expansion
+        # Synonym expansion
         self.use_synonyms = config.get('use_synonyms', True)
         self.context_aware = config.get('context_aware', True)
 
@@ -1261,7 +1261,7 @@ class TopicDetector:
             configured = config.get('blocked_topics', [])
             self.blocked_topics = [t.lower() for t in (configured if configured else self.DEFAULT_BLOCKED_TOPICS)]
 
-        # P1: Build expanded topic map with phrases and broad terms (blocklist only)
+        # Build expanded topic map with phrases and broad terms (blocklist only)
         self.topic_phrases: Dict[str, List[str]] = {}   # Always match
         self.topic_broad: Dict[str, List[str]] = {}     # Only match with advisory/direct intent
         if self.mode == "blocklist":
@@ -1351,7 +1351,7 @@ class TopicDetector:
 
     def _detect_topic_context(self, text: str, topic: str, matched_pattern: str) -> str:
         """
-        P1: Determine if topic mention is advisory vs informational vs warning.
+        Determine if topic mention is advisory vs informational vs warning.
 
         Args:
             text: Full text
@@ -1520,7 +1520,7 @@ class TopicDetector:
 
     def detect(self, text: str) -> DetectorResult:
         """
-        Detect restricted topics in text with P1 enhancements:
+        Detect restricted topics in text with the following enhancements:
         - Synonym expansion for comprehensive coverage
         - Context understanding
         - Severity differentiation
@@ -1544,7 +1544,7 @@ class TopicDetector:
         text_lower = text.lower()
         found_topics: Set[str] = set()
 
-        # P1: Check for each blocked topic - phrases first, then broad terms
+        # Check for each blocked topic - phrases first, then broad terms
         for topic in self.blocked_topics:
             if topic in found_topics:
                 continue
@@ -1582,7 +1582,7 @@ class TopicDetector:
             if matched_pattern is None:
                 continue
 
-            # P1: Determine context
+            # Determine context
             # For always-harmful topics, skip context analysis entirely —
             # the phrase match alone is sufficient to block.
             context = "direct"
@@ -1622,7 +1622,7 @@ class TopicDetector:
         if not rule_hits:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
-        # P1: Calculate risk score based on severity
+        # Calculate risk score based on severity
         risk_score = self._calculate_risk_score(rule_hits)
 
         block_threshold = self.config.get('block_threshold', 40)

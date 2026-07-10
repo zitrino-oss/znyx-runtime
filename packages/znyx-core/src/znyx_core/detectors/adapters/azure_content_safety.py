@@ -1,7 +1,7 @@
-"""Azure AI Content Safety remote_api adapter (plan P4).
+"""Azure AI Content Safety remote_api adapter.
 
 Maps the Azure AI Content Safety "Analyze Text" response — a stable, GA, public
-contract — onto the F1 DetectorResult. The contract (api-version 2024-09-01):
+contract — onto the DetectorResult. The contract (api-version 2024-09-01):
 
     POST {endpoint}/contentsafety/text:analyze?api-version=2024-09-01
     Headers: Ocp-Apim-Subscription-Key: <key>, Content-Type: application/json

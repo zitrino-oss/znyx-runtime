@@ -1,4 +1,4 @@
-"""System Prompt Leakage detector (P1a, OWASP LLM07 — System Prompt Leakage).
+"""System Prompt Leakage detector (OWASP LLM07 — System Prompt Leakage).
 
 Detects when a model's OUTPUT reproduces a registered system prompt. Operators register
 their prompts as **keyed shingle-hash fingerprints** (control plane:
@@ -10,7 +10,7 @@ Method (privacy-preserving, deterministic): HMAC the output's token shingles wit
 same per-org key and count how many match a fingerprint's stored digests. ``match_threshold``
 matching shingles (each ≥ ``min_shingle_tokens`` consecutive tokens) trips it — minor
 edits only break the few shingles spanning the edit, so near-verbatim leaks still match.
-No raw prompt text is ever held by the detector. Embedding-similarity escalation is P2.
+No raw prompt text is ever held by the detector. Embedding-similarity escalation is planned.
 """
 from typing import Any, Dict, List
 

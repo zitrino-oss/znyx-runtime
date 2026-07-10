@@ -1,4 +1,4 @@
-"""Inference service configuration (F3). Env-driven; safe dependency-free defaults so
+"""Inference service configuration. Env-driven; safe dependency-free defaults so
 the service boots on the StubRunner with no ML stack installed.
 
 Per-task spec keys:
@@ -37,7 +37,7 @@ class InferenceConfig:
     max_queue: int = 256
     budget_ms: int = 2000
     cache_maxsize: int = 4096
-    # Artifacts dir + no-download posture for heavy runners (F3 warnbox).
+    # Artifacts dir + no-download posture for heavy runners (warnbox).
     model_artifacts_dir: str = ""
     require_local_files: bool = True     # never pull weights from the network at startup
 

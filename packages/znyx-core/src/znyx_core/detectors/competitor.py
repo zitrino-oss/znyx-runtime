@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional, Set
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
 from znyx_core.core.risk import calculate_risk_score
 
-# P1: Import fuzzy matching library
+# Import fuzzy matching library
 try:
     from rapidfuzz import fuzz
     FUZZY_MATCHING_AVAILABLE = True
@@ -12,7 +12,7 @@ except ImportError:
 
 
 class CompetitorDetector:
-    """Detects competitor mentions in text with P1 enhancements:
+    """Detects competitor mentions in text with the following enhancements:
     - Fuzzy matching for typos and variations
     - Context categorization (partnership, technical, comparison, negative)
     - Allowlist support for approved contexts
@@ -40,14 +40,14 @@ class CompetitorDetector:
         self.competitors = [c.lower() for c in (configured if configured else self.DEFAULT_COMPETITORS)]
         self.action = config.get('action', 'ALLOW_WITH_NOTICE')
 
-        # P1: Fuzzy matching configuration
+        # Fuzzy matching configuration
         self.fuzzy_matching = config.get('fuzzy_matching', True) and FUZZY_MATCHING_AVAILABLE
         self.fuzzy_threshold = config.get('fuzzy_threshold', 85)
 
-        # P1: Context allowlist
+        # Context allowlist
         self.allowlist_contexts = config.get('allowlist_contexts', [])
 
-        # P1: Competitor aliases and products
+        # Competitor aliases and products
         self.competitor_aliases: Dict[str, List[str]] = {}
         aliases_config = config.get('competitor_aliases', {})
         for competitor, aliases in aliases_config.items():
@@ -55,7 +55,7 @@ class CompetitorDetector:
 
     def _fuzzy_match_competitor(self, text: str, competitor: str) -> Optional[str]:
         """
-        P1: Use fuzzy matching to detect competitor name variations and typos.
+        Use fuzzy matching to detect competitor name variations and typos.
 
         Args:
             text: Text to search in
@@ -122,7 +122,7 @@ class CompetitorDetector:
 
     def _categorize_competitor_mention(self, text: str, competitor: str) -> str:
         """
-        P1: Determine the context/intent of competitor mention.
+        Determine the context/intent of competitor mention.
 
         Args:
             text: Full text
@@ -243,7 +243,7 @@ class CompetitorDetector:
 
     def detect(self, text: str) -> DetectorResult:
         """
-        Detect competitor mentions in text with P1 enhancements:
+        Detect competitor mentions in text with the following enhancements:
         - Fuzzy matching for typos
         - Context categorization
         - Allowlist support
@@ -271,7 +271,7 @@ class CompetitorDetector:
             if pattern.search(text):
                 matched = True
 
-            # P1: 2. Check aliases and products
+            # 2. Check aliases and products
             if not matched and competitor in self.competitor_aliases:
                 for alias in self.competitor_aliases[competitor]:
                     alias_pattern = re.compile(r'\b' + re.escape(alias) + r'\b', re.IGNORECASE)
@@ -280,7 +280,7 @@ class CompetitorDetector:
                         matched_text = f"{competitor} (alias: {alias})"
                         break
 
-            # P1: 3. Fuzzy matching for typos
+            # 3. Fuzzy matching for typos
             if not matched and self.fuzzy_matching:
                 fuzzy_match = self._fuzzy_match_competitor(text, competitor)
                 if fuzzy_match:
@@ -288,17 +288,17 @@ class CompetitorDetector:
                     matched_text = f"{competitor} (fuzzy: {fuzzy_match})"
 
             if matched:
-                # P1: Categorize the context
+                # Categorize the context
                 context = self._categorize_competitor_mention(text, competitor)
                 competitor_contexts[competitor] = context
 
-                # P1: Check allowlist - skip if context is allowed
+                # Check allowlist - skip if context is allowed
                 if context in self.allowlist_contexts:
                     continue
 
                 found_competitors.add(competitor)
 
-                # P1: Adjust severity based on context
+                # Adjust severity based on context
                 severity = Severity.MEDIUM
                 if context == "negative":
                     severity = Severity.HIGH
@@ -319,7 +319,7 @@ class CompetitorDetector:
         if not rule_hits:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
-        # P1: Calculate risk score based on severity
+        # Calculate risk score based on severity
         risk_score = self._calculate_risk_score(rule_hits)
 
         # Handle based on action mode

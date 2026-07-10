@@ -1,4 +1,4 @@
-"""Judge consensus backend for the escalation engine (P3 unit 5, roadmap §5).
+"""Judge consensus backend for the escalation engine.
 
 ``make_judge_consensus_caller`` returns an escalation-compatible
 ``(backend, text, timeout_ms) -> DetectorResult`` that runs K independent judge calls
@@ -75,7 +75,7 @@ def make_judge_consensus_caller(
                 if not allowed:
                     denied = f"judge budget exceeded for {det_key}"
                     break
-            # Per-member F4 egress gate: EACH consensus call is its own audited boundary
+            # Per-member egress gate: EACH consensus call is its own audited boundary
             # crossing (one egress event per remote judge call), and the call runs on the
             # gate's redacted text. No gate (in-boundary / tests) → no crossing recorded.
             call_text, crossed, event_id = text, False, None

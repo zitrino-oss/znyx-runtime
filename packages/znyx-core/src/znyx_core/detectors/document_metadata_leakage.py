@@ -1,8 +1,8 @@
-"""Document metadata-leakage detector (deferred backlog §B, deterministic).
+"""Document metadata-leakage detector (deferred backlog, deterministic).
 
 Flags document *artifacts* that leak when office/PDF/web content is pasted or echoed:
 tracked-changes & comment markup, revision history, internal absolute file paths, and
-hidden zero-width / bidi-override text. Pure-rules, no dependencies — a P1-style
+hidden zero-width / bidi-override text. Pure-rules, no dependencies — a
 deterministic detector. (Image-borne / EXIF metadata waits on the multimodal track.)
 
 Scoped to unambiguous markers to keep false positives low; default action is advisory

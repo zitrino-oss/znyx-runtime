@@ -1,11 +1,11 @@
-"""Numerical consistency detector (deferred backlog §B, deterministic).
+"""Numerical consistency detector (deferred backlog, deterministic).
 
 Flags EXPLICIT arithmetic equations in text whose stated result is wrong — e.g.
 ``2 + 2 = 5``, ``$10 + $20 = $40``, ``10% + 20% = 35%``. It only evaluates a literal
 ``number <op> number = number`` pattern, so it cannot false-positive on prose; the
-harder reasoning-heavy numeric claims are deferred to an LLM judge (plan §B).
+harder reasoning-heavy numeric claims are deferred to an LLM judge.
 
-Pure-rules, no dependencies — an output-stage detector in the P1 deterministic family.
+Pure-rules, no dependencies — an output-stage detector in the deterministic family.
 """
 import re
 from typing import Any, Dict, List, Optional

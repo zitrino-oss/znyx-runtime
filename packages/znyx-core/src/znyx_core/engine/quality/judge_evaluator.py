@@ -1,11 +1,11 @@
-"""LLM-judge quality evaluators (P3 unit 4, roadmap §6).
+"""LLM-judge quality evaluators.
 
 Turns the judge runtime (``llm/judge.run_judge``) into the synchronous
 ``(input_text, output_text, metadata) -> QualityScore`` evaluators that ``QualityScorer``
 uses when ``judge_mode`` is on. Each evaluator:
 
 * **budget gate** (deny-of-wallet) — an injected ``budget_check`` can veto the call;
-* **F4 egress gate** — the content routes through the shared ``prepare_and_audit_egress``
+* **egress gate** — the content routes through the shared ``prepare_and_audit_egress``
   (same authority as the model-backed escalation, custom-webhook, and NLI paths): a
   remote judge is a boundary crossing, so ``no_external_calls`` / allowlist / residency can
   deny it, the payload is strict-redacted before it leaves, and a fail-closed audit event
@@ -28,7 +28,7 @@ from znyx_core.core.models import QualityScore
 from znyx_core.engine.egress import prepare_and_audit_egress
 from znyx_core.llm.judge import JudgeRequest, run_judge
 
-# The ten roadmap §6 evaluator categories. Four reuse a deterministic heuristic key (the
+# The ten evaluator categories. Four reuse a deterministic heuristic key (the
 # judge variant overrides it under judge_mode); six are judge-only (net-new).
 HEURISTIC_BACKED = ("groundedness", "relevance", "task_adherence", "tool_call_accuracy")
 JUDGE_ONLY = ("answer_correctness", "refusal_appropriateness", "policy_compliance",
@@ -36,7 +36,7 @@ JUDGE_ONLY = ("answer_correctness", "refusal_appropriateness", "policy_complianc
 JUDGE_EVALUATOR_METRICS = HEURISTIC_BACKED + JUDGE_ONLY
 
 # Default rubrics (the org can override per metric via a registered JudgeRubric). Each asks
-# for the §6 evaluator contract; the strict-delimiter wrapping is added by judge.run_judge.
+# for the evaluator contract; the strict-delimiter wrapping is added by judge.run_judge.
 DEFAULT_RUBRICS: Dict[str, str] = {
     "groundedness": "Score how well every factual claim in the AI OUTPUT is supported by the provided sources/context. 1.0 = fully grounded, 0.0 = unsupported/contradicted.",
     "relevance": "Score how directly the AI OUTPUT addresses the USER INPUT. 1.0 = fully on-point, 0.0 = irrelevant.",
@@ -53,12 +53,12 @@ DEFAULT_RUBRICS: Dict[str, str] = {
 
 @dataclass
 class JudgeEvaluatorPolicy:
-    """Provider + F4 egress controls for the judge evaluator calls."""
+    """Provider + egress controls for the judge evaluator calls."""
     provider: str = "openai"
     model: str = ""
     endpoint_url: Optional[str] = None
     api_key: str = ""
-    mode: str = "remote_llm"                 # F4 egress mode (remote_llm | local_llm | remote_api)
+    mode: str = "remote_llm"                 # egress mode (remote_llm | local_llm | remote_api)
     in_boundary: Optional[bool] = None       # remote_llm → a crossing; local co-located → True
     no_external_calls: bool = False
     egress_allowlist: Optional[List[str]] = None
@@ -104,7 +104,7 @@ def make_judge_evaluator(metric: str, rubric: str, policy: JudgeEvaluatorPolicy,
         content = f"USER INPUT:\n{input_text or ''}\n\nAI OUTPUT:\n{output_text or ''}"
 
         # Run ``members`` independent judge calls and average the 0..1 scores. The deny-of-
-        # wallet budget gate AND the F4 egress gate run PER MEMBER — so each remote judge call
+        # wallet budget gate AND the egress gate run PER MEMBER — so each remote judge call
         # is budget-checked and emits its OWN egress event (audited + linked), rather than one
         # gate covering the whole batch. A denied budget/egress (same for all members) stops
         # the loop → deterministic fallback.

@@ -1,10 +1,10 @@
-"""Canonical ML model catalog (P2 unit 4) — the single source of truth for the model-
+"""Canonical ML model catalog — the single source of truth for the model-
 backed inference tasks: which heavy runner serves each, the pinned model_id/revision,
 provenance (license / language / hardware), and the recommended deterministic→ML
 escalation defaults per detector.
 
 Shared by THREE consumers so they can't drift:
-  * the F3 inference service (``app/inference/config.py``) — task→runner+pins (heavy profile)
+  * the inference service (``packages/znyx-inference/src/znyx_inference/config.py``) — task→runner+pins (heavy profile)
   * the model-registry seed (control plane) — provenance rows
   * the default-strategy builder (console/API) — a gate-shaped strategy block per detector
 
@@ -17,7 +17,7 @@ runner verifies it (no implicit network downloads). A model is ``available=False
 registry until an operator actually loads its weights, and ships with an honest
 ``unverified`` scorecard — so a policy/pack that adopts a default strategy still can't
 publish a BLOCK (or even publish at all) until a real benchmark lands a passing scorecard.
-That gate is by design (P2).
+That gate is by design.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-# Runner kinds the F3 inference service can actually serve today (registry RUNNER_FACTORIES
+# Runner kinds the inference service can actually serve today (registry RUNNER_FACTORIES
 # + _HEAVY_KIND_MODULES). "ner" serves token-level PII NER (unstructured PII); "language"
 # serves language-ID + allow/block mapping.
 SERVABLE_RUNNERS = {"stub", "classifier", "embedding", "nli", "guard_llm", "ner", "language"}
@@ -50,7 +50,7 @@ class MLTaskSpec:
         return f"{self.model_id}@{self.revision}"
 
 
-# The 7 roadmap tasks — ALL now map to a real servable runner (pii_ner→ner and
+# The 7 tasks — ALL now map to a real servable runner (pii_ner→ner and
 # language→language landed; the rest use classifier/nli/embedding/guard_llm).
 ML_TASKS: Dict[str, MLTaskSpec] = {
     "prompt_injection": MLTaskSpec(
@@ -84,10 +84,10 @@ ML_TASKS: Dict[str, MLTaskSpec] = {
 }
 
 
-# ── Candidate-model shortlist (plan appendix M) ────────────────────────────
+# ── Candidate-model shortlist ────────────────────────────
 # Open-license checkpoints per task so an operator can CHOOSE which model to pin.
 # Accuracy figures are vendor/benchmark-reported (NOT measured on ZNYX data) and
-# every row must clear the P2 scorecard_gate on our own suites before enforcement.
+# every row must clear the scorecard_gate on our own suites before enforcement.
 # `open_license` = OSI-permissive / OpenRAIL++ / CC-BY-SA (commercial self-host OK);
 # Llama-Community rows are listed for choice but flagged (commercial <700M MAU, AUP).
 
@@ -155,7 +155,7 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
 
 
 def candidate_models(open_only: bool = False) -> List[Dict[str, Any]]:
-    """Flat list of candidate models (plan appendix M), tagging the currently-pinned
+    """Flat list of candidate models, tagging the currently-pinned
     model per task. `open_only=True` drops the Llama-Community (non-OSI) rows."""
     out: List[Dict[str, Any]] = []
     for task, cands in CANDIDATE_MODELS.items():
@@ -261,7 +261,7 @@ def default_strategy_for(
 
     ``in_boundary`` is SAFE-BY-DEFAULT: when not given it is inferred from the endpoint
     host — True only for a loopback (genuinely co-located) sidecar, else False so an
-    off-box endpoint is treated as a boundary crossing and the F4 egress gate (allowlist
+    off-box endpoint is treated as a boundary crossing and the egress gate (allowlist
     / residency / redaction / fail-closed audit) applies. This means pointing the builder
     off-box can't silently bypass the gate; pass ``in_boundary`` explicitly to override.
 
@@ -269,7 +269,7 @@ def default_strategy_for(
     and IS model-backed (``is_model_backed`` True), pinned to the catalog's model version
     so the scorecard gate checks THAT model. Adopting it in a policy/pack therefore
     requires a passing scorecard to publish (advisory) / BLOCK (enforcement); otherwise
-    publish is blocked or the action is pinned to WARN at runtime — by design (P2 gate)."""
+    publish is blocked or the action is pinned to WARN at runtime — by design (gate)."""
     d = DETECTOR_ML_DEFAULTS.get(detector_key)
     if d is None:
         return None

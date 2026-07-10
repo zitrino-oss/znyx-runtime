@@ -1,5 +1,5 @@
-"""The inference scoring contract (F3 / roadmap §4) — the request + response shapes the
-extended RemoteDetector (F0.5) speaks. Kept dependency-free (pydantic only)."""
+"""The inference scoring contract — the request + response shapes the
+extended RemoteDetector speaks. Kept dependency-free (pydantic only)."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -41,7 +41,7 @@ class InferRequest(BaseModel):
 
 
 class InferResult(BaseModel):
-    """The roadmap confidence contract for a single scored item."""
+    """The confidence contract for a single scored item."""
     decision: Decision                              # canonical: ALLOW|WARN|BLOCK|REDACT|TRANSFORM
     risk_score: int = Field(ge=0, le=100)
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)

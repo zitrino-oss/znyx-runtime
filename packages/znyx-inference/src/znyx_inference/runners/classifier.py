@@ -1,4 +1,4 @@
-"""Sequence-classification runner (F3) — e.g. Prompt-Guard / DeBERTa for prompt-injection
+"""Sequence-classification runner — e.g. Prompt-Guard / DeBERTa for prompt-injection
 / toxicity / jailbreak. Served on CPU via onnxruntime + tokenizers (torch-free); the ONNX
 graph + tokenizer load only in ``load()`` from the verified local artifact dir, never the
 network.

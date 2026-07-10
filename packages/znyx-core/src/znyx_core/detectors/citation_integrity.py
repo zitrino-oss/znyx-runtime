@@ -1,4 +1,4 @@
-"""Citation Integrity detector (P1a, OWASP LLM09 — Misinformation).
+"""Citation Integrity detector (OWASP LLM09 — Misinformation).
 
 Deterministic check that an output's *citations* are grounded in the sources the
 caller actually provided:
@@ -15,8 +15,8 @@ Grounding is supplied per-request via ``metadata.grounding_sources`` /
 same path as ``hallucination``). With no grounding provided, nothing can be verified —
 the detector is a no-op unless ``require_sources`` is set.
 
-P2 NLI hook: an optional ``nli_scorer`` callable ``(premise, hypotheses) -> list[float]``
-(the F3 inference NLI task, injected by the runtime) rescues quotes that fail the fuzzy
+NLI hook: an optional ``nli_scorer`` callable ``(premise, hypotheses) -> list[float]``
+(the inference NLI task, injected by the runtime) rescues quotes that fail the fuzzy
 overlap check — a quote *entailed* by the source text at/above ``min_nli_entailment`` is
 treated as supported. Absent the scorer the detector stays purely deterministic (same
 posture as the optional NLI in ``quality/groundedness.py``).
@@ -62,7 +62,7 @@ class CitationIntegrityDetector:
         self.block_threshold = int(self.config.get("block_threshold", 60))
         self.require_sources = bool(self.config.get("require_sources", False))
         self.min_quote_overlap = float(self.config.get("min_quote_overlap", 0.6))
-        # P2: optional inference NLI scorer (premise, hypotheses) -> list[float] entailment
+        # optional inference NLI scorer (premise, hypotheses) -> list[float] entailment
         # probs, injected by the runtime. None → deterministic fuzzy-overlap only.
         self.nli_scorer = self.config.get("nli_scorer")
         self.min_nli_entailment = float(self.config.get("min_nli_entailment", 0.5))
@@ -131,7 +131,7 @@ class CitationIntegrityDetector:
             return True
         if _FUZZY and (fuzz.partial_ratio(q, source_blob) / 100.0) >= self.min_quote_overlap:
             return True
-        # P2 NLI rescue: a quote the source text entails is supported even if the surface
+        # NLI rescue: a quote the source text entails is supported even if the surface
         # forms differ (paraphrase). Failures degrade silently to the deterministic verdict.
         if self.nli_scorer is not None:
             try:

@@ -1,11 +1,11 @@
-"""Sensitive Business Data detector (P1a, OWASP LLM02 — Sensitive Information
+"""Sensitive Business Data detector (OWASP LLM02 — Sensitive Information
 Disclosure).
 
 Flags confidential business information leaving (or entering) the model: M&A
 activity, internal/unpublished pricing, unreleased roadmap, and customer/account
 lists. This is a deterministic dictionary + allowlist control — operators extend the
 per-category dictionaries with their own domain terms; a transformer classifier is
-added in P2.
+planned.
 
 Config (all optional, ``DetectorConfig`` base + these):
   - ``categories``: dict ``{category: [phrase, ...]}`` MERGED over the defaults so an

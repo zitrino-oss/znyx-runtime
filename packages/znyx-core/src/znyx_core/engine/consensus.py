@@ -1,4 +1,4 @@
-"""Multi-judge consensus synthesis (P3 unit 5, roadmap §5).
+"""Multi-judge consensus synthesis.
 
 Given N independent judge verdicts (each a decision + risk score + confidence + a vote
 weight), synthesize one verdict by **majority** or **weighted** vote. Decision ties break

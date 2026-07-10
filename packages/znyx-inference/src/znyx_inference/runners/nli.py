@@ -1,6 +1,6 @@
-"""NLI cross-encoder runner (F3) — entailment between a premise (provided source) and a
-hypothesis (a claim/quote), for grounding checks (e.g. citation_integrity NLI-backed in
-P2). The input text is a JSON object ``{"premise": ..., "hypothesis": ...}`` (or
+"""NLI cross-encoder runner — entailment between a premise (provided source) and a
+hypothesis (a claim/quote), for grounding checks (e.g. citation_integrity NLI-backed).
+The input text is a JSON object ``{"premise": ..., "hypothesis": ...}`` (or
 ``premise [SEP] hypothesis``); risk = contradiction/non-entailment probability. Served on
 CPU via onnxruntime + tokenizers (torch-free); the ONNX graph loads only in ``load()``. The
 premise/hypothesis pair is tokenized as a sentence pair, so the cross-encoder gets its two

@@ -1,4 +1,4 @@
-"""Explicit, operator-run model fetch (F3 / P5 Step 1).
+"""Explicit, operator-run model fetch.
 
 The heavy runners load weights ONLY from a verified LOCAL artifact dir and NEVER pull from
 the network during inference — see ``_artifacts.py`` (the no-implicit-download warnbox). This

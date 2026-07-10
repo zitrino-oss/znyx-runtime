@@ -1,12 +1,12 @@
-"""Shared prompt-injection pattern bank (P1b).
+"""Shared prompt-injection pattern bank.
 
 Indirect prompt injection (OWASP LLM01) shows up the same way no matter where the
 untrusted text comes from — a retrieved RAG chunk, a tool result re-entering context,
 a poisoned memory write, or a malicious tool manifest. Rather than copy the same
-regexes into four detectors, the markers live here once and each P1b detector calls
+regexes into four detectors, the markers live here once and each detector calls
 ``scan_injection`` with its own ``rule_prefix``.
 
-These are deterministic markers only (no ML) — the ML classifier escalation is P2.
+These are deterministic markers only (no ML) — the ML classifier escalation is planned.
 """
 import re
 from typing import List

@@ -12,7 +12,7 @@ module is the dependency-free seam between them:
   precomputed — neither touches a DB on the hot path.
 * ``budget_allows`` — the pure deny-of-wallet decision over a budget snapshot. The control
   plane builds the snapshot from ``judge_budgets`` rows; the runtime builds it from a
-  bundle-delivered snapshot (Option C). Same logic, same answer.
+  bundle-delivered snapshot. Same logic, same answer.
 * ``policy_uses_judge`` — cheap predicate so a composition root only does the (more
   expensive) judge setup when a request's policy actually uses judges.
 * ``build_escalation_judge_caller`` — turns a detector's raw policy config into the
@@ -51,7 +51,7 @@ class JudgeExecutionContext:
     bridge. A ``None`` field means that capability is off (e.g. no budget configured →
     no veto). ``provider_caller`` lets a root supply the actual provider transport — the
     CP leaves it ``None`` (the judge runtime's default HTTP caller is used), tests inject
-    a fake, and the runtime (Option C) injects a co-located local-model caller.
+    a fake, and the runtime injects a co-located local-model caller.
     """
     audit_sink: Optional[Callable[[dict], None]] = None        # records ONE judge call; org/env stamped at drain
     budget_check: Optional[Callable[[str], bool]] = None       # (detector_key) -> allowed
