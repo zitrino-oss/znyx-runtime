@@ -103,6 +103,18 @@ class RunnerRegistry:
     def list_models(self) -> List[ModelInfo]:
         return list(self._models.values())
 
+    async def reload_task(self, task: str, spec: dict) -> ModelInfo:
+        """Hot-reload a single task after a model install. Stops the old batcher,
+        builds a new runner + batcher from the updated spec, and starts it."""
+        old = self._batchers.pop(task, None)
+        if old is not None:
+            await old.stop()
+        self._build(task, spec)
+        new = self._batchers.get(task)
+        if new is not None:
+            await new.start()
+        return self._models[task]
+
     async def start_all(self) -> None:
         for b in self._batchers.values():
             await b.start()

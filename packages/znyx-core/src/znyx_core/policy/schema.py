@@ -112,6 +112,7 @@ class BackendModeConfig(BaseModel):
     model: Optional[str] = None
     members: Optional[int] = Field(default=None, ge=1)
     method: Optional[Literal["majority", "weighted"]] = None
+    rubric_name: Optional[str] = None      # judge rubric reference (P3 rubric registry)
 
 
 class DetectorBackendsConfig(BaseModel):
