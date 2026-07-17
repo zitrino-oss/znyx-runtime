@@ -25,6 +25,7 @@ from znyx_inference.contract import (
     InferResponse,
     InferResult,
 )
+from znyx_inference.install import InstallManager
 from znyx_inference.registry import RunnerRegistry
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     app.state.config = config
     app.state.registry = registry
     app.state.cache = ContentHashCache(maxsize=config.cache_maxsize)
+    app.state.install_manager = InstallManager()
     available = [m.task for m in registry.list_models() if m.available]
     logger.info("ZNYX Inference ready — available tasks: %s", available)
     try:
@@ -127,3 +129,53 @@ async def infer(task: str, req: InferRequest, request: Request):
     cache.put(key, out)
     resp = _result(out, model_version).model_dump()
     return InferResponse(**resp, latency_ms=int((time.perf_counter() - t0) * 1000), cached=False)
+
+
+# ---------------------------------------------------------------------------
+# Model install + reload (operator-triggered via the console UI)
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+
+
+class InstallRequest(BaseModel):
+    task: str
+    model_id: str | None = None
+    revision: str | None = None
+
+
+class ReloadRequest(BaseModel):
+    task: str
+    spec: dict
+
+
+@app.post("/v1/models/install")
+async def install_model(req: InstallRequest, request: Request):
+    """Start a background model install job. Returns 202 with the job_id."""
+    manager: InstallManager = request.app.state.install_manager
+    try:
+        job = manager.start_install(req.task, model_id=req.model_id, revision=req.revision)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(status_code=202, content=job.to_dict())
+
+
+@app.get("/v1/models/install/{job_id}")
+async def get_install_status(job_id: str, request: Request):
+    """Poll the status of an install job."""
+    manager: InstallManager = request.app.state.install_manager
+    job = manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    return job.to_dict()
+
+
+@app.post("/v1/models/reload")
+async def reload_model(req: ReloadRequest, request: Request):
+    """Hot-reload a task's runner after a model install."""
+    registry: RunnerRegistry = request.app.state.registry
+    info = await registry.reload_task(req.task, req.spec)
+    return info.model_dump()
