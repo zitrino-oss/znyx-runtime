@@ -28,7 +28,7 @@ class ClassifierRunner(OnnxTextRunner):
                 unsafe = max(unsafe, float(p))
         return unsafe, label_scores
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         logits, _ = self._forward(list(texts))       # [B, L]
         probs = self._softmax(logits, axis=-1)
         outs = []

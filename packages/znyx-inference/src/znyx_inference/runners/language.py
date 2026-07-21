@@ -29,29 +29,44 @@ class LanguageRunner(OnnxTextRunner):
         self._allowed = {str(s).lower() for s in (spec.get("allowed_languages") or [])}
         self._blocked = {str(s).lower() for s in (spec.get("blocked_languages") or [])}
 
-    def _decide(self, lang_probs: Dict[str, float]) -> InferOutput:
+    def _decide(self, lang_probs: Dict[str, float],
+                 allowed: set | None = None, blocked: set | None = None) -> InferOutput:
         """Pure: given a language→probability distribution, apply the allow/block policy.
         risk = the top language's prob when blocked/disallowed, else 0; ``label_scores`` =
-        the distribution (so the detected language is always reported)."""
+        the distribution (so the detected language is always reported).
+
+        ``allowed``/``blocked`` override the static spec when provided (per-request params
+        from the policy), falling back to ``self._allowed``/``self._blocked``."""
         if not lang_probs:
             return self._output(0.0, None)
+        eff_allowed = allowed if allowed is not None else self._allowed
+        eff_blocked = blocked if blocked is not None else self._blocked
         top_lang, top_p = max(lang_probs.items(), key=lambda kv: kv[1])
         tl = top_lang.lower()
         unsafe = 0.0
-        if self._blocked and tl in self._blocked:
+        if eff_blocked and tl in eff_blocked:
             unsafe = top_p
-        elif self._allowed and tl != "unknown" and tl not in self._allowed:
+        elif eff_allowed and tl != "unknown" and tl not in eff_allowed:
             unsafe = top_p
         return self._output(unsafe, lang_probs)
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         logits, _ = self._forward(list(texts))       # [B, L]
         probs = self._softmax(logits, axis=-1)
+        # Per-request params from the policy override the static spec.
+        allowed = blocked = None
+        if params:
+            al = params.get("allowed_languages")
+            if al is not None:
+                allowed = {str(s).lower() for s in al}
+            bl = params.get("blocked_languages")
+            if bl is not None:
+                blocked = {str(s).lower() for s in bl}
         outs: List[InferOutput] = []
         for row in probs.tolist():
             lang_probs = {str(self._id2label.get(i, f"LABEL_{i}")).lower(): float(p)
                           for i, p in enumerate(row)}
-            outs.append(self._decide(lang_probs))
+            outs.append(self._decide(lang_probs, allowed, blocked))
         return outs
 
 

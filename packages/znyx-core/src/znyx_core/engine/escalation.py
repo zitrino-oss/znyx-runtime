@@ -116,6 +116,8 @@ def _call_backend(backend: DetectorBackend, text: str, timeout_ms: Optional[int]
         # than a synthetic BLOCK; the strategy fallback then decides the real outcome.
         "fail_open": True,
     }
+    if backend.params:
+        config["params"] = backend.params
     if timeout:
         config["timeout_seconds"] = timeout / 1000.0
         config["total_deadline_seconds"] = timeout / 1000.0

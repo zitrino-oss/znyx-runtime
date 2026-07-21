@@ -45,7 +45,7 @@ class GuardLlmRunner(HeavyRunner):
             return 0.0
         return 0.5
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         torch = self._torch
         outs = []
         # Guard LLMs aren't reliably batchable across prompt lengths → score sequentially

@@ -48,7 +48,7 @@ class NerRunner(OnnxTextRunner):
             types[ent] = max(types.get(ent, 0.0), p)
         return self._output(unsafe, types or None)
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         np = self._np
         logits, encs = self._forward(list(texts))          # [B, T, L]
         probs = self._softmax(logits, axis=-1)

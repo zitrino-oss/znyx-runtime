@@ -64,7 +64,7 @@ class HeavyRunner(Runner):
             threshold=self.threshold,
         )
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         raise NotImplementedError
 
 

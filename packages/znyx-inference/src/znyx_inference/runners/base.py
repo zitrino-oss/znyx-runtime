@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class RunnerUnavailable(Exception):
@@ -40,7 +40,7 @@ class Runner:
     def load(self) -> None:
         """Prepare the runner (load weights, verify sha256). May raise RunnerUnavailable."""
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: Optional[Dict[str, Any]] = None) -> List[InferOutput]:
         raise NotImplementedError
 
 
@@ -101,5 +101,5 @@ class StubRunner(Runner):
             threshold=self.threshold,
         )
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: Optional[Dict[str, Any]] = None) -> List[InferOutput]:
         return [self._score_one(t) for t in texts]

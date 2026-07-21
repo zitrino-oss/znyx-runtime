@@ -110,8 +110,8 @@ class CandidateModel:
 CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
     "prompt_injection": [
         CandidateModel("prompt_injection", "classifier", "protectai/deberta-v3-base-prompt-injection-v2", "primary", "apache-2.0", True, "yes", "184M", "~99.9% on its own eval set", "CPU ~50–100 ms"),
-        CandidateModel("prompt_injection", "classifier", "protectai/deberta-v3-small-prompt-injection-v2", "alternative", "apache-2.0", True, "yes", "96M", "~94% on unseen data", "CPU ~20–30 ms"),
-        CandidateModel("prompt_injection", "classifier", "meta-llama/Llama-Prompt-Guard-2-86M", "alternative", "llama-community", False, "conditional", "86M", "AUC ~0.998 (EN)", "CPU-ok", note="Llama Community: commercial <700M MAU, carries an AUP — not OSI-open."),
+        # CandidateModel("prompt_injection", "classifier", "protectai/deberta-v3-small-prompt-injection-v2", "alternative", "apache-2.0", True, "yes", "96M", "~94% on unseen data", "CPU ~20–30 ms"),  # gated on HuggingFace
+        # CandidateModel("prompt_injection", "classifier", "meta-llama/Llama-Prompt-Guard-2-86M", "alternative", "llama-community", False, "conditional", "86M", "AUC ~0.998 (EN)", "CPU-ok", note="Llama Community: commercial <700M MAU, carries an AUP — not OSI-open."),  # gated
     ],
     "toxicity": [
         CandidateModel("toxicity", "classifier", "unitary/toxic-bert", "primary", "apache-2.0", True, "yes", "110M", "Jigsaw Toxic Comment dataset (EN)", "CPU ~440MB"),
@@ -120,14 +120,15 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
         CandidateModel("toxicity", "classifier", "textdetox/bert-multilingual-toxicity-classifier", "alternative", "openrail++", True, "yes", "BERT-base", "multilingual", "CPU-ok"),
         CandidateModel("toxicity", "classifier", "gravitee-io/distilbert-multilingual-toxicity-classifier", "alternative", "openrail++", True, "yes", "DistilBERT", "fastest", "CPU fast"),
     ],
-    "safety": [
-        CandidateModel("safety", "guard_llm", "allenai/wildguard", "primary", "apache-2.0", True, "yes", "7B", "open safety classifier", "GPU recommended"),
-        CandidateModel("safety", "guard_llm", "ibm-granite/granite-guardian-3.0-2b", "alternative", "apache-2.0", True, "yes", "2B", "small guard options", "CPU-ok / GPU"),
-        CandidateModel("safety", "guard_llm", "meta-llama/Llama-Guard-3-8B", "alternative", "llama-community", False, "conditional", "8B", "strong, gated", "GPU", note="Llama Community: commercial <700M MAU, AUP."),
-    ],
+    # "safety" — guard_llm runner needs [torch] extra, not available in lean ONNX image
+    # "safety": [
+    #     CandidateModel("safety", "guard_llm", "allenai/wildguard", "primary", "apache-2.0", True, "yes", "7B", "open safety classifier", "GPU recommended"),
+    #     CandidateModel("safety", "guard_llm", "ibm-granite/granite-guardian-3.0-2b", "alternative", "apache-2.0", True, "yes", "2B", "small guard options", "CPU-ok / GPU"),
+    #     CandidateModel("safety", "guard_llm", "meta-llama/Llama-Guard-3-8B", "alternative", "llama-community", False, "conditional", "8B", "strong, gated", "GPU", note="Llama Community: commercial <700M MAU, AUP."),
+    # ],
     "language": [
         CandidateModel("language", "language", "papluca/xlm-roberta-base-language-detection", "primary", "mit", True, "yes", "XLM-R-base", "20 languages", "CPU-ok"),
-        CandidateModel("language", "language", "facebook/fasttext-language-identification", "alternative", "cc-by-sa-3.0", True, "yes", "fastText", "176 languages (max coverage)", "CPU fast", note="fastText format — needs a fastText loader, not the transformers LanguageRunner."),
+        # CandidateModel("language", "language", "facebook/fasttext-language-identification", "alternative", "cc-by-sa-3.0", True, "yes", "fastText", "176 languages (max coverage)", "CPU fast", note="fastText format — needs a fastText loader, not the transformers LanguageRunner."),  # fastText format incompatible
     ],
     "nli": [
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-large", "primary", "apache-2.0", True, "yes", "DeBERTa-v3-large", "strong NLI", "GPU pref / CPU-ok"),
@@ -136,21 +137,23 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
         CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),
     ],
     "pii_ner": [
-        CandidateModel("pii_ner", "ner", "urchade/gliner_multi_pii-v1", "primary", "apache-2.0", True, "yes", "GLiNER", "multilingual PII NER", "CPU-ok"),
-        CandidateModel("pii_ner", "ner", "Davlan/bert-base-multilingual-cased-ner-hrl", "alternative", "apache-2.0", True, "yes", "BERT-base", "multilingual basic NER", "CPU-ok"),
-        CandidateModel("pii_ner", "ner", "microsoft/presidio", "alternative", "mit", True, "yes", "framework", "rules+NER framework", "CPU", note="Framework (not a single HF checkpoint) — analyzer + recognizers."),
+        # CandidateModel("pii_ner", "ner", "urchade/gliner_multi_pii-v1", "primary", "apache-2.0", True, "yes", "GLiNER", "multilingual PII NER", "CPU-ok"),  # GLiNER format incompatible with ONNX export
+        CandidateModel("pii_ner", "ner", "Davlan/bert-base-multilingual-cased-ner-hrl", "primary", "apache-2.0", True, "yes", "BERT-base", "multilingual basic NER", "CPU-ok"),
+        # CandidateModel("pii_ner", "ner", "microsoft/presidio", "alternative", "mit", True, "yes", "framework", "rules+NER framework", "CPU", note="Framework (not a single HF checkpoint) — analyzer + recognizers."),  # framework, not a model
     ],
-    "topic_intent": [
-        CandidateModel("topic_intent", "embedding", "BAAI/bge-m3", "primary", "mit", True, "yes", "568M", "strong multilingual retrieval", "CPU-ok / GPU"),
-        CandidateModel("topic_intent", "embedding", "intfloat/multilingual-e5-large", "alternative", "mit", True, "yes", "560M", "strong multilingual", "GPU pref"),
-        CandidateModel("topic_intent", "embedding", "Alibaba-NLP/gte-multilingual-base", "alternative", "apache-2.0", True, "yes", "305M", "efficient", "CPU-ok"),
-        CandidateModel("topic_intent", "embedding", "Qwen/Qwen3-Embedding-0.6B", "alternative", "apache-2.0", True, "yes", "0.6B", "newer, top MTEB", "GPU pref"),
-    ],
-    "guard_llm": [
-        CandidateModel("guard_llm", "guard_llm", "allenai/wildguard", "primary", "apache-2.0", True, "yes", "7B", "permissive guard LLM", "GPU recommended"),
-        CandidateModel("guard_llm", "guard_llm", "ibm-granite/granite-guardian-3.0-2b", "alternative", "apache-2.0", True, "yes", "2B", "small options", "CPU-ok / GPU"),
-        CandidateModel("guard_llm", "guard_llm", "meta-llama/Llama-Guard-3-8B", "alternative", "llama-community", False, "conditional", "8B", "strong, gated", "GPU", note="Llama Community: commercial <700M MAU, AUP."),
-    ],
+    # "topic_intent" — embedding runner needs unsafe_examples config, not supported via UI install
+    # "topic_intent": [
+    #     CandidateModel("topic_intent", "embedding", "BAAI/bge-m3", "primary", "mit", True, "yes", "568M", "strong multilingual retrieval", "CPU-ok / GPU"),
+    #     CandidateModel("topic_intent", "embedding", "intfloat/multilingual-e5-large", "alternative", "mit", True, "yes", "560M", "strong multilingual", "GPU pref"),
+    #     CandidateModel("topic_intent", "embedding", "Alibaba-NLP/gte-multilingual-base", "alternative", "apache-2.0", True, "yes", "305M", "efficient", "CPU-ok"),
+    #     CandidateModel("topic_intent", "embedding", "Qwen/Qwen3-Embedding-0.6B", "alternative", "apache-2.0", True, "yes", "0.6B", "newer, top MTEB", "GPU pref"),
+    # ],
+    # "guard_llm" — guard_llm runner needs [torch] extra, not available in lean ONNX image
+    # "guard_llm": [
+    #     CandidateModel("guard_llm", "guard_llm", "allenai/wildguard", "primary", "apache-2.0", True, "yes", "7B", "permissive guard LLM", "GPU recommended"),
+    #     CandidateModel("guard_llm", "guard_llm", "ibm-granite/granite-guardian-3.0-2b", "alternative", "apache-2.0", True, "yes", "2B", "small options", "CPU-ok / GPU"),
+    #     CandidateModel("guard_llm", "guard_llm", "meta-llama/Llama-Guard-3-8B", "alternative", "llama-community", False, "conditional", "8B", "strong, gated", "GPU", note="Llama Community: commercial <700M MAU, AUP."),
+    # ],
 }
 
 

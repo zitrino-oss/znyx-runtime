@@ -41,7 +41,7 @@ class EmbeddingRunner(OnnxTextRunner):
         norms = np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-9, None)
         return pooled / norms
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         embs = self._embed(list(texts))
         sims = embs @ self._centroid                      # cosine (both normalized)
         return [self._output(max(0.0, float(s)), {"unsafe_similarity": round(float(s), 4)})

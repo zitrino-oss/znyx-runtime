@@ -123,6 +123,8 @@ class RemoteDetector:
             cooldown_seconds=config.get("circuit_cooldown", 30.0),
         )
         self._health_url = config.get("health_url")
+        # Per-request runner params (e.g. allowed_languages for language detection).
+        self._params = config.get("params")
 
     def _build_payload(self, text: str) -> Dict[str, Any]:
         """Build the request body. Keeps the back-compat ``{input_field: text}``
@@ -134,6 +136,8 @@ class RemoteDetector:
             payload["model_id"] = self.model_id
             if self.model_revision:
                 payload["revision"] = self.model_revision
+        if self._params:
+            payload["params"] = self._params
         return payload
 
     def _build_headers(self) -> Dict[str, str]:

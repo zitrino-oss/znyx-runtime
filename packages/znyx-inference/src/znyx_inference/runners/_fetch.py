@@ -112,9 +112,28 @@ def _export_onnx(model_id: str, revision: str, dest_dir: str, runner: str) -> No
     _quantize_onnx(dest_dir)
 
 
+def _should_skip_quantization(dest_dir: str) -> bool:
+    """DeBERTa-v3's disentangled attention produces garbage scores under int8 dynamic
+    quantization. Detect the model type from config.json and skip quantization for it."""
+    import json
+    cfg_path = Path(dest_dir) / "config.json"
+    if not cfg_path.is_file():
+        return False
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        model_type = cfg.get("model_type", "").lower()
+        return model_type in ("deberta-v2", "deberta-v3")
+    except Exception:
+        return False
+
+
 def _quantize_onnx(dest_dir: str) -> None:
     """Best-effort dynamic int8 quantization of the exported ONNX graph (CPU). Non-fatal:
-    if quantization is unavailable for this op set, the fp32 ``model.onnx`` still serves."""
+    if quantization is unavailable for this op set, the fp32 ``model.onnx`` still serves.
+    Skipped for DeBERTa-v3 whose disentangled attention breaks under int8."""
+    if _should_skip_quantization(dest_dir):
+        logger.info("skipping int8 quantization for DeBERTa-v3 model in %s (known incompatibility)", dest_dir)
+        return
     try:
         ort_mod = __import__("optimum.onnxruntime",
                              fromlist=["ORTQuantizer", "configuration"])

@@ -4,16 +4,14 @@ WORKDIR /app
 
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
-# Install the engine + the inference sidecar with the LEAN CPU serving stack ([onnx]):
-# onnxruntime + tokenizers + numpy only. NO torch, NO transformers, NO CUDA — those are
-# offline export-time deps ([export]) and are never baked into this image, which is why it
-# stays small (hundreds of MB, not multi-GB). Generative guard_llm needs [torch] and is
-# intentionally unavailable here.
-# Model weights are NOT baked into the image: export + sha256-pin them offline, mount the
-# ONNX artifact at /models, and pin per task via env (see packages/znyx-inference/MODELS.md).
+# Install the engine + inference sidecar with the serving stack ([onnx]) and the export
+# stack ([export]) so the console's Install button can download + ONNX-export models.
+# CPU-only torch is installed first from the PyTorch CPU index (~200 MB instead of ~2.5 GB
+# with CUDA) — the export pipeline never uses GPU.
 COPY packages/znyx-core /app/packages/znyx-core
 COPY packages/znyx-inference /app/packages/znyx-inference
-RUN pip install --no-cache-dir ./packages/znyx-core "./packages/znyx-inference[onnx]"
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir ./packages/znyx-core "./packages/znyx-inference[onnx,export]"
 
 # Non-root. /models is the read-only mount point for fetched, sha256-pinned weights.
 RUN useradd -m -u 1000 appuser && \
