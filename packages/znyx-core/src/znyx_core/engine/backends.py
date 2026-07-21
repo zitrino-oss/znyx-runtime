@@ -19,7 +19,7 @@ _DETERMINISTIC = ExecutionMode.local_deterministic.value
 _BACKEND_FIELDS = (
     "endpoint_url", "model_id", "revision", "sha256", "task", "threshold",
     "provider", "judge_id", "timeout_ms", "auth_type", "auth_value",
-    "region", "in_boundary", "provider_config",
+    "region", "in_boundary", "provider_config", "params",
 )
 
 
@@ -43,6 +43,9 @@ class DetectorBackend:
     # Vendor-adapter-specific settings (e.g. Azure api-version/severity threshold,
     # Bedrock guardrail id/version) merged into the adapter's config dict.
     provider_config: Optional[Dict[str, Any]] = None
+    # Per-request runner params (e.g. allowed_languages for the language runner).
+    # Passed through to the inference sidecar in the request body.
+    params: Optional[Dict[str, Any]] = None
 
     @property
     def model_version(self) -> Optional[str]:
@@ -143,6 +146,25 @@ def merge_org_defaults_into_policy(policies: Dict[str, Any],
     return out
 
 
+def _inject_language_params(detector_config: Dict[str, Any],
+                            backends: Dict[str, "DetectorBackend"]) -> None:
+    """If a backend serves the ``language`` task, copy the detector policy's
+    ``allowed_languages`` / ``blocked_languages`` into its ``params`` so the
+    LanguageRunner can enforce the same policy as the deterministic detector."""
+    lang_keys = {}
+    al = detector_config.get("allowed_languages")
+    if al is not None:
+        lang_keys["allowed_languages"] = al
+    bl = detector_config.get("blocked_languages")
+    if bl is not None:
+        lang_keys["blocked_languages"] = bl
+    if not lang_keys:
+        return
+    for be in backends.values():
+        if be.task == "language":
+            be.params = {**(be.params or {}), **lang_keys}
+
+
 def build_strategy(detector_config: Dict[str, Any],
                    runtime_policy: Optional[Dict[str, Any]] = None,
                    policy: Optional[Dict[str, Any]] = None,
@@ -169,6 +191,12 @@ def build_strategy(detector_config: Dict[str, Any],
     for mode, cfg in (detector_config.get("backends") or {}).items():
         if mode in _VALID_MODES and isinstance(cfg, dict):
             backends[mode] = DetectorBackend(mode=mode, **{f: cfg.get(f) for f in _BACKEND_FIELDS})
+
+    # Auto-populate per-request params for the language runner: copy the detector
+    # policy's allowed_languages / blocked_languages into the backend's params so the
+    # ML runner enforces the same policy as the deterministic detector — no manual
+    # config needed on the inference sidecar.
+    _inject_language_params(detector_config, backends)
 
     runtime_policy = runtime_policy or {}
     rbe = detector_config.get("redact_before_egress")

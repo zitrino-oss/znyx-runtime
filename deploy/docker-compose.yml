@@ -30,7 +30,7 @@ services:
       # (default: https://cp.znyx.ai/v1/install-telemetry — see TELEMETRY.md):
       # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
       # Enable ML by pointing at the inference sidecar (started with --profile ml):
-      # ZNYX_INFERENCE_URL: "http://inference:9000"
+      ZNYX_INFERENCE_URL: "http://inference:9000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 30s
@@ -49,13 +49,21 @@ services:
     ports:
       - "9000:9000"
     volumes:
-      - ./models:/models:ro
+      - inference-models:/models
     environment:
       PORT: "9000"
-      # Point each task at a fetched, pinned model, e.g.:
-      # ZNYX_INFERENCE_TASKS: '{"prompt_injection":{"runner":"classifier","model_id":"protectai/deberta-v3-base-prompt-injection-v2","revision":"main","sha256":"<sha>"}}'
+      ZNYX_INFERENCE_ARTIFACTS_DIR: "/models"
+      ZNYX_INFERENCE_TASKS: >
+        {"prompt_injection":{"runner":"classifier","model_id":"protectai/deberta-v3-base-prompt-injection-v2","revision":"main","threshold":0.5},
+         "toxicity":{"runner":"classifier","model_id":"unitary/toxic-bert","revision":"main","threshold":0.5},
+         "language":{"runner":"language","model_id":"papluca/xlm-roberta-base-language-detection","revision":"main","threshold":0.5},
+         "nli":{"runner":"nli","model_id":"cross-encoder/nli-deberta-v3-large","revision":"main","threshold":0.5},
+         "pii_ner":{"runner":"ner","model_id":"Davlan/bert-base-multilingual-cased-ner-hrl","revision":"main","threshold":0.5}}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  inference-models:

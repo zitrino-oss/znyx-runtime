@@ -2,7 +2,7 @@
 extended RemoteDetector speaks. Kept dependency-free (pydantic only)."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -18,6 +18,7 @@ class InferRequest(BaseModel):
     texts: Optional[List[str]] = None
     model_id: Optional[str] = None       # optional pin assertion (must match the loaded model)
     revision: Optional[str] = None
+    params: Optional[Dict[str, Any]] = None  # per-request runner params (e.g. allowed_languages)
 
     @model_validator(mode="after")
     def _validate(self):

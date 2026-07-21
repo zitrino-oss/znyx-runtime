@@ -38,7 +38,7 @@ class NliRunner(OnnxTextRunner):
         self._labels = (self.spec.get("nli_labels") or by_config
                         or ["contradiction", "neutral", "entailment"])
 
-    def infer_batch(self, texts: List[str]) -> List[InferOutput]:
+    def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:
         pairs = [_split_pair(t) for t in texts]
         logits, _ = self._forward(pairs)                    # [B, L] (pair-encoded)
         # multi-class NLI → softmax; a single-logit regression head → sigmoid.

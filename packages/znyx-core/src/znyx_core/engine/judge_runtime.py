@@ -152,7 +152,12 @@ def judge_params_from_config(policy_key: str, config: Dict[str, Any]) -> Optiona
         logger.warning("judge_params: %s — no backends dict in config (keys: %s)",
                        policy_key, list(config.keys()) if isinstance(config, dict) else None)
         return None
-    for mode in _JUDGE_MODES:
+    # Respect the strategy's execution order so the selected judge mode matches
+    # what the escalation engine will actually call (e.g. remote_llm, not a stale
+    # local_llm that also happens to be in backends from a previous configuration).
+    strategy_order = config.get("strategy", {}).get("order", [])
+    modes_to_check = [m for m in strategy_order if m in _JUDGE_MODES] or _JUDGE_MODES
+    for mode in modes_to_check:
         block = backends.get(mode)
         if not isinstance(block, dict):
             continue

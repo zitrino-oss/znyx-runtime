@@ -10,6 +10,7 @@ Boots on the dependency-free StubRunner with no ML stack installed.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -102,6 +103,24 @@ async def infer(task: str, req: InferRequest, request: Request):
 
     texts = req.items()
     t0 = time.perf_counter()
+
+    # When per-request params are provided (e.g. allowed_languages for the language
+    # runner), bypass the batcher and call the runner directly — the batcher groups
+    # texts from different callers and can't carry per-request params.
+    if req.params:
+        runner = batcher.runner
+        try:
+            outs = await asyncio.to_thread(runner.infer_batch, texts, req.params)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        if len(texts) == 1:
+            resp = _result(outs[0], model_version).model_dump()
+            return InferResponse(**resp, latency_ms=int((time.perf_counter() - t0) * 1000), cached=False)
+        return BatchInferResponse(
+            results=[_result(o, model_version) for o in outs],
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            model_version=model_version,
+        )
 
     # Explicit multi-item batch → no per-item cache, return BatchInferResponse.
     if req.texts is not None:
