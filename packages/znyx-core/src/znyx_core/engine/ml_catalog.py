@@ -177,13 +177,34 @@ def candidate_models(open_only: bool = False) -> List[Dict[str, Any]]:
 
 
 def inference_task_specs() -> Dict[str, Dict[str, Any]]:
-    """Heavy-profile task→spec map for ``InferenceConfig.task_specs``. Only tasks with a
-    real runner today (supported); ``pii_ner`` is excluded until its NER runner lands."""
-    return {
-        t.task: {"runner": t.runner, "model_id": t.model_id, "revision": t.revision,
-                 "threshold": t.threshold}
-        for t in ML_TASKS.values() if t.supported and t.runner in SERVABLE_RUNNERS
-    }
+    """Heavy-profile task→spec map for ``InferenceConfig.task_specs``. Prefers the catalog
+    default; if its artifacts are missing on disk, falls back to the first installed
+    candidate from ``CANDIDATE_MODELS``."""
+    base = os.getenv("ZNYX_INFERENCE_ARTIFACTS_DIR") or str(
+        Path.home() / ".znyx" / "models"
+    )
+    specs: Dict[str, Dict[str, Any]] = {}
+    for t in ML_TASKS.values():
+        if not t.supported or t.runner not in SERVABLE_RUNNERS:
+            continue
+        model_id = t.model_id
+        revision = t.revision
+        # If the default model's artifacts aren't on disk, check candidates.
+        default_dir = Path(base) / t.model_id.replace("/", "__")
+        if not default_dir.is_dir():
+            for c in CANDIDATE_MODELS.get(t.task, []):
+                cand_dir = Path(base) / c.model_id.replace("/", "__")
+                if cand_dir.is_dir():
+                    model_id = c.model_id
+                    revision = c.revision
+                    break
+        specs[t.task] = {
+            "runner": t.runner,
+            "model_id": model_id,
+            "revision": revision,
+            "threshold": t.threshold,
+        }
+    return specs
 
 
 def registry_seed_rows() -> List[Dict[str, Any]]:
@@ -233,7 +254,7 @@ DETECTOR_ML_DEFAULTS: Dict[str, DetectorMLDefault] = {
 
 
 def inference_url() -> str:
-    return os.getenv("ZNYX_INFERENCE_URL", "http://localhost:8088").rstrip("/")
+    return os.getenv("ZNYX_INFERENCE_URL", "http://localhost:9000").rstrip("/")
 
 
 def _is_loopback(url: str) -> bool:
