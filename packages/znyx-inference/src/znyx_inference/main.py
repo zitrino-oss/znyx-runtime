@@ -41,11 +41,18 @@ async def lifespan(app: FastAPI):
     app.state.registry = registry
     app.state.cache = ContentHashCache(maxsize=config.cache_maxsize)
     app.state.install_manager = InstallManager()
+    # Pull-based desired state: when the control-plane channel is configured, poll the
+    # bundle for this deployment's model pins, self-install, and heartbeat what's loaded.
+    from znyx_inference.pin_sync import PinSyncConfig, PinSyncService
+    pin_sync = PinSyncService(registry, PinSyncConfig.from_env())
+    app.state.pin_sync = pin_sync
+    await pin_sync.start()
     available = [m.task for m in registry.list_models() if m.available]
     logger.info("ZNYX Inference ready — available tasks: %s", available)
     try:
         yield
     finally:
+        await pin_sync.stop()
         await registry.stop_all()
 
 
@@ -60,17 +67,27 @@ def _result(out, model_version: str) -> InferResult:
     )
 
 
-def _assert_pin(req: InferRequest, model_version: str) -> None:
-    """If the caller pinned model_id/revision, the loaded model MUST match (model
-    pinning) — otherwise the caller could be silently scored by the wrong model. The
-    loaded identity is ``model_id@revision``; compare each pinned component against it."""
+def _resolve_batcher(registry: RunnerRegistry, task: str, req: InferRequest):
+    """Route the request to the batcher serving the model it pinned (multi-model).
+
+    Unpinned → the task's active slot. Pinned → the active slot when it matches, else a
+    loaded variant of that exact model. A pin no loaded model satisfies is still a 409 —
+    the caller must never be silently scored by the wrong model."""
     if not req.model_id:
-        return
-    loaded_id, _, loaded_rev = model_version.partition("@")
-    if req.model_id != loaded_id or (req.revision is not None and req.revision != loaded_rev):
-        want = req.model_id + (f"@{req.revision}" if req.revision else "")
-        raise HTTPException(status_code=409, detail=(
-            f"model pin mismatch: requested {want}, loaded {model_version}"))
+        batcher = registry.get(task)
+        if batcher is None:
+            raise HTTPException(status_code=503, detail=f"task '{task}' unavailable")
+        return batcher, registry.model_version(task) or "unknown"
+
+    resolved = registry.get_for(task, req.model_id, req.revision)
+    if resolved is not None:
+        return resolved
+    if registry.get(task) is None and not registry.serves(task, req.model_id, req.revision):
+        raise HTTPException(status_code=503, detail=f"task '{task}' unavailable")
+    want = req.model_id + (f"@{req.revision}" if req.revision else "")
+    loaded = registry.model_version(task) or "unknown"
+    raise HTTPException(status_code=409, detail=(
+        f"model pin mismatch: requested {want}, loaded {loaded}"))
 
 
 @app.get("/healthz")
@@ -95,11 +112,7 @@ async def stats(request: Request):
 async def infer(task: str, req: InferRequest, request: Request):
     registry: RunnerRegistry = request.app.state.registry
     cache: ContentHashCache = request.app.state.cache
-    batcher = registry.get(task)
-    if batcher is None:
-        raise HTTPException(status_code=503, detail=f"task '{task}' unavailable")
-    model_version = registry.model_version(task) or "unknown"
-    _assert_pin(req, model_version)
+    batcher, model_version = _resolve_batcher(registry, task, req)
 
     texts = req.items()
     t0 = time.perf_counter()

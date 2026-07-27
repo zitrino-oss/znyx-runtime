@@ -82,3 +82,6 @@ class ModelInfo(BaseModel):
     revision: Optional[str] = None
     sha256: Optional[str] = None
     detail: Optional[str] = None
+    # True for the task's active (default) slot; False for an additionally loaded variant
+    # a pinned request routes to (multi-model). Defaults True so older payloads are active.
+    active: bool = True
