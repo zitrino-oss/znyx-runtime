@@ -98,6 +98,13 @@ class RunnerRegistry:
                 model_id=mid, revision=rev,
                 sha256=spec.get("sha256"), active=active,
             )
+            # The failure branch below always logs; this mirrors it on success so a real
+            # (non-stub) load leaves SOME trace — previously only failures were visible,
+            # which made a successful pin-sync install indistinguishable from silence.
+            if kind != "stub":
+                logger.info("inference task '%s' (runner=%s) loaded: %s%s",
+                           task, kind, model_version,
+                           "" if active else " (variant, not the active slot)")
             return batcher, info
         except Exception as exc:  # noqa: BLE001
             # Any load failure (RunnerUnavailable, or an unexpected OSError/ValueError
@@ -181,6 +188,18 @@ class RunnerRegistry:
         if new is not None:
             await new.start()
         return self._models[task]
+
+    async def unload_variant(self, task: str, model_id: str, revision: Optional[str] = None) -> bool:
+        """Evict a previously-loaded variant — load_variant's mirror. Frees the batcher
+        (stops the underlying runner) and removes the ModelInfo entirely, so
+        list_models()/the next heartbeat immediately stop reporting it. Returns False if
+        nothing matched (already gone, or never loaded)."""
+        key = (task, variant_key(model_id, revision))
+        batcher = self._variant_batchers.pop(key, None)
+        had_info = self._variant_models.pop(key, None) is not None
+        if batcher is not None:
+            await batcher.stop()
+        return had_info or batcher is not None
 
     async def load_variant(self, task: str, spec: dict) -> ModelInfo:
         """Load an ADDITIONAL model for ``task`` without touching the active slot.

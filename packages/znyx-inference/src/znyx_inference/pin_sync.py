@@ -119,11 +119,20 @@ class PinSyncService:
         pins = await self._fetch_pins()
         applied: List[str] = []
         skipped: List[str] = []
+        evicted: List[str] = []
         if pins is not None:                 # None → 304 / unchanged
+            previous = self._last_pins
             self._last_pins = pins
             applied, skipped = await self._apply(pins)
+            evicted = await self._evict_removed(previous, pins)
+            # Only when something changed — an unchanged bundle (304) or a bundle whose
+            # pins are all already served produces no line, so this doesn't spam the log
+            # every poll interval; the per-model lines below already cover the download.
+            if applied or skipped or evicted:
+                logger.info("pin-sync: cycle complete — applied=%s skipped=%s evicted=%s",
+                            applied, skipped, evicted)
         await self._heartbeat()
-        return {"pins": self._last_pins, "applied": applied, "skipped": skipped}
+        return {"pins": self._last_pins, "applied": applied, "skipped": skipped, "evicted": evicted}
 
     async def _fetch_pins(self) -> Optional[Dict[str, Dict[str, Any]]]:
         headers = {"X-API-Key": self.config.token}
@@ -162,6 +171,34 @@ class PinSyncService:
                 skipped.append(f"{task}:{model_id}@{revision}")
         return applied, skipped
 
+    async def _evict_removed(self, previous: Dict[str, Dict[str, Any]],
+                             current: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Unload any variant this service loaded for a task whose pin has since been
+        removed or changed to a different model. Safe without provenance tracking —
+        ``registry.load_variant`` has exactly one caller in the whole package (this
+        service), so every entry in the registry's variant tables was put there by a
+        pin, never by the manual Install/Reload path (that only ever replaces the
+        ACTIVE slot via ``reload_task``)."""
+        evicted: List[str] = []
+        for task, prev_pin in previous.items():
+            if not isinstance(prev_pin, dict) or not prev_pin.get("model_id"):
+                continue
+            model_id = str(prev_pin["model_id"])
+            revision = str(prev_pin.get("revision") or "main")
+            cur_pin = current.get(task)
+            still_pinned = (
+                isinstance(cur_pin, dict)
+                and str(cur_pin.get("model_id") or "") == model_id
+                and str(cur_pin.get("revision") or "main") == revision
+            )
+            if still_pinned:
+                continue
+            if await self.registry.unload_variant(task, model_id, revision):
+                evicted.append(f"{task}:{model_id}@{revision}")
+                logger.info("pin-sync: unloaded %s@%s for task %s (no longer pinned)",
+                            model_id, revision, task)
+        return evicted
+
     async def _install_and_load(self, task: str, model_id: str, revision: str,
                                 threshold: Any) -> None:
         from znyx_inference.runners._fetch import fetch_model, resolve_fetch_target
@@ -173,10 +210,18 @@ class PinSyncService:
         dest = Path(target["dest_dir"])
         sha: Optional[str] = None
         if not (dest.exists() and any(dest.iterdir())):
-            logger.info("pin-sync: fetching %s@%s for task %s", model_id, revision, task)
+            logger.info("pin-sync: fetching %s@%s for task %s (this can take a while for "
+                        "large models — huggingface_hub's own progress bar is disabled on a "
+                        "non-tty stream, so nothing more will print here until it finishes)",
+                        model_id, revision, task)
             sha = await asyncio.to_thread(
                 fetch_model, target["model_id"], target["revision"], target["dest_dir"],
                 runner=target["runner"])
+            logger.info("pin-sync: fetch complete for %s@%s (sha256=%s)",
+                        model_id, revision, sha)
+        else:
+            logger.info("pin-sync: %s@%s for task %s already cached, loading",
+                        model_id, revision, task)
 
         spec: Dict[str, Any] = {
             "runner": target["runner"],
@@ -190,6 +235,7 @@ class PinSyncService:
         info = await self.registry.load_variant(task, spec)
         if not info.available:
             raise RuntimeError(info.detail or "variant failed to load")
+        logger.info("pin-sync: now serving %s@%s for task %s", model_id, revision, task)
 
     async def _heartbeat(self) -> None:
         """Report loaded models to the control plane. Best-effort: an older control plane

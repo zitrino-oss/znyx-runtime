@@ -29,6 +29,12 @@ from znyx_inference.contract import (
 from znyx_inference.install import InstallManager
 from znyx_inference.registry import RunnerRegistry
 
+# Nothing in this package configured a level/handler before, so every INFO-level log
+# (pin-sync's fetch/load progress, registry's successful-load line) was silently dropped —
+# Python's root logger defaults to WARNING with no handler, and uvicorn's own dictConfig
+# only touches its own "uvicorn"/"uvicorn.access"/"uvicorn.error" loggers, not this app's.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
 logger = logging.getLogger(__name__)
 
 
