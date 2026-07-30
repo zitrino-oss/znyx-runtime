@@ -6,13 +6,14 @@
 # apply to a call that never leaves the pod). No address is stored in the control plane and
 # none is shipped in the policy bundle.
 #
-# To enable ML: create the secret and PVC below, then uncomment the `inference` container.
+# To enable ML: create the secret, create a models PersistentVolumeClaim (see the volumes
+# section at the bottom), then uncomment the `inference` container.
 #
 #   kubectl create secret generic znyx-inference-secrets \
 #     --from-literal=ZNYX_INFERENCE_API_KEY=gr_...        # Console → project → Keys
 #
 # Note the trade-off of same-pod co-location: each replica provisions and holds its own copy
-# of the weights, so the PVC must be ReadWriteMany (or use one volume per replica via a
+# of the weights, so the claim must be ReadWriteMany (or use one volume per replica via a
 # StatefulSet). For a large estate, running the sidecar as its own Deployment and setting
 # ZNYX_INFERENCE_URL on the runtime is still supported — but then the address is off-box, the
 # egress gate applies, and you are back to managing an address.
@@ -116,7 +117,27 @@ spec:
         #       cpu: "2"
         #       memory: "4Gi"
 
-      # Uncomment alongside the inference container above, and apply inference-pvc.yaml.
+      # Uncomment alongside the inference container above. You supply the claim yourself —
+      # storage classes vary too much per cluster to ship a manifest that would work
+      # anywhere. It must be WRITABLE (the sidecar downloads into it) and, because every
+      # replica of this Deployment mounts it, ReadWriteMany. Budget ~1GB per
+      # classifier/NER task and ~2.5GB for a guard LLM; 20Gi holds the default pins.
+      #
+      #   kubectl create -f - <<'YAML'
+      #   apiVersion: v1
+      #   kind: PersistentVolumeClaim
+      #   metadata:
+      #     name: znyx-inference-models
+      #   spec:
+      #     accessModes: [ReadWriteMany]
+      #     resources:
+      #       requests:
+      #         storage: 20Gi
+      #     storageClassName: <an RWX class — azurefile, efs-sc, nfs, …>
+      #   YAML
+      #
+      # No RWX class available? Drop to one replica, or move the sidecar to a StatefulSet
+      # with a volumeClaimTemplate so each replica gets its own volume.
       # volumes:
       #   - name: models
       #     persistentVolumeClaim:
