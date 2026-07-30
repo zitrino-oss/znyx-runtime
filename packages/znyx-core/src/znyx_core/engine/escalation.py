@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 from znyx_core.core.labels import normalize_risk
 from znyx_core.core.models import Decision, DetectorResult, LayerResult, RuleHit, Severity
 from znyx_core.engine.backends import (
+    ML_MODES,
     BackendStrategy,
     DetectorBackend,
     should_escalate,
@@ -38,7 +39,9 @@ def _caller_accepts_gate(fn) -> bool:
         return False
     return "egress_gate" in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
 
-_ML_MODES = {"local_ml", "local_embedding"}
+# Owned by ``backends`` so the address resolver and this mode classification can never
+# drift apart — a mode counted as ML here but not there would escalate with no endpoint.
+_ML_MODES = ML_MODES
 _LLM_MODES = {"local_llm", "remote_llm"}
 # Egress-gate denial reasons that become the fallback_path verbatim. Includes
 # the two fail-closed reasons: a configured redactor that couldn't run, and an audit

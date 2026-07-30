@@ -15,6 +15,11 @@ from znyx_core.core.models import ExecutionMode
 _VALID_MODES = frozenset(m.value for m in ExecutionMode)
 _DETERMINISTIC = ExecutionMode.local_deterministic.value
 
+# Modes served by the co-located inference sidecar. Single owner: ``escalation`` imports
+# this rather than keeping its own copy, because ``_resolve_ml_endpoints`` below and
+# ``escalation._normalize_kind`` must agree on exactly which modes get a sidecar address.
+ML_MODES = frozenset({"local_ml", "local_embedding"})
+
 # Fields copied from a policy backends.<mode> block into a DetectorBackend.
 _BACKEND_FIELDS = (
     "endpoint_url", "model_id", "revision", "sha256", "task", "threshold",
@@ -146,6 +151,45 @@ def merge_org_defaults_into_policy(policies: Dict[str, Any],
     return out
 
 
+def _resolve_ml_endpoints(backends: Dict[str, "DetectorBackend"]) -> None:
+    """Fill in ``endpoint_url`` / ``in_boundary`` for ML backends that carry neither.
+
+    The inference sidecar is co-located with this runtime at a fixed convention address —
+    loopback when it runs as a same-pod container, a service name on a compose network.
+    The control plane cannot know which, so it ships no address at all and actively strips
+    any stale one at publish time. This function is therefore the ONLY place a ``local_ml``
+    backend acquires an address, and without it escalation raises "no endpoint configured
+    for mode local_ml" and silently degrades every ML detector to rules.
+
+    Deliberately narrow:
+
+    * **ML modes only.** ``remote_api`` / ``remote_llm`` / ``local_llm`` name third-party or
+      operator-chosen endpoints; defaulting those to the inference sidecar would send judge
+      traffic somewhere it was never configured to go.
+    * **Never overrides an explicit address.** An operator pointing one detector at a
+      dedicated sidecar still wins.
+    * **Requires ``task``**, since the address is per-task (``/v1/infer/{task}``). A backend
+      with no task is left alone to fail loudly rather than be pointed at ``/v1/infer/None``.
+
+    ``in_boundary`` is inferred safe-by-default from the resolved host, mirroring
+    ``ml_catalog.default_strategy_for``: true only for genuine loopback (where the call never
+    leaves the pod, so the F4 egress gate correctly does not apply), false otherwise so an
+    off-box sidecar is treated as a boundary crossing and gets allowlist / residency /
+    redaction / fail-closed audit. An explicit ``in_boundary`` in the policy is preserved.
+    """
+    from znyx_core.engine.ml_catalog import _is_loopback, inference_url
+
+    base: Optional[str] = None
+    for backend in backends.values():
+        if backend.mode not in ML_MODES or backend.endpoint_url or not backend.task:
+            continue
+        if base is None:
+            base = inference_url()          # resolved once per strategy build
+        backend.endpoint_url = f"{base}/v1/infer/{backend.task}"
+        if backend.in_boundary is None:
+            backend.in_boundary = _is_loopback(backend.endpoint_url)
+
+
 def _inject_language_params(detector_config: Dict[str, Any],
                             backends: Dict[str, "DetectorBackend"]) -> None:
     """If a backend serves the ``language`` task, copy the detector policy's
@@ -191,6 +235,11 @@ def build_strategy(detector_config: Dict[str, Any],
     for mode, cfg in (detector_config.get("backends") or {}).items():
         if mode in _VALID_MODES and isinstance(cfg, dict):
             backends[mode] = DetectorBackend(mode=mode, **{f: cfg.get(f) for f in _BACKEND_FIELDS})
+
+    # Resolve the co-located sidecar's address for ML modes that don't carry one. The
+    # control plane deliberately ships no address (it doesn't know the deployment's
+    # topology), so this is where an ML backend actually acquires one.
+    _resolve_ml_endpoints(backends)
 
     # Auto-populate per-request params for the language runner: copy the detector
     # policy's allowed_languages / blocked_languages into the backend's params so the
