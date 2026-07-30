@@ -13,13 +13,19 @@ COPY packages/znyx-inference /app/packages/znyx-inference
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir ./packages/znyx-core "./packages/znyx-inference[onnx,export]"
 
-# Non-root. /models is the read-only mount point for fetched, sha256-pinned weights.
+# Non-root. /models holds the sha256-verified weights. It must be a WRITABLE mount: the
+# sidecar provisions models itself from the control plane (see pin_sync.py), so this is no
+# longer a read-only mount of pre-fetched artifacts.
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /models /app/.cache/znyx && \
     chown -R appuser:appuser /models /app/.cache
 USER appuser
 
-ENV PORT=9000
+# Point the artifact root at the mount above. Without this the default is
+# ~/.znyx/models — inside the container's own layer, so every provisioned model would be
+# silently re-downloaded on each `docker run`.
+ENV PORT=9000 \
+    ZNYX_INFERENCE_ARTIFACTS_DIR=/models
 EXPOSE 9000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
