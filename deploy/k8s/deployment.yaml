@@ -6,16 +6,21 @@
 # apply to a call that never leaves the pod). No address is stored in the control plane and
 # none is shipped in the policy bundle.
 #
-# To enable ML: create the secret and PVC below, then uncomment the `inference` container.
+# To enable ML: create the secret below, then uncomment the `inference` container and the
+# `volumes` block at the bottom.
 #
 #   kubectl create secret generic znyx-inference-secrets \
 #     --from-literal=ZNYX_INFERENCE_API_KEY=gr_...        # Console → project → Keys
 #
 # Note the trade-off of same-pod co-location: each replica provisions and holds its own copy
-# of the weights, so the PVC must be ReadWriteMany (or use one volume per replica via a
-# StatefulSet). For a large estate, running the sidecar as its own Deployment and setting
-# ZNYX_INFERENCE_URL on the runtime is still supported — but then the address is off-box, the
-# egress gate applies, and you are back to managing an address.
+# of the weights in a pod-local emptyDir, so a replaced pod re-downloads them. That is the
+# deliberate default — no shared volume means no concurrent writers to one artifact tree and
+# no cache that can outlive a pod in a broken state. If cold-start time matters more, move the
+# sidecar into a StatefulSet with a volumeClaimTemplate so each replica gets its own
+# persistent volume; do not point every replica at one shared ReadWriteMany claim. For a large
+# estate, running the sidecar as its own Deployment and setting ZNYX_INFERENCE_URL on the
+# runtime is still supported — but then the address is off-box, the egress gate applies, and
+# you are back to managing an address.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -116,8 +121,14 @@ spec:
         #       cpu: "2"
         #       memory: "4Gi"
 
-      # Uncomment alongside the inference container above, and apply inference-pvc.yaml.
+      # Uncomment alongside the inference container above. Pod-scoped on purpose: the sidecar
+      # re-provisions the weights whenever a pod is replaced, and an interrupted download
+      # leaves nothing behind to be mistaken for a complete artifact on the next start.
+      #
+      # sizeLimit keeps a multi-gigabyte download off the node's ephemeral storage budget —
+      # budget ~1GB per classifier/NER task and ~2.5GB for a guard LLM. Exceeding it evicts the
+      # pod, so raise it if you pin more than the defaults.
       # volumes:
       #   - name: models
-      #     persistentVolumeClaim:
-      #       claimName: znyx-inference-models
+      #     emptyDir:
+      #       sizeLimit: 25Gi
