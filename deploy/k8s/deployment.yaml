@@ -1,3 +1,26 @@
+# Znyx runtime, with the optional ML sidecar as a same-pod container.
+#
+# The sidecar is co-located deliberately: the runtime then reaches it on
+# http://localhost:9000 with nothing configured, and because that address is genuinely
+# loopback the ML layer is correctly treated as in-boundary (the F4 egress gate does not
+# apply to a call that never leaves the pod). No address is stored in the control plane and
+# none is shipped in the policy bundle.
+#
+# To enable ML: create the secret below, then uncomment the `inference` container and the
+# `volumes` block at the bottom.
+#
+#   kubectl create secret generic znyx-inference-secrets \
+#     --from-literal=ZNYX_INFERENCE_API_KEY=gr_...        # Console → project → Keys
+#
+# Note the trade-off of same-pod co-location: each replica provisions and holds its own copy
+# of the weights in a pod-local emptyDir, so a replaced pod re-downloads them. That is the
+# deliberate default — no shared volume means no concurrent writers to one artifact tree and
+# no cache that can outlive a pod in a broken state. If cold-start time matters more, move the
+# sidecar into a StatefulSet with a volumeClaimTemplate so each replica gets its own
+# persistent volume; do not point every replica at one shared ReadWriteMany claim. For a large
+# estate, running the sidecar as its own Deployment and setting ZNYX_INFERENCE_URL on the
+# runtime is still supported — but then the address is off-box, the egress gate applies, and
+# you are back to managing an address.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,9 +56,9 @@ spec:
                 secretKeyRef:
                   name: znyx-runtime-secrets
                   key: RUNTIME_API_KEY
-            # Optional ML: point at a sidecar endpoint you run.
-            # - name: ZNYX_INFERENCE_URL
-            #   value: "http://znyx-inference:9000"
+            # ZNYX_INFERENCE_URL is intentionally NOT set. With the sidecar in this pod the
+            # runtime's default (http://localhost:9000) is already correct, and leaving it
+            # unset is what keeps the call loopback/in-boundary.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -55,3 +78,57 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
+
+        # ── Optional ML sidecar ──────────────────────────────────────────────────────────
+        # Self-provisioning: on startup it pings the control plane for this project's model
+        # pins, downloads and sha256-verifies the weights into /models, and hot-loads them.
+        # Until a model is loaded, ML tasks return 503 and the runtime falls back to
+        # deterministic rules — an unreachable control plane is never an outage.
+        #
+        # - name: inference
+        #   image: znyx/inference:latest
+        #   ports:
+        #     - containerPort: 9000
+        #   env:
+        #     # The two settings that drive model provisioning.
+        #     - name: ZNYX_CONTROL_PLANE_URL
+        #       value: "https://cp.znyx.ai"
+        #     - name: ZNYX_INFERENCE_API_KEY
+        #       valueFrom:
+        #         secretKeyRef:
+        #           name: znyx-inference-secrets
+        #           key: ZNYX_INFERENCE_API_KEY
+        #     # One inference key serves the whole project; this names which environment this
+        #     # deployment is, so it picks up env-specific pins over the project-wide cascade.
+        #     - name: ZNYX_ENVIRONMENT_NAME
+        #       value: "prod"
+        #     - name: ZNYX_INFERENCE_ARTIFACTS_DIR
+        #       value: "/models"
+        #   volumeMounts:
+        #     - name: models
+        #       mountPath: /models
+        #   readinessProbe:
+        #     httpGet:
+        #       path: /healthz
+        #       port: 9000
+        #     initialDelaySeconds: 10
+        #     periodSeconds: 10
+        #   resources:
+        #     requests:
+        #       cpu: "500m"
+        #       memory: "2Gi"
+        #     limits:
+        #       cpu: "2"
+        #       memory: "4Gi"
+
+      # Uncomment alongside the inference container above. Pod-scoped on purpose: the sidecar
+      # re-provisions the weights whenever a pod is replaced, and an interrupted download
+      # leaves nothing behind to be mistaken for a complete artifact on the next start.
+      #
+      # sizeLimit keeps a multi-gigabyte download off the node's ephemeral storage budget —
+      # budget ~1GB per classifier/NER task and ~2.5GB for a guard LLM. Exceeding it evicts the
+      # pod, so raise it if you pin more than the defaults.
+      # volumes:
+      #   - name: models
+      #     emptyDir:
+      #       sizeLimit: 25Gi

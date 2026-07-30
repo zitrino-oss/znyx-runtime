@@ -1,15 +1,24 @@
-# Znyx runtime, rules-only. Boots with no external dependencies.
+# Znyx runtime + inference sidecar.
 #
 #   docker compose up
 #
-# The runtime enforces the deterministic rules path out of the box. To add
-# model-backed (ML) detection, start the inference sidecar too:
+# Rules-only, zero external dependencies, nothing to configure. The runtime enforces the
+# deterministic rules path out of the box.
 #
+# To add model-backed (ML) detection, connect the deployment to a control plane:
+#
+#   ZNYX_CONTROL_PLANE_URL=https://cp.znyx.ai
+#   ZNYX_INFERENCE_API_KEY=gr_...      # Console → project → Keys → Inference key
+#   ZNYX_ENVIRONMENT_NAME=prod         # optional; picks up env-specific model pins
 #   docker compose --profile ml up
 #
-# and set ZNYX_INFERENCE_URL on the runtime (see below). The sidecar serves ML
-# models; weights are NOT bundled, mount your fetched+pinned weights at ./models
-# (see packages/znyx-inference/MODELS.md).
+# The sidecar then pings the control plane for this project's model pins, downloads and
+# sha256-verifies the weights into the `inference-models` volume, and hot-loads them. Nothing
+# addresses the sidecar: the runtime reaches it at the fixed in-network name below. There is
+# no URL to configure here or in the console.
+#
+# Air-gapped / offline: skip the control plane entirely, mount pre-fetched weights at /models
+# and declare them with ZNYX_INFERENCE_TASKS (see packages/znyx-inference/MODELS.md).
 services:
   runtime:
     build:
@@ -29,36 +38,60 @@ services:
       # Optionally redirect heartbeats to a self-hosted receiver: ** ONLY FOR SELF HOST **
       # (default: https://cp.znyx.ai/v1/install-telemetry — see TELEMETRY.md):
       # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
-      # Enable ML by pointing at the inference sidecar (started with --profile ml):
+      #
+      # Fixed in-network address of the sidecar below — a deployment convention, not a
+      # product setting. The control plane neither stores nor ships it. Change this only if
+      # you rename the `inference` service; in Kubernetes run the sidecar in the same pod
+      # and leave it unset so the loopback default applies.
       ZNYX_INFERENCE_URL: "http://inference:9000"
+      # Managed mode (policy from the control plane) is separate from model provisioning and
+      # uses its own runtime token:
+      # ZNYX_MODE: managed
+      # ZNYX_CONTROL_PLANE_URL: "${ZNYX_CONTROL_PLANE_URL}"
+      # ZNYX_RUNTIME_TOKEN: "${ZNYX_RUNTIME_TOKEN}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 30s
       timeout: 5s
       retries: 3
 
-  # Optional ML sidecar. Only started with `--profile ml`. Serves model-backed
-  # detection; mount your fetched, sha256-pinned weights at ./models (read-only).
-  # Weights are never baked into the image. See packages/znyx-inference/MODELS.md.
+  # ML sidecar. Started with `--profile ml`. Self-provisioning: give it the control plane URL
+  # and the project's inference key and it installs the pinned models itself. Weights are
+  # never baked into the image — they land in the `inference-models` volume, sha256-verified
+  # against what the control plane expects. See packages/znyx-inference/MODELS.md.
   inference:
     profiles: ["ml"]
     build:
       context: ..
       dockerfile: Dockerfile.inference
     image: znyx/inference:latest
+    # Bound to loopback only, deliberately. The runtime reaches it over the compose network
+    # and does not need a published port; the binding exists so an operator can check
+    # `curl localhost:9000/v1/models`. The sidecar has NO authentication of its own and
+    # /v1/models/install triggers multi-gigabyte downloads, so never widen this to 0.0.0.0.
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
     volumes:
       - inference-models:/models
     environment:
       PORT: "9000"
       ZNYX_INFERENCE_ARTIFACTS_DIR: "/models"
-      ZNYX_INFERENCE_TASKS: >
-        {"prompt_injection":{"runner":"classifier","model_id":"protectai/deberta-v3-base-prompt-injection-v2","revision":"main","threshold":0.5},
-         "toxicity":{"runner":"classifier","model_id":"unitary/toxic-bert","revision":"main","threshold":0.5},
-         "language":{"runner":"language","model_id":"papluca/xlm-roberta-base-language-detection","revision":"main","threshold":0.5},
-         "nli":{"runner":"nli","model_id":"cross-encoder/nli-deberta-v3-large","revision":"main","threshold":0.5},
-         "pii_ner":{"runner":"ner","model_id":"Davlan/bert-base-multilingual-cased-ner-hrl","revision":"main","threshold":0.5}}
+      # The two settings that drive model provisioning. Unset → the sidecar starts and serves
+      # whatever is already in /models (or nothing), and the runtime falls back to rules.
+      ZNYX_CONTROL_PLANE_URL: "${ZNYX_CONTROL_PLANE_URL:-}"
+      ZNYX_INFERENCE_API_KEY: "${ZNYX_INFERENCE_API_KEY:-}"
+      # One inference key serves every environment in the project; this names which one this
+      # deployment is, so it picks up environment-specific pins instead of the project-wide
+      # cascade. Optional.
+      ZNYX_ENVIRONMENT_NAME: "${ZNYX_ENVIRONMENT_NAME:-}"
+      # Offline/air-gapped fallback: declare pre-mounted weights explicitly instead of
+      # provisioning them from the control plane. Ignored once pins arrive for a task.
+      # ZNYX_INFERENCE_TASKS: >
+      #   {"prompt_injection":{"runner":"classifier","model_id":"protectai/deberta-v3-base-prompt-injection-v2","revision":"main","threshold":0.5},
+      #    "toxicity":{"runner":"classifier","model_id":"unitary/toxic-bert","revision":"main","threshold":0.5},
+      #    "language":{"runner":"language","model_id":"papluca/xlm-roberta-base-language-detection","revision":"main","threshold":0.5},
+      #    "nli":{"runner":"nli","model_id":"cross-encoder/nli-deberta-v3-large","revision":"main","threshold":0.5},
+      #    "pii_ner":{"runner":"ner","model_id":"Davlan/bert-base-multilingual-cased-ner-hrl","revision":"main","threshold":0.5}}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"]
       interval: 30s
