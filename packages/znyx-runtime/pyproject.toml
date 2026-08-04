@@ -30,6 +30,11 @@ dependencies = [
   "pydantic-settings>=2.1.0",
   "python-multipart>=0.0.30",
   "python-dotenv>=1.0.0",
+  # Declared explicitly because this package imports httpx DIRECTLY in five modules
+  # (bundle_manager, telemetry, heartbeat, inference_sync, runtime_report). It previously
+  # resolved only because znyx-core happens to depend on it, so the install would have broken
+  # silently the day znyx-core dropped it.
+  "httpx>=0.26.0",
 ]
 
 [project.scripts]

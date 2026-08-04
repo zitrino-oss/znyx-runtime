@@ -49,7 +49,21 @@ def resolve_artifact_dir(spec: dict) -> str:
     if explicit:
         return explicit
     base = os.getenv("ZNYX_INFERENCE_ARTIFACTS_DIR") or str(Path.home() / ".znyx" / "models")
-    return str(Path(base) / safe)
+
+    # Containment check. Replacing "/" neutralises the common case but NOT a model_id of
+    # ".." (which resolves to the parent of the artifact root) or a backslash form on
+    # Windows. Normally unreachable, because resolve_fetch_target validates model_id against
+    # the vetted shortlist first — but that check is bypassable with
+    # ZNYX_INFERENCE_ALLOW_UNVETTED, so this is the backstop that keeps a hostile pin from
+    # writing weights outside the artifact directory. Deliberately a containment assertion
+    # rather than extra sanitising, so legitimate names keep resolving to the SAME directory
+    # and no already-cached model is orphaned.
+    base_path = Path(base).resolve()
+    candidate = (base_path / safe).resolve()
+    if candidate != base_path and base_path not in candidate.parents:
+        raise ValueError(
+            f"refusing model_id {model_id!r}: it resolves outside the artifact directory")
+    return str(base_path / safe)
 
 
 def verify_pinned(path: str, expected_sha256: str | None) -> None:

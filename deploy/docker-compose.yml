@@ -5,17 +5,19 @@
 # Rules-only, zero external dependencies, nothing to configure. The runtime enforces the
 # deterministic rules path out of the box.
 #
-# To add model-backed (ML) detection, connect the deployment to a control plane:
+# To add model-backed (ML) detection, connect the RUNTIME to a control plane:
 #
-#   ZNYX_CONTROL_PLANE_URL=https://cp.znyx.ai
-#   ZNYX_INFERENCE_API_KEY=gr_...      # Console → project → Keys → Inference key
-#   ZNYX_ENVIRONMENT_NAME=prod         # optional; picks up env-specific model pins
+#   ZNYX_MODE=managed
+#   ZNYX_CONTROL_PLANE_URL=https://your-control-plane.example.com
+#   ZNYX_RUNTIME_TOKEN=rt_...          # Console → project → Keys → Runtime token
 #   docker compose --profile ml up
 #
-# The sidecar then pings the control plane for this project's model pins, downloads and
-# sha256-verifies the weights into the `inference-models` volume, and hot-loads them. Nothing
-# addresses the sidecar: the runtime reaches it at the fixed in-network name below. There is
-# no URL to configure here or in the console.
+# Only the runtime talks to the control plane. It fetches the policy bundle, reads the model
+# pins the bundle declares, and hands them to the sidecar over the compose network; the
+# sidecar downloads and sha256-verifies the weights into the `inference-models` volume and
+# hot-loads them. The sidecar itself needs NO control-plane URL, NO API key and no outbound
+# internet access beyond fetching weights. Nothing addresses the sidecar either: the runtime
+# reaches it at the fixed in-network name below.
 #
 # Air-gapped / offline: skip the control plane entirely, mount pre-fetched weights at /models
 # and declare them with ZNYX_INFERENCE_TASKS (see packages/znyx-inference/MODELS.md).
@@ -33,11 +35,11 @@ services:
       # Secure-by-default. Set a key and require auth in any non-local deploy:
       # RUNTIME_REQUIRE_AUTH: "true"
       # RUNTIME_API_KEY: "<your-key>"
-      # Telemetry is OFF by default (see TELEMETRY.md). Opt in with:
+      # Telemetry is OFF by default for the runtime (see TELEMETRY.md). Opt in with:
       # ZNYX_TELEMETRY: "true"
-      # Optionally redirect heartbeats to a self-hosted receiver: ** ONLY FOR SELF HOST **
-      # (default: https://cp.znyx.ai/v1/install-telemetry — see TELEMETRY.md):
-      # ZNYX_HEARTBEAT_URL: "https://your-telemetry-host/v1/install-telemetry"
+      # Optionally redirect heartbeats to a receiver you operate (default:
+      # https://cp.znyx.ai/v1/install-telemetry), or set it to "" to remove the destination:
+      # ZNYX_TELEMETRY_URL: "https://your-telemetry-host/v1/install-telemetry"
       #
       # Fixed in-network address of the sidecar below — a deployment convention, not a
       # product setting. The control plane neither stores nor ships it. Change this only if
@@ -55,10 +57,11 @@ services:
       timeout: 5s
       retries: 3
 
-  # ML sidecar. Started with `--profile ml`. Self-provisioning: give it the control plane URL
-  # and the project's inference key and it installs the pinned models itself. Weights are
-  # never baked into the image — they land in the `inference-models` volume, sha256-verified
-  # against what the control plane expects. See packages/znyx-inference/MODELS.md.
+  # ML sidecar. Started with `--profile ml`. Provisioned BY THE RUNTIME: it needs no
+  # control-plane URL and no credential of its own. The runtime pushes the desired model
+  # pins to it every bundle cycle and it installs them. Weights are never baked into the
+  # image — they land in the `inference-models` volume, sha256-verified against what the
+  # control plane expects. See packages/znyx-inference/MODELS.md.
   inference:
     profiles: ["ml"]
     build:
@@ -76,14 +79,11 @@ services:
     environment:
       PORT: "9000"
       ZNYX_INFERENCE_ARTIFACTS_DIR: "/models"
-      # The two settings that drive model provisioning. Unset → the sidecar starts and serves
-      # whatever is already in /models (or nothing), and the runtime falls back to rules.
-      ZNYX_CONTROL_PLANE_URL: "${ZNYX_CONTROL_PLANE_URL:-}"
-      ZNYX_INFERENCE_API_KEY: "${ZNYX_INFERENCE_API_KEY:-}"
-      # One inference key serves every environment in the project; this names which one this
-      # deployment is, so it picks up environment-specific pins instead of the project-wide
-      # cascade. Optional.
-      ZNYX_ENVIRONMENT_NAME: "${ZNYX_ENVIRONMENT_NAME:-}"
+      # No control-plane settings here, deliberately. Model provisioning is driven by the
+      # runtime over the compose network (POST /v1/models/desired), so this service holds no
+      # credential and reads no policy. With no runtime attached it simply serves whatever is
+      # already in /models (or nothing), and the runtime falls back to rules.
+      #
       # Offline/air-gapped fallback: declare pre-mounted weights explicitly instead of
       # provisioning them from the control plane. Ignored once pins arrive for a task.
       # ZNYX_INFERENCE_TASKS: >
