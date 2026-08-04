@@ -129,7 +129,7 @@ Key environment variables:
 | `ALLOWED_ORIGINS` | (empty) | CORS allowlist, comma separated |
 | `ZNYX_INFERENCE_URL` | (unset) | Sidecar endpoint for ML detection |
 | `ZNYX_TELEMETRY` | `false` | Opt in to anonymous install heartbeats |
-| `ZNYX_HEARTBEAT_URL` | `https://cp.znyx.ai/v1/install-telemetry` | Override the heartbeat receiver (self-hosting) |
+| `ZNYX_TELEMETRY_URL` | `https://cp.znyx.ai/v1/install-telemetry` | Install-telemetry receiver. Only used when `ZNYX_TELEMETRY=true`; set to `""` to remove the destination |
 
 ## Telemetry
 

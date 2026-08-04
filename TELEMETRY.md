@@ -54,8 +54,12 @@ Heartbeats are POSTed to:
 
     https://cp.znyx.ai/v1/install-telemetry
 
-That is the only telemetry destination, and only when opted in — easy to
-verify on the wire by watching outbound traffic to `cp.znyx.ai`.
+That is the only telemetry destination, and **only when opted in** — the runtime
+heartbeat is off unless `ZNYX_TELEMETRY=true`, so an unconfigured install sends
+nothing. Easy to verify on the wire by watching outbound traffic to `cp.znyx.ai`.
+
+Setting `ZNYX_TELEMETRY_URL` to an empty string removes the destination entirely,
+so nothing is sent even if the flag is on.
 
 To send heartbeats to a self-hosted receiver instead, override the URL:
 

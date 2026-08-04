@@ -30,8 +30,12 @@ dependencies = [
   "fastapi>=0.109.0",
   "uvicorn[standard]>=0.27.0",
   "pydantic>=2.5.0",
-  "httpx>=0.26.0",
 ]
+# httpx is deliberately NOT a dependency. This service makes no outbound HTTP calls of its
+# own: desired state is pushed to it by the runtime, and weights are fetched through
+# huggingface_hub. Keeping an HTTP client out of the runtime dependency set matches the
+# posture (no control-plane credential, no egress) and keeps the image lean. Tests that drive
+# the app with fastapi's TestClient need httpx in the TEST environment only.
 
 [project.optional-dependencies]
 # --- [onnx] — the DEFAULT serving extra. CPU-only, torch-free. This is what the

@@ -7,7 +7,7 @@ In managed mode, polls the control plane for the latest bundle.
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from znyx_core.policy.bundle import (
     PolicyBundle, load_bundle_from_file, save_bundle_to_file,
@@ -30,6 +30,22 @@ class BundleManager:
         self._policy_resolver: Optional[PolicyResolver] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._etag: Optional[str] = None
+        # Called after EVERY poll, changed or not (see _poll_loop). Used to push model
+        # pins to the inference sidecar and to report state upstream.
+        self._on_cycle: List[Callable[[Optional[Dict[str, Any]]], Awaitable[None]]] = []
+        # The in-flight listener run, so a slow cycle skips the next tick instead of stacking.
+        self._cycle_task: Optional[asyncio.Task] = None
+
+    def add_cycle_listener(self, callback) -> None:
+        """Register an async callback invoked once per poll cycle with the active policy.
+
+        Deliberately fired on unchanged cycles too. That is what makes downstream
+        reconciliation self-healing: a sidecar whose model download failed, or which
+        restarted and lost its variants, is repopulated on the next tick without needing a
+        republish. Gating this on "bundle changed" is exactly the bug that left a failed
+        model install permanently unserved.
+        """
+        self._on_cycle.append(callback)
 
     @property
     def is_ready(self) -> bool:
@@ -67,14 +83,31 @@ class BundleManager:
             self._poll_task = asyncio.create_task(self._poll_loop())
         else:
             raise ValueError(f"Unknown mode: {self.config.mode}")
+        # Fire once on boot so downstream state converges immediately rather than after a
+        # full poll interval. Matters most in local/YAML mode, which has no poll loop at
+        # all and would otherwise never push pins to the sidecar.
+        #
+        # Spawned, not awaited: the sidecar may not be listening yet (containers start
+        # together) and a first-time model download takes minutes. Blocking here would hold
+        # the runtime out of service behind ML provisioning, which is exactly backwards —
+        # the deterministic rules path is ready and should start serving immediately.
+        self._spawn_cycle()
 
     async def stop(self) -> None:
-        """Stop background polling."""
+        """Stop background polling and any in-flight listener run."""
         if self._poll_task:
             self._poll_task.cancel()
             try:
                 await self._poll_task
             except asyncio.CancelledError:
+                pass
+        # The cycle listeners run detached (see _spawn_cycle), so without this an in-flight
+        # push would be left dangling at shutdown and asyncio would warn about a pending task.
+        if self._cycle_task is not None and not self._cycle_task.done():
+            self._cycle_task.cancel()
+            try:
+                await self._cycle_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutting down anyway
                 pass
 
     def get_policy(self, tenant_id: str = "default", app_id: str = "default",
@@ -243,6 +276,55 @@ class BundleManager:
                 await self._fetch_bundle()
             except Exception as e:
                 logger.warning(f"Bundle poll failed: {e}")
+            # Fire listeners even when the fetch failed or returned 304. They converge
+            # downstream state (sidecar models, reported status) and must keep running
+            # against the policy we already hold, otherwise a transient failure anywhere
+            # downstream would never be retried.
+            self._spawn_cycle()
+
+    def _spawn_cycle(self) -> None:
+        """Run the cycle listeners OFF the poll loop.
+
+        Deliberately not awaited by the caller. Listeners do network I/O to the inference
+        sidecar and the control plane, and the sidecar reconcile can legitimately block for
+        minutes behind a large model download. Awaiting it here would make a slow or
+        unreachable sidecar delay the next POLICY fetch, so a model download could hold up a
+        security policy update. Policy freshness must never depend on ML provisioning.
+
+        Guarded against pile-up: if the previous cycle is still in flight the tick is skipped
+        rather than queued, so a sidecar stuck for ten minutes leaves one pending task, not
+        twenty. The skipped work is not lost, because the next tick re-pushes the full desired
+        state anyway.
+        """
+        if self._cycle_task is not None and not self._cycle_task.done():
+            logger.debug("Bundle cycle listeners still running; skipping this tick")
+            return
+        self._cycle_task = asyncio.create_task(self._notify_cycle())
+
+    async def _notify_cycle(self) -> None:
+        policy = self._active_policy_for_listeners()
+        for callback in self._on_cycle:
+            try:
+                await callback(policy)
+            except Exception as e:  # noqa: BLE001 - a listener must never kill the poll loop
+                logger.debug("Bundle cycle listener failed: %s", e)
+
+    def _active_policy_for_listeners(self) -> Optional[Dict[str, Any]]:
+        """The policy dict listeners should act on, or None in YAML-resolver mode.
+
+        Bundle mode hands over the bundle's own policies, which is where the control plane
+        injects runtime_policy. YAML mode resolves the default scope so a self-hosted
+        operator who declared runtime_policy.inference in policies.yaml gets the same
+        behaviour with no control plane involved.
+        """
+        if self._bundle is not None:
+            return self._bundle.policies or {}
+        if self._policy_resolver is not None:
+            try:
+                return self.get_policy()
+            except Exception:  # noqa: BLE001 - resolution is best-effort here
+                return None
+        return None
 
     def _cache_path(self) -> str:
         # 0700: the cached bundle is trusted policy; don't let other local users

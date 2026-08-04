@@ -27,7 +27,11 @@ dependencies = [
   "pyyaml>=6.0",
   "rapidfuzz>=3.6.0",
   "httpx>=0.26.0",
-  "cryptography>=41.0.0",
+  # Floor deliberately well above 41.x: several advisories were fixed across the 41.0.6 /
+  # 42.0.x / 43.0.x line (NULL dereferences in PKCS#12 handling, plus OpenSSL updates bundled
+  # into the wheels). A permissive floor lets a downstream resolver legitimately install a
+  # version carrying those, which for a security product is the wrong default.
+  "cryptography>=44.0.1",
   "defusedxml>=0.7.1",
   "fastapi>=0.109.0",
 ]

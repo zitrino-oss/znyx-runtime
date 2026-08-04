@@ -1,12 +1,20 @@
 """ZNYX Inference Service — optional sidecar FastAPI app.
 
 Endpoints:
-  POST /v1/infer/{task}  → the confidence contract (cached + batched)
-  GET  /healthz          → liveness
-  GET  /v1/models        → registered models + availability (feeds the model registry)
-  GET  /v1/stats         → cache + batcher metrics (observability for cache-hit/batching)
+  POST /v1/infer/{task}    → the confidence contract (cached + batched)
+  GET  /healthz            → liveness
+  GET  /v1/models          → registered models + availability (feeds the model registry)
+  GET  /v1/stats           → cache + batcher metrics (observability for cache-hit/batching)
+  POST /v1/models/desired  → reconcile loaded models against a desired pin set
+  POST /v1/models/install  → operator-triggered download (active slot)
+  POST /v1/models/reload   → operator-triggered hot-reload (active slot)
 
 Boots on the dependency-free StubRunner with no ML stack installed.
+
+This service NEVER calls the control plane. The runtime owns that channel and pushes
+desired model pins here via POST /v1/models/desired on each of its bundle cycles; see
+``reconciler.py`` for why desired state flows in that direction. Consequently the sidecar
+needs no API key and no outbound internet access beyond fetching model weights.
 """
 from __future__ import annotations
 
@@ -47,18 +55,16 @@ async def lifespan(app: FastAPI):
     app.state.registry = registry
     app.state.cache = ContentHashCache(maxsize=config.cache_maxsize)
     app.state.install_manager = InstallManager()
-    # Pull-based desired state: when the control-plane channel is configured, poll the
-    # bundle for this deployment's model pins, self-install, and heartbeat what's loaded.
-    from znyx_inference.pin_sync import PinSyncConfig, PinSyncService
-    pin_sync = PinSyncService(registry, PinSyncConfig.from_env())
-    app.state.pin_sync = pin_sync
-    await pin_sync.start()
+    # Desired state is PUSHED here by the runtime (POST /v1/models/desired), not polled.
+    # Nothing to start or stop: the reconciler holds only the last pin set, so it needs no
+    # background task and no credential.
+    from znyx_inference.reconciler import ModelReconciler
+    app.state.reconciler = ModelReconciler(registry)
     available = [m.task for m in registry.list_models() if m.available]
     logger.info("ZNYX Inference ready — available tasks: %s", available)
     try:
         yield
     finally:
-        await pin_sync.stop()
         await registry.stop_all()
 
 
@@ -173,7 +179,8 @@ async def infer(task: str, req: InferRequest, request: Request):
 # Model install + reload (operator-triggered via the console UI)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Any, Dict
 from fastapi.responses import JSONResponse
 
 
@@ -217,3 +224,46 @@ async def reload_model(req: ReloadRequest, request: Request):
     registry: RunnerRegistry = request.app.state.registry
     info = await registry.reload_task(req.task, req.spec)
     return info.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Desired-state reconcile (pushed by the runtime on every bundle cycle)
+# ---------------------------------------------------------------------------
+
+# There are 7 inference tasks in the catalog. A desired set can only ever name a task the
+# catalog knows, so anything beyond a small multiple of that is a malformed or hostile payload
+# rather than a real configuration. Bounded so a junk body cannot make the reconciler churn
+# through thousands of failed shortlist lookups, each with its own log line.
+_MAX_DESIRED_PINS = 64
+
+
+class DesiredModelsRequest(BaseModel):
+    # {task: {model_id, revision, threshold, runner, sha256}} — the full desired set for
+    # this deployment. It must be complete rather than a delta: a task absent from the map
+    # is what tells the reconciler that its pin was removed and the variant can be evicted.
+    pins: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/v1/models/desired")
+async def set_desired_models(req: DesiredModelsRequest, request: Request):
+    """Converge the loaded models onto ``pins`` and report what is now loaded.
+
+    Called by the runtime, not by the control plane, which cannot reach this process. The
+    runtime re-pushes the same set every cycle, so this is idempotent and cheap when
+    nothing has changed, and a pin whose download failed last time is retried here.
+
+    Auth matches the sibling install/reload endpoints: none, by deployment contract. This
+    service is a same-pod or same-network component and MUST NOT be published beyond its own
+    deployment: the endpoints here can evict a loaded model (degrading a detector to its
+    deterministic fallback) and can trigger multi-gigabyte downloads. The shipped compose binds
+    it to loopback for exactly that reason. If you run the sidecar as its own Service, restrict
+    it with a NetworkPolicy.
+    """
+    reconciler = getattr(request.app.state, "reconciler", None)
+    if reconciler is None:      # pragma: no cover - lifespan always sets this
+        raise HTTPException(status_code=503, detail="reconciler unavailable")
+    if len(req.pins) > _MAX_DESIRED_PINS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"too many pins: {len(req.pins)} (max {_MAX_DESIRED_PINS})")
+    return await reconciler.reconcile(req.pins)

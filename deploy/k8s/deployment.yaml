@@ -80,28 +80,22 @@ spec:
               memory: "512Mi"
 
         # ── Optional ML sidecar ──────────────────────────────────────────────────────────
-        # Self-provisioning: on startup it pings the control plane for this project's model
-        # pins, downloads and sha256-verifies the weights into /models, and hot-loads them.
-        # Until a model is loaded, ML tasks return 503 and the runtime falls back to
-        # deterministic rules — an unreachable control plane is never an outage.
+        # Provisioned BY THE RUNTIME container above, over pod-local loopback. The runtime
+        # fetches the policy bundle, reads the model pins it declares, and pushes them here
+        # every cycle; this container then downloads and sha256-verifies the weights into
+        # /models and hot-loads them. Until a model is loaded, ML tasks return 503 and the
+        # runtime falls back to deterministic rules — an unreachable control plane is never
+        # an outage.
+        #
+        # Note what is NOT here: no ZNYX_CONTROL_PLANE_URL, no API key, no secretKeyRef.
+        # This container never calls the control plane, so it needs no credential and can be
+        # denied egress entirely apart from fetching model weights.
         #
         # - name: inference
         #   image: znyx/inference:latest
         #   ports:
         #     - containerPort: 9000
         #   env:
-        #     # The two settings that drive model provisioning.
-        #     - name: ZNYX_CONTROL_PLANE_URL
-        #       value: "https://cp.znyx.ai"
-        #     - name: ZNYX_INFERENCE_API_KEY
-        #       valueFrom:
-        #         secretKeyRef:
-        #           name: znyx-inference-secrets
-        #           key: ZNYX_INFERENCE_API_KEY
-        #     # One inference key serves the whole project; this names which environment this
-        #     # deployment is, so it picks up env-specific pins over the project-wide cascade.
-        #     - name: ZNYX_ENVIRONMENT_NAME
-        #       value: "prod"
         #     - name: ZNYX_INFERENCE_ARTIFACTS_DIR
         #       value: "/models"
         #   volumeMounts:

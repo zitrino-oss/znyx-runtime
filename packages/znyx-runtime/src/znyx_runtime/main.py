@@ -88,6 +88,35 @@ async def lifespan(app: FastAPI):
 
     # Initialize bundle manager
     bundle_manager = BundleManager(config)
+
+    # Desired-state fan-out. The runtime is the only component that talks to the control
+    # plane, so on every bundle cycle it (a) hands the sidecar the model pins the bundle
+    # declares and (b) reports the active bundle plus what the sidecar loaded. Registered
+    # BEFORE start() so the boot cycle already carries them.
+    from znyx_runtime.inference_sync import InferenceSync
+    from znyx_runtime.runtime_report import RuntimeReporter
+
+    inference_sync = InferenceSync()
+    runtime_reporter = RuntimeReporter(
+        control_plane_url=config.control_plane_url,
+        runtime_token=config.runtime_token,
+        mode=config.mode,
+    )
+
+    async def _on_bundle_cycle(policy) -> None:
+        # Order matters: push first so the report carries the sidecar's state as of this
+        # cycle rather than the previous one.
+        await inference_sync.push(policy)
+        await runtime_reporter.report(
+            bundle_manager.bundle_info,
+            sidecar_models=inference_sync.reported_models,
+            sidecar_version=inference_sync.sidecar_version,
+        )
+
+    bundle_manager.add_cycle_listener(_on_bundle_cycle)
+    app.state.inference_sync = inference_sync
+    app.state.runtime_reporter = runtime_reporter
+
     await bundle_manager.start()
     logger.info(f"Runtime mode: {config.mode}")
 

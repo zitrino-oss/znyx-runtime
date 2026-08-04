@@ -7,8 +7,11 @@ Sends a daily anonymous ping with non-sensitive metadata:
 - detector count, total evaluation count, run_count
 
 No PII, no request content, no tenant data.
-Opt-in: off by default; the runtime sends nothing unless ZNYX_TELEMETRY=true.
-ZNYX_HEARTBEAT_URL overrides the destination, e.g. for a self-hosted receiver.
+
+Opt-in for the runtime: nothing is sent unless ZNYX_TELEMETRY=true. The destination
+defaults to the ZNYX receiver and is overridable with ZNYX_TELEMETRY_URL (set it to a
+receiver you operate, or to an empty string to remove the destination altogether).
+Note the SDKs use the opposite enable-default (opt-out) - see TELEMETRY.md.
 See TELEMETRY.md at the repo root for the exact payload and endpoint.
 """
 import asyncio
@@ -22,13 +25,30 @@ from znyx_runtime.install_state import get_install_id
 
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_ENDPOINT = os.getenv(
-    # Destination only — this does not enable anything. Sending is gated on
-    # ZNYX_TELEMETRY (off by default). Set ZNYX_HEARTBEAT_URL to redirect
-    # heartbeats to a self-hosted receiver.
-    "ZNYX_HEARTBEAT_URL",
-    "https://cp.znyx.ai/v1/install-telemetry",
-)
+DEFAULT_HEARTBEAT_ENDPOINT = "https://cp.znyx.ai/v1/install-telemetry"
+
+
+def heartbeat_endpoint() -> str:
+    """Where install pings go.
+
+    Defaults to the ZNYX receiver. This is a DESTINATION only and does not enable
+    anything: sending is gated on ZNYX_TELEMETRY, which is off by default for the
+    runtime (see RuntimeConfig.heartbeat_enabled), so an unconfigured install stays
+    silent. Point ZNYX_TELEMETRY_URL at your own receiver to self-host it, or set it
+    to an empty string to remove the destination entirely.
+
+    Read at call time rather than at import so a test or an embedding app can change
+    it after import.
+    """
+    for name in ("ZNYX_TELEMETRY_URL", "ZNYX_HEARTBEAT_URL"):
+        value = os.getenv(name)
+        if value is not None:
+            # An explicitly empty value is an intentional opt-out of the destination,
+            # not "fall through to the default".
+            return value.strip()
+    return DEFAULT_HEARTBEAT_ENDPOINT
+
+
 HEARTBEAT_INTERVAL = 86400  # 24 hours
 VERSION = "1.0.0"
 
@@ -102,6 +122,13 @@ class Heartbeat:
 
     async def _send_ping(self, event_type: str = "heartbeat", run_count: int = 0) -> None:
         """Send a single heartbeat ping. Fire-and-forget."""
+        endpoint = heartbeat_endpoint()
+        if not endpoint:
+            # No destination configured. Nothing to do -- see the module docstring:
+            # this package deliberately has no built-in receiver, so an unconfigured
+            # install is silent rather than phoning somewhere by default.
+            logger.debug("Heartbeat skipped: no ZNYX_TELEMETRY_URL configured")
+            return
         try:
             import httpx
             from znyx_runtime.install_state import get_run_count
@@ -116,7 +143,7 @@ class Heartbeat:
 
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(
-                    HEARTBEAT_ENDPOINT,
+                    endpoint,
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
