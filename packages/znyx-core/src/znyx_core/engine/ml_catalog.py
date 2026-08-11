@@ -69,8 +69,8 @@ ML_TASKS: Dict[str, MLTaskSpec] = {
                "allowed_languages / blocked_languages (from the runner spec) to an "
                "allow/block decision — fixes the generic-classifier-scores-0 gap."),
     "nli": MLTaskSpec(
-        "nli", "nli", "cross-encoder/nli-deberta-v3-base", "main", 0.5,
-        ("en",), "apache-2.0", "cpu-ok; ~440MB"),
+        "nli", "nli", "cross-encoder/nli-deberta-v3-large", "main", 0.5,
+        ("en",), "apache-2.0", "gpu-recommended; ~870MB"),
     "safety": MLTaskSpec(
         "safety", "guard_llm", "meta-llama/Llama-Guard-3-1B", "main", 0.5,
         ("en",), "llama3.2-community", "gpu-recommended; ~2.5GB"),
@@ -150,7 +150,7 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
     "nli": [
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-large", "primary", "apache-2.0", True, "yes", "DeBERTa-v3-large", "strong NLI", "GPU pref / CPU-ok"),
         CandidateModel("nli", "nli", "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli", "alternative", "mit", True, "yes", "DeBERTa-v3-large", "adversarial-robust (ANLI)", "GPU pref"),
-        CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter", "CPU-ok"),
+        CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter, CPU-friendly fallback", "CPU-ok"),
         CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),
     ],
     "pii_ner": [

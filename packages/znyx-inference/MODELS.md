@@ -29,7 +29,7 @@ Export runs **offline** (the heavy `[export]` extra: torch + optimum); serving i
 | prompt_injection | protectai/deberta-v3-base-prompt-injection-v2 | Apache-2.0 | ✅ yes | OSI-open |
 | toxicity | unitary/toxic-bert | Apache-2.0 | ✅ yes | OSI-open |
 | language | papluca/xlm-roberta-base-language-detection | MIT | ✅ yes | OSI-open |
-| nli | cross-encoder/nli-deberta-v3-base | Apache-2.0 | ✅ yes | OSI-open |
+| nli | cross-encoder/nli-deberta-v3-large | Apache-2.0 | ✅ yes | OSI-open |
 | topic_intent | sentence-transformers/all-MiniLM-L6-v2 | Apache-2.0 | ✅ yes | OSI-open |
 | pii_ner | Davlan/bert-base-multilingual-cased-ner-hrl | Apache-2.0 | ✅ yes | OSI-open; 10 languages, PER/ORG/LOC |
 | **safety** | **meta-llama/Llama-Guard-3-1B** | **Llama 3.2 Community** | ⚠️ conditional | **Special license - see flags below** |
