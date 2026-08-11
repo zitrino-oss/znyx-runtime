@@ -6,3 +6,16 @@
 # patched vendored versions.
 CVE-2026-23949
 CVE-2026-24049
+
+# msgpack and setuptools both come from pip's own internal build-provenance
+# SBOM (usr/local/lib/python3.14/site-packages/pip/_vendor/bom.cdx.json),
+# which Trivy ingests directly (see its own "Third-party SBOM may lead to
+# inaccurate vulnerability detection" warning). That SBOM documents pip's
+# vendored msgpack (used internally by pip's HTTP cache) and a historical
+# setuptools version from pip's own build — neither is the setuptools our
+# Dockerfile actually installs, and neither is imported by our code.
+# Confirmed the current latest pip release (26.2.1) still ships this SBOM
+# verbatim, so there is no newer pip to upgrade to. Revisit once upstream pip
+# publishes an updated bom.cdx.json.
+GHSA-6v7p-g79w-8964
+CVE-2025-47273

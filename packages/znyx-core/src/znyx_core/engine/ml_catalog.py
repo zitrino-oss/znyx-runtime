@@ -69,19 +69,28 @@ ML_TASKS: Dict[str, MLTaskSpec] = {
                "allowed_languages / blocked_languages (from the runner spec) to an "
                "allow/block decision — fixes the generic-classifier-scores-0 gap."),
     "nli": MLTaskSpec(
-        "nli", "nli", "cross-encoder/nli-deberta-v3-base", "main", 0.5,
-        ("en",), "apache-2.0", "cpu-ok; ~440MB"),
+        "nli", "nli", "cross-encoder/nli-deberta-v3-large", "main", 0.5,
+        ("en",), "apache-2.0", "gpu-recommended; ~870MB"),
     "safety": MLTaskSpec(
         "safety", "guard_llm", "meta-llama/Llama-Guard-3-1B", "main", 0.5,
         ("en",), "llama3.2-community", "gpu-recommended; ~2.5GB"),
     "topic_intent": MLTaskSpec(
         "topic_intent", "embedding", "sentence-transformers/all-MiniLM-L6-v2", "main", 0.5,
         ("en",), "apache-2.0", "cpu-ok; ~90MB"),
+    # Default is the model that actually serves on the NER runner today. The previous pin
+    # (iiiorg/piiranha-v1-detect-personal-information) is PII-specific but is not verified
+    # through the AutoTokenizer NER path, so a pii_ner task pinned to it reports
+    # unavailable; the Davlan multilingual NER checkpoint loads and serves. Keep this in
+    # sync with the CANDIDATE_MODELS "primary" row for pii_ner — the console's
+    # Servable-tasks "Catalog default" column reads this spec.
     "pii_ner": MLTaskSpec(
-        "pii_ner", "ner", "iiiorg/piiranha-v1-detect-personal-information", "main", 0.5,
-        ("en",), "mit", "cpu-ok; ~700MB",
+        "pii_ner", "ner", "Davlan/bert-base-multilingual-cased-ner-hrl", "main", 0.5,
+        ("ar", "de", "en", "es", "fr", "it", "lv", "nl", "pt", "zh"),
+        "apache-2.0", "cpu-ok; ~700MB",
         detail="NerRunner does token-level classification to catch UNSTRUCTURED PII "
-               "(names/addresses) the deterministic regex/checksum PII detector misses."),
+               "(names/orgs/locations) the deterministic regex/checksum PII detector "
+               "misses. Structured PII (cards, SSNs, emails) stays with the deterministic "
+               "layer — the ML layer here is additive, not a replacement."),
 }
 
 
@@ -117,7 +126,14 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
     "toxicity": [
         CandidateModel("toxicity", "classifier", "unitary/toxic-bert", "primary", "apache-2.0", True, "yes", "110M", "Jigsaw Toxic Comment dataset (EN)", "CPU ~440MB"),
         CandidateModel("toxicity", "classifier", "textdetox/xlmr-large-toxicity-classifier-v2", "alternative", "openrail++", True, "yes", "0.6B", "F1 0.56–0.97 across 15 langs", "GPU pref / CPU-ok"),
-        CandidateModel("toxicity", "classifier", "unitary/multilingual-toxic-xlm-roberta", "alternative", "apache-2.0", True, "yes", "XLM-R-base", "Jigsaw-trained, 7 langs", "CPU-ok"),
+        # CandidateModel("toxicity", "classifier", "unitary/multilingual-toxic-xlm-roberta", "alternative", "apache-2.0", True, "yes", "XLM-R-base", "Jigsaw-trained, 7 langs", "CPU-ok"),  # no tokenizer.json on the Hub — install fails, see below
+        # ^ Ships only sentencepiece.bpe.model, no prebuilt tokenizer.json, so _export_onnx's
+        # AutoTokenizer call has to BUILD the fast tokenizer from the SPM model — which needs
+        # the sentencepiece + protobuf packages the [export] extra does not carry. The install
+        # job therefore fails for this row alone. Every other multilingual toxicity row above
+        # ships tokenizer.json (textdetox/xlmr-large-toxicity-classifier-v2 is also XLM-R and
+        # installs fine), so nothing here is lost by dropping it. Re-enable only together with
+        # sentencepiece + protobuf in the [export] extra of znyx-inference/pyproject.toml.
         CandidateModel("toxicity", "classifier", "textdetox/bert-multilingual-toxicity-classifier", "alternative", "openrail++", True, "yes", "BERT-base", "multilingual", "CPU-ok"),
         CandidateModel("toxicity", "classifier", "gravitee-io/distilbert-multilingual-toxicity-classifier", "alternative", "openrail++", True, "yes", "DistilBERT", "fastest", "CPU fast"),
     ],
@@ -134,7 +150,7 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
     "nli": [
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-large", "primary", "apache-2.0", True, "yes", "DeBERTa-v3-large", "strong NLI", "GPU pref / CPU-ok"),
         CandidateModel("nli", "nli", "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli", "alternative", "mit", True, "yes", "DeBERTa-v3-large", "adversarial-robust (ANLI)", "GPU pref"),
-        CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter", "CPU-ok"),
+        CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter, CPU-friendly fallback", "CPU-ok"),
         CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),
     ],
     "pii_ner": [
