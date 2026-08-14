@@ -134,10 +134,6 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
     "nli": [
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-large", "primary", "apache-2.0", True, "yes", "DeBERTa-v3-large", "strong NLI", "GPU pref / CPU-ok"),
         CandidateModel("nli", "nli", "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli", "alternative", "mit", True, "yes", "DeBERTa-v3-large", "adversarial-robust (ANLI)", "GPU pref"),
-<<<<<<< Updated upstream
-        CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter", "CPU-ok"),
-        CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),
-=======
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter, CPU-friendly fallback", "CPU-ok"),
         # CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),  # custom architecture — needs trust_remote_code, see below
         # ^ HHEMv2ForSequenceClassification, declared through an auto_map pointing at
@@ -149,7 +145,6 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
         # skipped the load AND evicted whatever the task was already serving, so nli went from a
         # working DeBERTa to no model at all. Do not re-enable by turning on trust_remote_code;
         # it would need a separate loader with its own review.
->>>>>>> Stashed changes
     ],
     "pii_ner": [
         # CandidateModel("pii_ner", "ner", "urchade/gliner_multi_pii-v1", "primary", "apache-2.0", True, "yes", "GLiNER", "multilingual PII NER", "CPU-ok"),  # GLiNER format incompatible with ONNX export
