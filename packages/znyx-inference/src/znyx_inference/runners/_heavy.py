@@ -176,3 +176,17 @@ class OnnxTextRunner(HeavyRunner):
         x = x - x.max(axis=axis, keepdims=True)
         e = np.exp(x)
         return e / e.sum(axis=axis, keepdims=True)
+
+    def _sigmoid(self, x):
+        """Per-logit activation for MULTI-LABEL heads, where every label is an independent
+        yes/no and the scores must NOT be normalised to sum to 1.
+
+        Applying ``_softmax`` to such a head discards absolute magnitude and reports each
+        label's *share of a forced total* rather than its probability — so an
+        all-labels-near-zero (benign) prediction comes back as a high score for whichever
+        label happened to be largest. Pick the activation from the head type, not by default.
+        """
+        np = self._np
+        # Evaluate via exp(-|x|) on both branches so exp() can't overflow on large |x|.
+        ex = np.exp(-np.abs(x))
+        return np.where(x >= 0, 1.0 / (1.0 + ex), ex / (1.0 + ex))

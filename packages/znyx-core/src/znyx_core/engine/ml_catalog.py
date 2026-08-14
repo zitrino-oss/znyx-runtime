@@ -151,7 +151,16 @@ CANDIDATE_MODELS: Dict[str, List[CandidateModel]] = {
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-large", "primary", "apache-2.0", True, "yes", "DeBERTa-v3-large", "strong NLI", "GPU pref / CPU-ok"),
         CandidateModel("nli", "nli", "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli", "alternative", "mit", True, "yes", "DeBERTa-v3-large", "adversarial-robust (ANLI)", "GPU pref"),
         CandidateModel("nli", "nli", "cross-encoder/nli-deberta-v3-base", "alternative", "apache-2.0", True, "yes", "DeBERTa-v3-base", "lighter, CPU-friendly fallback", "CPU-ok"),
-        CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),
+        # CandidateModel("nli", "nli", "vectara/hallucination_evaluation_model", "alternative", "apache-2.0", True, "yes", "purpose-built", "hallucination-specific", "CPU-ok"),  # custom architecture — needs trust_remote_code, see below
+        # ^ HHEMv2ForSequenceClassification, declared through an auto_map pointing at
+        # configuration_hhem_v2.py / modeling_hhem_v2.py INSIDE the repo. Loading it therefore
+        # executes Hub-hosted Python, which _export_onnx will not do (no trust_remote_code) and
+        # should not: this package treats a checkpoint as a supply-chain artifact that an
+        # operator pins by digest, and running arbitrary code fetched alongside the weights
+        # gives that guarantee away. Leaving the row listed was worse than useless — pinning it
+        # skipped the load AND evicted whatever the task was already serving, so nli went from a
+        # working DeBERTa to no model at all. Do not re-enable by turning on trust_remote_code;
+        # it would need a separate loader with its own review.
     ],
     "pii_ner": [
         # CandidateModel("pii_ner", "ner", "urchade/gliner_multi_pii-v1", "primary", "apache-2.0", True, "yes", "GLiNER", "multilingual PII NER", "CPU-ok"),  # GLiNER format incompatible with ONNX export
