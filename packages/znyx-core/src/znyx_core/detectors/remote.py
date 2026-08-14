@@ -10,6 +10,7 @@ detector that supports:
 """
 import asyncio
 import logging
+import re
 import time
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -20,6 +21,21 @@ from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.net_guard import resolve_egress_target, UnsafeEgressURL
 
 logger = logging.getLogger(__name__)
+
+
+def _slug(value: Any) -> str:
+    """Lowercase, non-alphanumerics collapsed to ``_`` — safe as a rule_id segment."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def _severity_for(risk_score: int) -> Severity:
+    """Mirror the LOW/MEDIUM/HIGH risk bands the deterministic detectors use, so an
+    ML-layer hit sorts alongside them instead of always reporting MEDIUM."""
+    if risk_score >= 80:
+        return Severity.HIGH
+    if risk_score >= 40:
+        return Severity.MEDIUM
+    return Severity.LOW
 
 
 class CircuitState(str, Enum):
@@ -270,27 +286,57 @@ class RemoteDetector:
             risk_score = int(score) if score is not None else 0
         except (TypeError, ValueError):
             risk_score = 0
+        risk_score = min(100, max(0, risk_score))
+
+        label_scores = self._coerce_label_scores(
+            self._get_nested(data, self.output_label_scores_field))
+
+        # A non-ALLOW decision ALWAYS yields a rule hit. This previously also required a
+        # non-empty ``message``, so a sidecar response without that field would BLOCK the
+        # request while contributing nothing to ``rule_hit_ids`` — leaving the audit trail
+        # to attribute the block to whichever deterministic detector happened to hit.
         rule_hits = []
-        if decision != Decision.ALLOW and message:
+        if decision != Decision.ALLOW:
+            top_label = self._top_label(label_scores)
             rule_hits.append(RuleHit(
-                rule_id="remote_detector",
-                severity=Severity.MEDIUM,
-                message=str(message),
+                rule_id=self._rule_id(_slug(top_label) if top_label else "detected"),
+                severity=_severity_for(risk_score),
+                message=str(message) if message else (
+                    f"{self.task or 'remote'} model returned "
+                    f"{decision.value} (risk={risk_score})"
+                ),
             ))
 
         return DetectorResult(
             decision=decision,
-            risk_score=min(100, max(0, risk_score)),
+            risk_score=risk_score,
             rule_hits=rule_hits,
             developer_message=str(message) if message else None,
             # confidence contract (all optional; absent fields stay None).
             confidence=self._coerce_float(self._get_nested(data, self.output_confidence_field)),
             calibrated_score=self._coerce_float(self._get_nested(data, self.output_calibrated_field)),
-            label_scores=self._coerce_label_scores(self._get_nested(data, self.output_label_scores_field)),
+            label_scores=label_scores,
             model_version=(
                 str(mv) if (mv := self._get_nested(data, self.output_model_version_field)) is not None else None
             ),
         )
+
+    def _rule_id(self, suffix: str) -> str:
+        """Task-scoped rule id, so an ML-layer hit is attributable in the audit trail.
+
+        ``prompt_injection.injection`` / ``toxicity.toxic`` group cleanly in analytics and
+        tell an operator which model fired. Falls back to the old generic ``remote_detector``
+        prefix only when no task is configured (a bare custom webhook backend).
+        """
+        return f"{_slug(self.task) if self.task else 'remote_detector'}.{suffix}"
+
+    @staticmethod
+    def _top_label(label_scores: Optional[Dict[str, float]]) -> Optional[str]:
+        """Highest-scoring label, used to name the rule hit. None when the backend
+        reported no label_scores (the minimal 3-field contract)."""
+        if not label_scores:
+            return None
+        return max(label_scores.items(), key=lambda kv: kv[1])[0]
 
     @staticmethod
     def _coerce_float(value: Any) -> Optional[float]:
@@ -328,7 +374,7 @@ class RemoteDetector:
         return DetectorResult(
             decision=Decision.BLOCK, risk_score=100,
             rule_hits=[RuleHit(
-                rule_id="remote_detector",
+                rule_id=self._rule_id("unavailable"),
                 severity=Severity.HIGH,
                 message=f"Remote detector unavailable (fail-closed): {error}",
             )],
