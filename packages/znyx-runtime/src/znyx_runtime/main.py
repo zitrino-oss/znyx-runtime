@@ -168,6 +168,21 @@ async def lifespan(app: FastAPI):
     )
     app.state.runtime_judge = runtime_judge
 
+    # Control-plane-queued benchmarks. Only this runtime can reach its own inference
+    # sidecar, so a model-backed benchmark is evaluated here rather than in the control
+    # plane (which must never dial a tenant-supplied URL and has no route into a customer
+    # network). Given its own task deliberately, NOT a bundle-cycle listener: a
+    # multi-minute run parked there would starve model-pin pushes and heartbeats, because
+    # _spawn_cycle skips a tick while the previous one is still in flight.
+    from znyx_runtime.benchmark_worker import BenchmarkWorker
+    benchmark_worker = BenchmarkWorker(
+        control_plane_url=config.control_plane_url,
+        runtime_token=config.runtime_token,
+        evaluator=evaluator,
+    )
+    await benchmark_worker.start()
+    app.state.benchmark_worker = benchmark_worker
+
     # Record this startup in shared install state (increments run_count).
     state = record_run(mode=config.mode)
     run_count = state["run_count"]
@@ -193,6 +208,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    await benchmark_worker.stop()
     await heartbeat.stop()
     await telemetry.stop()
     await bundle_manager.stop()
