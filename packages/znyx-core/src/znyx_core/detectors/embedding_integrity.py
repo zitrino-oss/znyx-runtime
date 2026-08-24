@@ -1,4 +1,4 @@
-"""Embedding-integrity detector (OWASP LLM08 — Vector and Embedding Weaknesses).
+"""Embedding-integrity detector (OWASP LLM09 — Vector and Embedding Weaknesses).
 
 Runs in the ``retrieval`` stage on retrieved RAG chunks and flags signals that a
 vector store has been poisoned or manipulated at the EMBEDDING layer — distinct
@@ -33,7 +33,7 @@ _WORD_RE = re.compile(r"\b\w{3,}\b", re.UNICODE)
 
 
 class EmbeddingIntegrityDetector:
-    """Flags vector-store/embedding-layer manipulation in retrieved chunks (LLM08)."""
+    """Flags vector-store/embedding-layer manipulation in retrieved chunks (LLM09)."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config or {}

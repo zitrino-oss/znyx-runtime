@@ -323,7 +323,20 @@ class GuardrailsEvaluator:
                 "max_iterations": scoped.max_iterations,
             }
         elif isinstance(scoped, RetrievalEvaluationRequest):
-            metadata["retrieval_chunks"] = [c.model_dump() for c in scoped.chunks]
+            chunks = [c.model_dump() for c in scoped.chunks]
+            # The retrieval-stage detectors (tenant_scope_assertion, retrieval_jamming)
+            # read a `retrieval` BLOCK, which is also the shape a caller passing raw
+            # metadata uses. Emitting only the flat `retrieval_chunks` key left the typed
+            # API unable to reach them at all: chunk tenancy and scores were carried in
+            # the request and then dropped on the floor. Both keys are written so the
+            # block is canonical while anything reading the flat key keeps working.
+            existing = metadata.get("retrieval")
+            block = dict(existing) if isinstance(existing, dict) else {}
+            block["chunks"] = chunks
+            if scoped.scope_enforced_in_query is not None:
+                block["scope_enforced_in_query"] = scoped.scope_enforced_in_query
+            metadata["retrieval"] = block
+            metadata["retrieval_chunks"] = chunks
         elif isinstance(scoped, AgentPlanEvaluationRequest):
             metadata["agent_plan"] = scoped.plan
         elif isinstance(scoped, MemoryWriteEvaluationRequest) and scoped.memory_key is not None:

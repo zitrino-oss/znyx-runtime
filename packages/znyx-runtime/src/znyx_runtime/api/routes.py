@@ -104,7 +104,25 @@ get_evaluator = _get_evaluator
 get_heartbeat = _get_heartbeat
 
 
-@router.post("/v1/evaluate/input", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+# OpenAPI metadata (tags / operation_id / summary) on the evaluate routes.
+#
+# These are the runtime's public contract, so a self-hosted deployment's own
+# /openapi.json should describe them properly rather than emitting anonymous
+# "evaluate_input__post" operation ids under no tag. Generated clients and doc
+# tooling both key off these.
+#
+# The values intentionally mirror the ones the ZNYX control plane uses for the
+# same paths, so tooling that has seen either spec resolves the same operation.
+
+
+@router.post(
+    "/v1/evaluate/input",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateInput",
+    summary="Evaluate user input before calling the LLM",
+)
 async def evaluate_input(request: EvaluationRequest) -> EvaluationResponse:
     """Evaluate input text before sending to LLM."""
     try:
@@ -132,7 +150,14 @@ async def evaluate_input(request: EvaluationRequest) -> EvaluationResponse:
         raise HTTPException(status_code=500, detail="Evaluation failed")
 
 
-@router.post("/v1/evaluate/output", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+@router.post(
+    "/v1/evaluate/output",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateOutput",
+    summary="Evaluate an LLM response before returning it to the user",
+)
 async def evaluate_output(request: EvaluationRequest) -> EvaluationResponse:
     """Evaluate output text from LLM before returning to user."""
     try:
@@ -160,7 +185,14 @@ async def evaluate_output(request: EvaluationRequest) -> EvaluationResponse:
         raise HTTPException(status_code=500, detail="Evaluation failed")
 
 
-@router.post("/v1/evaluate/tool", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+@router.post(
+    "/v1/evaluate/tool",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateTool",
+    summary="Evaluate a tool / function invocation",
+)
 async def evaluate_tool(request: ToolEvaluationRequest) -> EvaluationResponse:
     """Evaluate tool invocation against governance policies."""
     try:
@@ -211,7 +243,14 @@ async def _evaluate_stage_runtime(scoped, stage: str) -> EvaluationResponse:
     return result
 
 
-@router.post("/v1/evaluate/retrieval", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+@router.post(
+    "/v1/evaluate/retrieval",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateRetrieval",
+    summary="Evaluate retrieved RAG chunks for indirect prompt injection (LLM01)",
+)
 async def evaluate_retrieval(request: RetrievalEvaluationRequest) -> EvaluationResponse:
     """Evaluate retrieved RAG chunks for indirect prompt injection before they enter context (LLM01)."""
     try:
@@ -223,9 +262,16 @@ async def evaluate_retrieval(request: RetrievalEvaluationRequest) -> EvaluationR
         raise HTTPException(status_code=500, detail="Evaluation failed")
 
 
-@router.post("/v1/evaluate/agent-plan", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+@router.post(
+    "/v1/evaluate/agent-plan",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateAgentPlan",
+    summary="Evaluate a proposed agent plan for excessive agency (LLM03)",
+)
 async def evaluate_agent_plan(request: AgentPlanEvaluationRequest) -> EvaluationResponse:
-    """Evaluate a proposed multi-step agent plan for excessive agency (LLM06)."""
+    """Evaluate a proposed multi-step agent plan for excessive agency (LLM03)."""
     try:
         return await _evaluate_stage_runtime(request, "agent_plan")
     except RuntimeError:
@@ -235,9 +281,16 @@ async def evaluate_agent_plan(request: AgentPlanEvaluationRequest) -> Evaluation
         raise HTTPException(status_code=500, detail="Evaluation failed")
 
 
-@router.post("/v1/evaluate/agent-step", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+@router.post(
+    "/v1/evaluate/agent-step",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateAgentStep",
+    summary="Evaluate a single agent-loop iteration for budget/depth caps (LLM06)",
+)
 async def evaluate_agent_step(request: AgentStepEvaluationRequest) -> EvaluationResponse:
-    """Evaluate a single agent-loop iteration for budget/depth caps (LLM10)."""
+    """Evaluate a single agent-loop iteration for budget/depth caps (LLM06)."""
     try:
         return await _evaluate_stage_runtime(request, "agent_loop")
     except RuntimeError:
@@ -247,7 +300,14 @@ async def evaluate_agent_step(request: AgentStepEvaluationRequest) -> Evaluation
         raise HTTPException(status_code=500, detail="Evaluation failed")
 
 
-@router.post("/v1/evaluate/memory-write", response_model=EvaluationResponse, dependencies=[Depends(_optional_runtime_auth)])
+@router.post(
+    "/v1/evaluate/memory-write",
+    response_model=EvaluationResponse,
+    dependencies=[Depends(_optional_runtime_auth)],
+    tags=["Runtime API"],
+    operation_id="runtime.evaluateMemoryWrite",
+    summary="Evaluate text written to agent memory for persistent injection (LLM01)",
+)
 async def evaluate_memory_write(request: MemoryWriteEvaluationRequest) -> EvaluationResponse:
     """Evaluate text being written to agent memory for persistent injection (LLM01)."""
     try:

@@ -1,4 +1,4 @@
-"""Excessive-agency detector (OWASP LLM06).
+"""Excessive-agency detector (OWASP LLM03).
 
 Risk-scores a proposed agent plan, or a single agent-loop step's action, by the kind of
 actions it takes: destructive/irreversible operations, financial or external
@@ -76,8 +76,33 @@ def _extract_action_strings(plan: Any) -> List[str]:
     return out
 
 
+def normalize_separators(text: str) -> str:
+    """`delete_all_files` -> `delete all files`.
+
+    ``_`` and ``-`` are word characters to ``re``, so ``\bdelete\b`` does not match a verb
+    glued into an identifier. Callers scan the raw AND normalised forms."""
+    return re.sub(r'[_\-]+', ' ', text)
+
+
+def build_action_scan_text(text: str) -> str:
+    """The text to match action patterns against: the raw payload, the action-naming
+    fields when it parses as JSON, and a separator-normalised copy of both.
+
+    Shared so every LLM03 control classifies actions identically. Two detectors quietly
+    disagreeing about what counts as destructive is worse than either being wrong alone:
+    one would gate an action the other had already waved through."""
+    haystacks = [text]
+    try:
+        parsed = json.loads(text)
+        haystacks.extend(_extract_action_strings(parsed))
+    except (ValueError, TypeError, RecursionError):
+        pass
+    raw = "\n".join(h for h in haystacks if h)
+    return raw + "\n" + normalize_separators(raw)
+
+
 class ExcessiveAgencyDetector:
-    """Risk-scores agent plans / agent-loop step actions for excessive autonomy (LLM06)."""
+    """Risk-scores agent plans / agent-loop step actions for excessive autonomy (LLM03)."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config or {}
@@ -97,21 +122,9 @@ class ExcessiveAgencyDetector:
         if not self.enabled or not text:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
-        # Match against the action-naming fields when the plan is structured JSON, plus
-        # the full serialized text as a fallback (covers free-form plans / tool calls).
-        haystacks = [text]
-        try:
-            parsed = json.loads(text)
-            haystacks.extend(_extract_action_strings(parsed))
-        except (ValueError, TypeError, RecursionError):
-            # Unparseable or maliciously-deep JSON → fall back to scanning the raw text.
-            parsed = None
-        raw = "\n".join(haystacks)
-        # Action names are often snake_case / kebab-case (delete_all_files, transfer-funds).
-        # `\bkeyword\b` won't match a verb glued to a token by '_' (a word char), so scan a
-        # separator-normalized copy too.
-        normalized = re.sub(r'[_\-]+', ' ', raw)
-        scan_text = raw + "\n" + normalized
+        # Raw payload + action-naming fields + a separator-normalised copy. Shared with
+        # human_approval_gate so the two cannot drift on what counts as destructive.
+        scan_text = build_action_scan_text(text)
 
         hits: List[RuleHit] = []
         seen: set = set()

@@ -1,4 +1,4 @@
-"""MCP / tool-manifest scanner (OWASP LLM01 + LLM03 — supply chain).
+"""MCP / tool-manifest scanner (OWASP LLM01 + LLM04 — supply chain).
 
 A lifecycle hook (NOT a per-request stage): when a tool / MCP server is registered, its
 manifest — name, description, parameter schema, requested permissions, egress domains —
