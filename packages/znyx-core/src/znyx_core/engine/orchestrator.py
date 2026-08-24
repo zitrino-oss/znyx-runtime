@@ -86,25 +86,43 @@ _DETECTOR_PIPELINE: List[tuple] = [
     ("copyright",         False, "output", False),
     ("code_safety",       False, None,     False),
     ("hallucination",     False, "output", False),
-    # 7b. deterministic gap detectors (LLM02 / LLM09 / LLM07).
+    # 7b. deterministic gap detectors (LLM02 / LLM07 / LLM08).
     ("sensitive_business_data", False, None,     True),
     ("citation_integrity",      False, "output", False),
     ("system_prompt_leakage",   False, "output", False),
     ("numerical_consistency",   False, "output", False),
     ("document_metadata_leakage", False, None,   False),
-    # 7c. new-stage gap detectors (LLM01 / LLM06 / LLM10). Each is scoped to its
+    # 7c. new-stage gap detectors (LLM01 / LLM03 / LLM06). Each is scoped to its
     # stage(s) via the ctx_filter (a tuple = runs in any of those stages). They are
     # default-disabled and only fire on their stage's evaluate endpoint / benchmark
-    # dispatch. mcp_manifest_scanner is a tool_registration HOOK, not in this pipeline.
+    # dispatch. mcp_manifest_scanner and tool_permission_audit are tool_registration
+    # HOOKS, not in this pipeline.
     ("retrieval_chunk_injection", False, "retrieval",                       False),
     ("embedding_integrity",       False, "retrieval",                       False),
+    ("tenant_scope_assertion",    False, "retrieval",                       False),
+    ("retrieval_jamming",         False, "retrieval",                       False),
     ("tool_output_injection",     False, "tool",                            False),
     # excessive_agency risk-scores a PLAN (agent_plan) or a live step's action
     # (agent_loop) — both reachable via their evaluate endpoints. It is NOT scoped to
     # "tool" (the tool stage carries tool-RESULT text, not an action plan).
     ("excessive_agency",          False, ("agent_plan", "agent_loop"),      False),
+    # Same stages as excessive_agency: it scores what the action DOES, this asks
+    # whether a human agreed to it. Both must see a plan before it runs and each
+    # live step as it is taken.
+    ("human_approval_gate",       False, ("agent_plan", "agent_loop"),      False),
     ("unbounded_consumption",     False, ("agent_loop", "input", "output"), False),
     ("memory_write_poisoning",    False, "memory_write",                    False),
+    # Durable corpus corruption (LLM05) as distinct from injected instructions
+    # (LLM01): also exposed as an ingest hook for the corpus write path.
+    ("corpus_poisoning_monitor",  False, ("memory_write", "retrieval"),     False),
+    ("reasoning_trace_disclosure", False, "output",                        False),
+    # Output-side counterpart to the input normaliser: stops model output rewriting a
+    # terminal, where the input path stops an attacker hiding from the detectors.
+    ("output_control_char_sanitizer", False, "output",                      False),
+    ("multimodal_injection",      False, "input",                           False),
+    # A semantic cache is consulted on the way IN and can also be reported alongside the
+    # answer, so it runs in both directions; the detector no-ops without a cache block.
+    ("semantic_cache_integrity",  False, ("input", "output", "retrieval"),  False),
     # 8. Structure (output only, never blocks early)
     ("structure",         False, "output", False),
     # 9. Tool governance (text must be JSON: {"tool_name": ..., "arguments": ...}).
@@ -375,7 +393,7 @@ class DetectorOrchestrator:
             conversation_id = request.metadata.get('conversation_id') if request.metadata else None
             return detector.detect(text, conversation_id=conversation_id)
         if policy_key == "unbounded_consumption":
-            # Stateful (LLM10): needs scope + a per-identity key (session > user) for
+            # Stateful (LLM06): needs scope + a per-identity key (session > user) for
             # per-session budget accounting and the budget signals in metadata
             # (tokens/cost/agent_step). user_id is the fallback so two users without a
             # session id don't share one budget bucket.
@@ -393,6 +411,30 @@ class DetectorOrchestrator:
                 metadata=request.metadata,
                 user_id=user_id,
             )
+        if policy_key == "corpus_poisoning_monitor":
+            return detector.detect(text, tenant_id=request.tenant_id,
+                                   metadata=request.metadata)
+        if policy_key in ("tenant_scope_assertion", "semantic_cache_integrity"):
+            # Both compare the REQUESTING tenant against the tenant recorded on what was
+            # served: retrieved chunks in one case, a cache entry in the other.
+            return detector.detect(text, tenant_id=request.tenant_id,
+                                   metadata=request.metadata)
+        if policy_key == "reasoning_trace_disclosure":
+            # Also needs the ENVIRONMENT: log-probability exposure is gated by where the
+            # response is going, not banned outright, since the same detail is a
+            # legitimate debugging tool on a development endpoint.
+            return detector.detect(text, metadata=request.metadata, env=request.env)
+        if policy_key in ("retrieval_jamming", "output_control_char_sanitizer",
+                          "multimodal_injection"):
+            # Each reads its evidence (scores, traces, attachments) from metadata.
+            return detector.detect(text, metadata=request.metadata)
+        if policy_key == "human_approval_gate":
+            # Approval evidence (approver identity, ticket) travels in metadata, not text.
+            return detector.detect(text, metadata=request.metadata)
+        if policy_key == "system_prompt_leakage":
+            # Needs the request's tool/function schemas so live schema disclosure is caught
+            # without prior registration (LLM08 covers all hidden context, not just prompts).
+            return detector.detect(text, metadata=request.metadata)
         if policy_key == "tools":
             import json as _json
             try:

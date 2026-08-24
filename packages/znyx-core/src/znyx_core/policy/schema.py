@@ -233,7 +233,7 @@ class SensitiveBusinessDataConfig(DetectorConfig):
 
 
 class CitationIntegrityConfig(DetectorConfig):
-    """(LLM09): validate cited URLs/source-ids + quote spans against grounding."""
+    """(LLM07): validate cited URLs/source-ids + quote spans against grounding."""
     action: Literal["BLOCK", "WARN"] = "WARN"          # only BLOCK/WARN are honoured
     block_threshold: int = Field(default=60, ge=0, le=100)
     require_sources: bool = False
@@ -246,16 +246,23 @@ class SystemPromptFingerprintEntry(BaseModel):
     model_config = ConfigDict(extra="allow")
     hashes: List[str] = Field(min_length=1)
     min_shingle_tokens: int = Field(default=8, ge=8)
+    # What kind of hidden context this is. 2026's LLM08 spans more than the system
+    # prompt, so a hit can name what leaked instead of always saying "system prompt".
+    kind: Literal["system_prompt", "tool_schema", "policy_text"] = "system_prompt"
 
 
 class SystemPromptLeakageConfig(DetectorConfig):
-    """(LLM07): match output against registered system-prompt fingerprints by keyed
-    shingle-hash overlap (hash-only; no raw prompts). ``fingerprint_key`` + the keyed
-    hash sets are delivered into the resolved policy from the fingerprint registry."""
-    action: Literal["BLOCK", "WARN"] = "BLOCK"         # leaked prompts are blocked/warned, never redacted
+    """(LLM08): match output against registered hidden-context fingerprints by keyed
+    shingle-hash overlap (hash-only; no raw text), and against the tool/function schemas
+    the request itself carried. ``fingerprint_key`` + the keyed hash sets are delivered
+    into the resolved policy from the fingerprint registry."""
+    action: Literal["BLOCK", "WARN"] = "BLOCK"         # leaked context is blocked/warned, never redacted
     fingerprint_key: Optional[str] = None              # per-org HMAC pepper (hex)
     fingerprints: Optional[List[SystemPromptFingerprintEntry]] = None
     match_threshold: int = Field(default=2, ge=1)
+    # Fingerprint the request's own tool schemas per call. Tool definitions are generated
+    # per request rather than registered once, so this is what actually covers them.
+    check_tool_schemas: bool = True
 
     @field_validator("fingerprint_key")
     @classmethod
@@ -414,7 +421,7 @@ class HallucinationConfig(DetectorConfig):
     min_claim_words: int = 3
 
 
-# ── new-stage / lifecycle gap detectors (OWASP LLM01 / LLM06 / LLM10 / LLM03) ──
+# ── new-stage / lifecycle gap detectors (OWASP LLM01 / LLM03 / LLM06 / LLM04) ──
 
 class RetrievalChunkInjectionConfig(DetectorConfig):
     """(LLM01): scan retrieved RAG chunks for injection markers (``retrieval`` stage)."""
@@ -429,7 +436,7 @@ class ToolOutputInjectionConfig(DetectorConfig):
 
 
 class EmbeddingIntegrityConfig(DetectorConfig):
-    """LLM08: vector-store/embedding manipulation in retrieved chunks (``retrieval`` stage)."""
+    """LLM09: vector-store/embedding manipulation in retrieved chunks (``retrieval`` stage)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=50, ge=0, le=100)
     max_repetition_ratio: float = Field(default=0.30, ge=0.0, le=1.0)
@@ -438,17 +445,118 @@ class EmbeddingIntegrityConfig(DetectorConfig):
 
 
 class UnboundedConsumptionConfig(DetectorConfig):
-    """(LLM10): per-session token/cost budgets + agent-loop depth caps."""
+    """(LLM06): per-session token/cost budgets, thinking-token caps, agent-loop depth
+    caps, and state-hash loop detection."""
     action: Literal["BLOCK", "WARN"] = "BLOCK"
     max_session_tokens: int = Field(default=200_000, ge=0)
     max_session_cost_usd: float = Field(default=10.0, ge=0)
     max_iterations: int = Field(default=50, ge=1)
     max_tool_depth: int = Field(default=25, ge=1)
     session_window_seconds: int = Field(default=3600, ge=1)
+    # Extended-thinking exhaustion: a short prompt driving a long reasoning run passes
+    # every input-size check, so it needs budgets of its own.
+    max_thinking_tokens_per_request: int = Field(default=32_000, ge=0)
+    max_session_thinking_tokens: int = Field(default=200_000, ge=0)
+    # Thinking tokens per input token. 0 disables the ratio check.
+    max_thinking_to_input_ratio: float = Field(default=50.0, ge=0)
+    # Floor before the ratio applies, so a tiny prompt cannot trip it on its own.
+    ratio_min_thinking_tokens: int = Field(default=4_000, ge=0)
+    # Agent loop spinning on one state: repeats allowed before it is called a loop.
+    max_repeated_states: int = Field(default=3, ge=2)
+    max_tracked_states: int = Field(default=64, ge=1)
+
+
+class SemanticCacheIntegrityConfig(DetectorConfig):
+    """LLM09: answers served from a semantic cache (cross-tenant hits, collisions,
+    planted entries)."""
+    block_cross_tenant: bool = True
+    min_similarity: float = Field(default=0.90, ge=0.0, le=1.0)
+    min_token_overlap: float = Field(default=0.30, ge=0.0, le=1.0)
+    require_partitioning: bool = True
+    max_entry_age_seconds: int = Field(default=0, ge=0)
+
+
+class CorpusPoisoningMonitorConfig(DetectorConfig):
+    """(LLM05): screen documents entering a corpus for durable poisoning."""
+    action: Literal["BLOCK", "WARN"] = "WARN"
+    authority_threshold: int = Field(default=1, ge=1)
+    max_question_repeats: int = Field(default=3, ge=2)
+    flag_untrusted_into_trusted: bool = True
+    max_writes_per_window: int = Field(default=250, ge=0)
+    window_seconds: int = Field(default=3600, ge=1)
+
+
+class TenantScopeAssertionConfig(DetectorConfig):
+    """(LLM09): assert retrieved chunks belong to the requesting tenant."""
+    action: Literal["BLOCK", "WARN"] = "WARN"
+    # A confirmed cross-tenant chunk is a leak in progress, so it blocks even in WARN
+    # mode unless an operator deliberately turns this off.
+    block_cross_tenant: bool = True
+    require_tenant_tags: bool = True
+    require_query_scoping: bool = True
+
+
+class RetrievalJammingConfig(DetectorConfig):
+    """(LLM09): detect blocker documents that suppress a RAG answer."""
+    action: Literal["BLOCK", "WARN"] = "WARN"
+    refusal_threshold: int = Field(default=2, ge=1)
+    dominance_ratio: float = Field(default=3.0, ge=1.0)
+    min_chunks_for_dominance: int = Field(default=3, ge=3)
+    min_content_words: int = Field(default=25, ge=0)
+
+
+class ReasoningTraceDisclosureConfig(DetectorConfig):
+    """(LLM02): treat reasoning traces and tool arguments as output channels."""
+    action: Literal["BLOCK", "WARN"] = "WARN"
+    require_trace_scanned: bool = True
+    flag_tool_arguments: bool = True
+    min_trace_chars: int = Field(default=40, ge=0)
+
+
+class OutputControlCharSanitizerConfig(DetectorConfig):
+    """(LLM10): neutralise terminal control sequences in model output."""
+    # REDACT by default: the answer is usable once neutralised, so withholding it costs
+    # more than it saves.
+    action: Literal["BLOCK", "WARN", "REDACT"] = "REDACT"
+    allow_color_codes: bool = True
+
+
+class MultimodalInjectionConfig(DetectorConfig):
+    """(LLM01): govern caller-extracted OCR/transcript text, and flag unscanned media."""
+    action: Literal["BLOCK", "WARN"] = "BLOCK"
+    # Report media that arrived with nothing extracted. A control that stays silent about
+    # what it could not inspect makes the gap invisible.
+    flag_unextracted_media: bool = True
+    match_threshold: int = Field(default=1, ge=1)
+
+
+class ToolPermissionAuditConfig(DetectorConfig):
+    """(LLM03): audit tool/function declarations for excessive functionality and
+    permissions at registration time (``tool_registration`` hook)."""
+    # WARN by default: a registration finding is design feedback, and blocking a tool the
+    # app already depends on breaks the app rather than the attack.
+    action: Literal["BLOCK", "WARN"] = "WARN"
+    flag_open_ended: bool = True
+    flag_destructive_bundling: bool = True
+    flag_wildcard_scopes: bool = True
+    flag_unconstrained_params: bool = True
+    # Tool names the operator has reviewed and sanctioned.
+    allowed_tools: Optional[List[str]] = None
+
+
+class HumanApprovalGateConfig(DetectorConfig):
+    """(LLM03): require human approval before irreversible or high-impact agent actions
+    (``agent_plan`` / ``agent_loop``)."""
+    action: Literal["BLOCK", "WARN"] = "BLOCK"
+    # Action categories that need a human. Shares excessive_agency's taxonomy; mutating
+    # actions are excluded by default because gating everything causes approval fatigue.
+    gated_categories: Optional[List[str]] = None
+    # Reject an approval that names no approver: it cannot be audited.
+    require_approver_identity: bool = True
 
 
 class ExcessiveAgencyConfig(DetectorConfig):
-    """(LLM06): risk-score agent plans / agent-loop step actions (``agent_plan``/``agent_loop``)."""
+    """(LLM03): risk-score agent plans / agent-loop step actions (``agent_plan``/``agent_loop``)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     # 50 so a single HIGH-severity action reaches BLOCK when action=BLOCK (matches the detector).
     block_threshold: int = Field(default=50, ge=0, le=100)
@@ -463,7 +571,7 @@ class MemoryWritePoisoningConfig(DetectorConfig):
 
 
 class McpManifestScannerConfig(DetectorConfig):
-    """(LLM01/LLM03): scan tool/MCP manifests at registration (``tool_registration`` hook)."""
+    """(LLM01/LLM04): scan tool/MCP manifests at registration (``tool_registration`` hook)."""
     action: Literal["BLOCK", "WARN"] = "WARN"
     block_threshold: int = Field(default=50, ge=0, le=100)
     allowed_domains: Optional[List[str]] = None
@@ -506,11 +614,11 @@ class PolicySchema(BaseModel):
     copyright: Optional[CopyrightConfig] = None
     code_safety: Optional[CodeSafetyConfig] = None
     hallucination: Optional[HallucinationConfig] = None
-    # deterministic gap detectors (OWASP LLM02 / LLM09 / LLM07)
+    # deterministic gap detectors (OWASP LLM02 / LLM07 / LLM08)
     sensitive_business_data: Optional[SensitiveBusinessDataConfig] = None
     citation_integrity: Optional[CitationIntegrityConfig] = None
     system_prompt_leakage: Optional[SystemPromptLeakageConfig] = None
-    # new-stage / lifecycle gap detectors (OWASP LLM01 / LLM06 / LLM10 / LLM03)
+    # new-stage / lifecycle gap detectors (OWASP LLM01 / LLM03 / LLM06 / LLM04)
     retrieval_chunk_injection: Optional[RetrievalChunkInjectionConfig] = None
     embedding_integrity: Optional[EmbeddingIntegrityConfig] = None
     tool_output_injection: Optional[ToolOutputInjectionConfig] = None
@@ -518,6 +626,15 @@ class PolicySchema(BaseModel):
     excessive_agency: Optional[ExcessiveAgencyConfig] = None
     memory_write_poisoning: Optional[MemoryWritePoisoningConfig] = None
     mcp_manifest_scanner: Optional[McpManifestScannerConfig] = None
+    tool_permission_audit: Optional[ToolPermissionAuditConfig] = None
+    human_approval_gate: Optional[HumanApprovalGateConfig] = None
+    tenant_scope_assertion: Optional[TenantScopeAssertionConfig] = None
+    retrieval_jamming: Optional[RetrievalJammingConfig] = None
+    reasoning_trace_disclosure: Optional[ReasoningTraceDisclosureConfig] = None
+    output_control_char_sanitizer: Optional[OutputControlCharSanitizerConfig] = None
+    multimodal_injection: Optional[MultimodalInjectionConfig] = None
+    corpus_poisoning_monitor: Optional[CorpusPoisoningMonitorConfig] = None
+    semantic_cache_integrity: Optional[SemanticCacheIntegrityConfig] = None
     numerical_consistency: Optional[NumericalConsistencyConfig] = None
     document_metadata_leakage: Optional[DocumentMetadataLeakageConfig] = None
     # Structured output contract

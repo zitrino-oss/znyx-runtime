@@ -50,7 +50,7 @@ def _mismatch(expected: float, stated: float) -> bool:
 
 
 class NumericalConsistencyDetector:
-    """Deterministic arithmetic-equation consistency check (OWASP LLM09-adjacent)."""
+    """Deterministic arithmetic-equation consistency check (OWASP LLM07-adjacent)."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config or {}

@@ -38,6 +38,15 @@ from znyx_core.detectors.unbounded_consumption import UnboundedConsumptionDetect
 from znyx_core.detectors.excessive_agency import ExcessiveAgencyDetector
 from znyx_core.detectors.memory_write_poisoning import MemoryWritePoisoningDetector
 from znyx_core.detectors.mcp_manifest_scanner import McpManifestScannerDetector
+from znyx_core.detectors.tool_permission_audit import ToolPermissionAuditDetector
+from znyx_core.detectors.human_approval_gate import HumanApprovalGateDetector
+from znyx_core.detectors.tenant_scope_assertion import TenantScopeAssertionDetector
+from znyx_core.detectors.retrieval_jamming import RetrievalJammingDetector
+from znyx_core.detectors.reasoning_trace_disclosure import ReasoningTraceDisclosureDetector
+from znyx_core.detectors.output_control_char_sanitizer import OutputControlCharSanitizerDetector
+from znyx_core.detectors.multimodal_injection import MultimodalInjectionDetector
+from znyx_core.detectors.corpus_poisoning_monitor import CorpusPoisoningMonitorDetector
+from znyx_core.detectors.semantic_cache_integrity import SemanticCacheIntegrityDetector
 from znyx_core.detectors.numerical_consistency import NumericalConsistencyDetector
 from znyx_core.detectors.document_metadata_leakage import DocumentMetadataLeakageDetector
 
@@ -110,6 +119,15 @@ def _build_default_registry() -> DetectorRegistry:
     # lifecycle hook (tool_registration) — registered for the hook path, NOT in
     # _DETECTOR_PIPELINE (it does not run per request).
     registry.register("mcp_manifest_scanner", McpManifestScannerDetector)
+    registry.register("tool_permission_audit", ToolPermissionAuditDetector)
+    registry.register("human_approval_gate", HumanApprovalGateDetector)
+    registry.register("tenant_scope_assertion", TenantScopeAssertionDetector)
+    registry.register("retrieval_jamming", RetrievalJammingDetector)
+    registry.register("reasoning_trace_disclosure", ReasoningTraceDisclosureDetector)
+    registry.register("output_control_char_sanitizer", OutputControlCharSanitizerDetector)
+    registry.register("multimodal_injection", MultimodalInjectionDetector)
+    registry.register("corpus_poisoning_monitor", CorpusPoisoningMonitorDetector)
+    registry.register("semantic_cache_integrity", SemanticCacheIntegrityDetector)
     registry.register("numerical_consistency", NumericalConsistencyDetector)
     registry.register("document_metadata_leakage", DocumentMetadataLeakageDetector)
     registry.register("structure", StructureDetector)

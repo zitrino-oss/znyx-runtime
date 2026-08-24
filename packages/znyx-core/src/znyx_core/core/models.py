@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -178,11 +178,29 @@ class RetrievalChunk(BaseModel):
     content: str = Field(..., description="The retrieved chunk text")
     source_id: Optional[str] = Field(default=None, description="Identifier of the source document")
     score: Optional[float] = Field(default=None, description="Retriever relevance score")
+    # Ownership. ``tenant_scope_assertion`` (LLM09) cannot prove a chunk belongs to the
+    # caller without it, and an untagged chunk is a finding rather than an assumption,
+    # so this is a first-class field and not something buried in free metadata.
+    tenant_id: Optional[str] = Field(
+        default=None, description="Tenant the chunk belongs to, as recorded in the index")
+    # Whether ``score`` counts up (similarity) or down (distance). Retrievers disagree,
+    # and reading a distance as a similarity inverts every ranking check built on it.
+    score_kind: Optional[Literal["similarity", "distance"]] = Field(
+        default=None,
+        description="Whether a higher score is better ('similarity') or worse ('distance')")
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None, description="Vector-store metadata carried alongside the chunk")
 
 
 class RetrievalEvaluationRequest(_ScopedRequest):
     """Retrieval-stage request: the RAG chunks about to enter the model context."""
     chunks: List[RetrievalChunk] = Field(default_factory=list)
+    # Reported by the caller: was the tenant filter part of the index query, or applied
+    # to the results afterwards? Left None when the caller does not know, because an
+    # unreported pipeline is not evidence of a bad one.
+    scope_enforced_in_query: Optional[bool] = Field(
+        default=None,
+        description="True when tenant scoping was applied inside the index query")
 
     def to_evaluation_text(self) -> str:
         return "\n\n".join(c.content for c in self.chunks)

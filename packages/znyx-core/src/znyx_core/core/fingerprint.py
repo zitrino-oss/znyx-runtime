@@ -1,4 +1,4 @@
-"""Keyed shingle fingerprinting (OWASP LLM07 system-prompt leakage).
+"""Keyed shingle fingerprinting (OWASP LLM08 system-prompt leakage).
 
 Privacy-preserving fingerprints: a system prompt is reduced to a set of **keyed**
 hashes of its overlapping token n-grams ("shingles"). The raw prompt is never stored —

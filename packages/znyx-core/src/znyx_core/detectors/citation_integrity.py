@@ -1,4 +1,4 @@
-"""Citation Integrity detector (OWASP LLM09 — Misinformation).
+"""Citation Integrity detector (OWASP LLM07 — Misinformation).
 
 Deterministic check that an output's *citations* are grounded in the sources the
 caller actually provided:
@@ -53,7 +53,7 @@ def _normalize(s: str) -> str:
 
 
 class CitationIntegrityDetector:
-    """Deterministic citation/quote grounding check (LLM09)."""
+    """Deterministic citation/quote grounding check (LLM07)."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config or {}
