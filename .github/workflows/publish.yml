@@ -13,6 +13,13 @@
 # The first PyPI release is intended to be done manually (to claim the names and
 # verify the install). After that, tag a release to trigger this workflow so the
 # PyPI packages stay in lockstep with the Docker image.
+#
+# The `binaries` job builds the five standalone platform executables that the
+# @znyx/runtime npm wrapper downloads at install time, smoke-tests each one,
+# and attaches them plus per-file .sha256 checksums to the GitHub release.
+# Each digest is also written to the job summary so it can be pinned into the
+# wrapper's KNOWN_CHECKSUMS map (npm-runtime/scripts/postinstall.js in the
+# znyx-sdk repo) before the npm package is published.
 name: publish
 
 on:
@@ -50,6 +57,85 @@ jobs:
         with:
           packages-dir: ${{ matrix.package }}/dist/
           skip-existing: true
+
+  # Standalone platform executables for the @znyx/runtime npm wrapper.
+  # PyInstaller bundles the znyx-runtime CLI together with znyx-core into a
+  # single self-contained binary per platform; no Python needed on the target.
+  #
+  # A workflow_dispatch run from a branch builds and smoke-tests only (a dry
+  # run). Assets are uploaded when the workflow runs for a published release
+  # or is dispatched against a tag, so missing binaries can be backfilled.
+  binaries:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # attach the binaries to the GitHub release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # arm64
+            target: darwin-arm64
+          - os: macos-15-intel # last GitHub-hosted x64 macOS runner line
+            target: darwin-x64
+          - os: ubuntu-22.04 # oldest hosted glibc for widest Linux compat
+            target: linux-x64
+          - os: ubuntu-22.04-arm
+            target: linux-arm64
+          - os: windows-latest
+            target: windows-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Build binary
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./packages/znyx-core ./packages/znyx-runtime pyinstaller
+          # --collect-all bundles both packages plus their data files (YAML
+          # policies). znyx_runtime.main is loaded from a string by
+          # uvicorn.run, so PyInstaller cannot trace it and needs the hint.
+          pyinstaller --onefile --name "znyx-runtime-${{ matrix.target }}" \
+            --collect-all znyx_runtime --collect-all znyx_core \
+            --collect-submodules uvicorn \
+            --hidden-import znyx_runtime.main \
+            packages/znyx-runtime/src/znyx_runtime/cli.py
+          FILE="znyx-runtime-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then FILE="$FILE.exe"; fi
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+      - name: Smoke test
+        shell: bash
+        run: |
+          "./dist/$FILE" --help
+          "./dist/$FILE" serve --port 8199 &
+          SERVER=$!
+          STATUS=0
+          curl -sf --retry 30 --retry-delay 1 --retry-connrefused \
+            --retry-all-errors http://127.0.0.1:8199/healthz || STATUS=1
+          kill "$SERVER" || true
+          exit "$STATUS"
+      - name: Checksum
+        shell: bash
+        working-directory: dist
+        run: |
+          python -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest() + '  ' + sys.argv[1])" "$FILE" > "$FILE.sha256"
+          cat "$FILE.sha256"
+          {
+            echo "### $FILE"
+            echo '```'
+            cat "$FILE.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach to release
+        if: ${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then TAG="${{ github.ref_name }}"; fi
+          gh release upload "$TAG" "dist/$FILE" "dist/$FILE.sha256" --clobber
 
   image:
     runs-on: ubuntu-latest
