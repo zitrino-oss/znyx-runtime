@@ -28,23 +28,44 @@ class PolicyLoader:
         self.load()
 
     def load(self) -> None:
-        """Load policies from YAML file and validate the default policy."""
+        """Load policies from YAML file, validate the default + tenant policies, and
+        serve the validated form.
+
+        Validation used to run for its logging side effect only -- the returned
+        ``PolicySchema`` was discarded and the raw YAML dict stayed in ``self._policies``,
+        so a malformed key or a coercible-but-wrong-typed value was logged but still
+        served as-is. Now the validated model's dict form is what gets served.
+
+        Dumped with ``exclude_unset=True`` (not ``exclude_none``, and not a full dump):
+        a field a scope never mentioned stays absent rather than materializing
+        ``PolicySchema``'s default. This matters because ``PolicyResolver``'s deep-merge
+        treats "key present in this scope" as "this scope decided this" -- a partial
+        tenant/app/agent/env override that sets only e.g. ``threshold`` deliberately
+        omits ``enabled`` to inherit it from a broader scope. Dumping with defaults
+        filled in would make that omission explicit (e.g. ``enabled: false``, pydantic's
+        default), silently re-deciding it and turning the detector off for that scope.
+        ``exclude_unset=True`` reproduces the raw dict exactly when every field is valid,
+        and only diverges where validation actually corrects something: an invalid key
+        is genuinely dropped (not merely logged) and a coercible value is coerced.
+        """
         if not self.policy_path.exists():
             raise FileNotFoundError(f"Policy file not found: {self.policy_path}")
 
         with open(self.policy_path, 'r') as f:
             self._policies = yaml.safe_load(f) or {}
 
-        # Validate the default policy at load time
+        # Validate the default policy at load time and serve the validated form.
         default_policy = self._policies.get('default', {})
         if default_policy:
-            validate_policy(default_policy)
+            validated = validate_policy(default_policy)
+            self._policies['default'] = validated.model_dump(exclude_unset=True)
             logger.info("Default policy validated successfully")
 
-        # Validate tenant-level policies
+        # Validate tenant-level policies and serve their validated form too.
         for tenant_id, tenant_policy in self._policies.get('tenants', {}).items():
             if isinstance(tenant_policy, dict):
-                validate_policy(tenant_policy)
+                validated = validate_policy(tenant_policy)
+                self._policies['tenants'][tenant_id] = validated.model_dump(exclude_unset=True)
                 logger.debug("Tenant '%s' policy validated", tenant_id)
 
     def reload(self) -> None:
