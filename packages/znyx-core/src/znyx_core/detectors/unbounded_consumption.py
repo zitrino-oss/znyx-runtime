@@ -41,6 +41,7 @@ the remainder of ``session_window_seconds`` (the window then resets).
 """
 import hashlib
 import math
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -107,6 +108,9 @@ class UnboundedConsumptionDetector:
         #         "states": OrderedDict[hash, count], "first_ts": float}
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self._last_cleanup = time.time()
+        # Guards _sessions read-modify sections; pure metadata coercion and
+        # rule construction stay outside it.
+        self._lock = threading.Lock()
 
     @staticmethod
     def _key(tenant_id: str, app_id: str, session_id: Optional[str],
@@ -121,13 +125,14 @@ class UnboundedConsumptionDetector:
         return None
 
     def _cleanup(self, now: float) -> None:
-        if now - self._last_cleanup < 300:
-            return
-        stale = [k for k, v in self._sessions.items()
-                 if now - v.get('first_ts', now) > self.session_window_seconds]
-        for k in stale:
-            del self._sessions[k]
-        self._last_cleanup = now
+        with self._lock:
+            if now - self._last_cleanup < 300:
+                return
+            stale = [k for k, v in self._sessions.items()
+                     if now - v.get('first_ts', now) > self.session_window_seconds]
+            for k in stale:
+                del self._sessions[k]
+            self._last_cleanup = now
 
     def detect(self, text: str, tenant_id: str = "", app_id: str = "",
                session_id: Optional[str] = None, context: str = "input",
@@ -158,21 +163,23 @@ class UnboundedConsumptionDetector:
         # would let one user's usage block an unrelated user). Instead we check THIS request
         # alone — so a single anonymous runaway is still caught, with no cross-contamination.
         key = self._key(tenant_id, app_id, session_id, user_id)
+        state = None
         if key is not None:
-            state = self._sessions.get(key)
-            if state is None or (now - state.get('first_ts', now)) > self.session_window_seconds:
-                state = {"tokens": 0, "cost": 0.0, "thinking": 0,
-                         "states": OrderedDict(), "first_ts": now}
-                self._sessions[key] = state
-            state.setdefault('thinking', 0)      # tolerate state from an older process
-            # OrderedDict so the loop-state table can evict its oldest entry when full.
-            if not isinstance(state.get('states'), OrderedDict):
-                state['states'] = OrderedDict(state.get('states') or {})
-            state['tokens'] += req_tokens
-            state['cost'] += req_cost
-            state['thinking'] += req_thinking
-            total_tokens, total_cost = state['tokens'], state['cost']
-            total_thinking = state['thinking']
+            with self._lock:
+                state = self._sessions.get(key)
+                if state is None or (now - state.get('first_ts', now)) > self.session_window_seconds:
+                    state = {"tokens": 0, "cost": 0.0, "thinking": 0,
+                             "states": OrderedDict(), "first_ts": now}
+                    self._sessions[key] = state
+                state.setdefault('thinking', 0)      # tolerate state from an older process
+                # OrderedDict so the loop-state table can evict its oldest entry when full.
+                if not isinstance(state.get('states'), OrderedDict):
+                    state['states'] = OrderedDict(state.get('states') or {})
+                state['tokens'] += req_tokens
+                state['cost'] += req_cost
+                state['thinking'] += req_thinking
+                total_tokens, total_cost = state['tokens'], state['cost']
+                total_thinking = state['thinking']
         else:
             total_tokens, total_cost = req_tokens, req_cost
             total_thinking = req_thinking
@@ -254,22 +261,25 @@ class UnboundedConsumptionDetector:
             raw_state = raw_state.strip()
             if raw_state:
                 digest = hashlib.sha256(raw_state.encode('utf-8', 'ignore')).hexdigest()[:16]
-                states: "OrderedDict[str, int]" = self._sessions[key]['states']
-                seen = states.get(digest, 0) + 1
-                if digest in states:
-                    states[digest] = seen
-                    # Recently-seen states are the ones worth keeping, so touching an
-                    # entry moves it to the end of the eviction order.
-                    states.move_to_end(digest)
-                else:
-                    # EVICT the oldest rather than refuse the new state. Refusing turned a
-                    # full table into a bypass: once max_tracked_states distinct states had
-                    # been seen, every later state was recomputed as seen == 1 forever, so
-                    # an agent could spin on state 65 indefinitely without ever tripping the
-                    # rule. Eviction costs history, never detection of an active loop.
-                    if len(states) >= self.max_tracked_states:
-                        states.popitem(last=False)
-                    states[digest] = seen
+                # `state` was fetched/created under the lock above; a concurrent
+                # cleanup may have dropped the key, so never re-read _sessions here.
+                with self._lock:
+                    states: "OrderedDict[str, int]" = state['states']
+                    seen = states.get(digest, 0) + 1
+                    if digest in states:
+                        states[digest] = seen
+                        # Recently-seen states are the ones worth keeping, so touching an
+                        # entry moves it to the end of the eviction order.
+                        states.move_to_end(digest)
+                    else:
+                        # EVICT the oldest rather than refuse the new state. Refusing turned a
+                        # full table into a bypass: once max_tracked_states distinct states had
+                        # been seen, every later state was recomputed as seen == 1 forever, so
+                        # an agent could spin on state 65 indefinitely without ever tripping the
+                        # rule. Eviction costs history, never detection of an active loop.
+                        if len(states) >= self.max_tracked_states:
+                            states.popitem(last=False)
+                        states[digest] = seen
                 if seen >= self.max_repeated_states:
                     rule_hits.append(RuleHit(
                         rule_id="unbounded_consumption.agent_loop_state_repeat",

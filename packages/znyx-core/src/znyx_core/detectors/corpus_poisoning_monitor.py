@@ -28,6 +28,7 @@ Signals:
   per-tenant state.
 """
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -81,15 +82,18 @@ class CorpusPoisoningMonitorDetector:
         self.window_seconds = max(1, int(self.config.get("window_seconds", 3600)))
         self._writes: Dict[str, Dict[str, Any]] = {}
         self._last_cleanup = time.time()
+        # Guards _writes; the text analysis above runs outside it.
+        self._lock = threading.Lock()
 
     def _cleanup(self, now: float) -> None:
-        if now - self._last_cleanup < 300:
-            return
-        stale = [k for k, v in self._writes.items()
-                 if now - v.get("first_ts", now) > self.window_seconds]
-        for k in stale:
-            del self._writes[k]
-        self._last_cleanup = now
+        with self._lock:
+            if now - self._last_cleanup < 300:
+                return
+            stale = [k for k, v in self._writes.items()
+                     if now - v.get("first_ts", now) > self.window_seconds]
+            for k in stale:
+                del self._writes[k]
+            self._last_cleanup = now
 
     @staticmethod
     def _lower_values(metadata: Dict[str, Any], keys) -> List[str]:
@@ -158,16 +162,18 @@ class CorpusPoisoningMonitorDetector:
             now = time.time()
             self._cleanup(now)
             key = f"{tenant_id}:{source.strip()}"
-            state = self._writes.get(key)
-            if state is None or (now - state["first_ts"]) > self.window_seconds:
-                state = {"count": 0, "first_ts": now}
-                self._writes[key] = state
-            state["count"] += 1
-            if state["count"] > self.max_writes_per_window:
+            with self._lock:
+                state = self._writes.get(key)
+                if state is None or (now - state["first_ts"]) > self.window_seconds:
+                    state = {"count": 0, "first_ts": now}
+                    self._writes[key] = state
+                state["count"] += 1
+                count = state["count"]
+            if count > self.max_writes_per_window:
                 rule_hits.append(RuleHit(
                     rule_id="corpus_poisoning_monitor.ingest_burst",
                     severity=Severity.MEDIUM,
-                    message=(f"Source '{source}' has written {state['count']} documents in "
+                    message=(f"Source '{source}' has written {count} documents in "
                              f"this window; a few hundred is enough to plant a backdoor"),
                 ))
 

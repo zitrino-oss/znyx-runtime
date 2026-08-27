@@ -1,6 +1,7 @@
 import re
 import base64
 import logging
+import threading
 import time
 from collections import OrderedDict
 from typing import List, Dict, Any, Optional
@@ -953,6 +954,9 @@ class JailbreakDetector:
         self._conversation_timestamps: Dict[str, float] = {}
         self._max_conversations = 10000  # Limit total tracked conversations
         self._conversation_ttl = 3600  # Evict conversations older than 1 hour
+        # Guards the two history dicts only; pattern matching runs outside it
+        # so concurrent detect() calls are not re-serialized.
+        self._history_lock = threading.Lock()
 
         # Pre-compiled patterns for encoded content detection
         self._base64_re = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
@@ -1139,19 +1143,27 @@ class JailbreakDetector:
 
         return decoded_texts
 
-    def detect(self, text: str, conversation_id: Optional[str] = None) -> DetectorResult:
+    def detect(self, text: str, conversation_id: Optional[str] = None,
+               tenant_id: Optional[str] = None,
+               app_id: Optional[str] = None) -> DetectorResult:
         """
         Detect jailbreak attempts in text.
 
         Args:
             text: Input text to scan
             conversation_id: Optional conversation ID for tracking multi-turn attacks
+            tenant_id: Optional tenant scope for the conversation history
+            app_id: Optional app scope for the conversation history
 
         Returns:
             DetectorResult with findings
         """
         if not self.enabled:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
+
+        # Scope the history key so two tenants (or apps) reusing the same
+        # conversation id can never share escalation state.
+        history_key = self._history_key(conversation_id, tenant_id, app_id)
 
         rule_hits: List[RuleHit] = []
         texts_to_check = [text]
@@ -1245,7 +1257,7 @@ class JailbreakDetector:
 
             # CRITICAL: Track conversation history for escalation
             if self.track_conversation and conversation_id:
-                risk_score = self._apply_conversation_history(conversation_id, risk_score)
+                risk_score = self._apply_conversation_history(history_key, risk_score)
 
             # Block if above threshold
             if risk_score >= self.threshold:
@@ -1267,7 +1279,7 @@ class JailbreakDetector:
 
         # Track in conversation history if enabled
         if self.track_conversation and conversation_id:
-            self._update_conversation_history(conversation_id, result)
+            self._update_conversation_history(history_key, result)
 
         return result
 
@@ -1276,29 +1288,39 @@ class JailbreakDetector:
         """Calculate risk score based on rule hits"""
         return calculate_risk_score(rule_hits)
 
-    def _apply_conversation_history(self, conversation_id: str, current_risk_score: int) -> int:
+    @staticmethod
+    def _history_key(conversation_id: Optional[str], tenant_id: Optional[str],
+                     app_id: Optional[str]) -> Optional[str]:
+        """Tenant/app-scoped conversation-history key. None when there is no
+        conversation id - an untracked turn must never create a shared pseudo-key."""
+        if not conversation_id:
+            return None
+        return f"{tenant_id or ''}:{app_id or ''}:{conversation_id}"
+
+    def _apply_conversation_history(self, conversation_key: str, current_risk_score: int) -> int:
         """
         Apply conversation history to escalate risk score for repeated attempts.
 
         Args:
-            conversation_id: Conversation identifier
+            conversation_key: Scoped conversation-history key (see _history_key)
             current_risk_score: Current calculated risk score
 
         Returns:
             Adjusted risk score based on history
         """
-        if conversation_id not in self.conversation_history:
-            return current_risk_score
+        with self._history_lock:
+            if conversation_key not in self.conversation_history:
+                return current_risk_score
 
-        # LRU touch: move to end on access
-        self.conversation_history.move_to_end(conversation_id)
-        history = self.conversation_history[conversation_id]
+            # LRU touch: move to end on access
+            self.conversation_history.move_to_end(conversation_key)
+            history = self.conversation_history[conversation_key]
 
-        # Count prior attempts that had actual jailbreak signal (risk_score > 0).
-        # These are used to escalate the score of new messages that ALSO have
-        # jailbreak signal — repeated attackers should be treated more harshly.
-        recent_attempts = history[-5:]
-        suspicious_attempts = sum(1 for result in recent_attempts if result.risk_score > 0)
+            # Count prior attempts that had actual jailbreak signal (risk_score > 0).
+            # These are used to escalate the score of new messages that ALSO have
+            # jailbreak signal - repeated attackers should be treated more harshly.
+            recent_attempts = history[-5:]
+            suspicious_attempts = sum(1 for result in recent_attempts if result.risk_score > 0)
 
         # Only escalate if the current message already carries some jailbreak risk.
         # Applying the boost to a zero-score message (i.e. a completely clean query
@@ -1312,42 +1334,43 @@ class JailbreakDetector:
 
         return current_risk_score
 
-    def _update_conversation_history(self, conversation_id: str, result: DetectorResult) -> None:
+    def _update_conversation_history(self, conversation_key: str, result: DetectorResult) -> None:
         """
         Update conversation history with current detection result.
         Uses LRU eviction: oldest-accessed conversations are evicted first
         when the cache exceeds _max_conversations.
 
         Args:
-            conversation_id: Conversation identifier
+            conversation_key: Scoped conversation-history key (see _history_key)
             result: Detection result to store
         """
         now = time.time()
 
-        # Evict stale entries (TTL-based) then LRU if still over limit
-        if len(self.conversation_history) >= self._max_conversations:
-            # First pass: remove entries older than TTL
-            stale = [
-                cid for cid, ts in self._conversation_timestamps.items()
-                if now - ts > self._conversation_ttl
-            ]
-            for cid in stale:
-                self.conversation_history.pop(cid, None)
-                self._conversation_timestamps.pop(cid, None)
+        with self._history_lock:
+            # Evict stale entries (TTL-based) then LRU if still over limit
+            if len(self.conversation_history) >= self._max_conversations:
+                # First pass: remove entries older than TTL
+                stale = [
+                    cid for cid, ts in self._conversation_timestamps.items()
+                    if now - ts > self._conversation_ttl
+                ]
+                for cid in stale:
+                    self.conversation_history.pop(cid, None)
+                    self._conversation_timestamps.pop(cid, None)
 
-            # Second pass: if still at capacity, evict oldest-accessed (front of OrderedDict)
-            while len(self.conversation_history) >= self._max_conversations:
-                evicted_cid, _ = self.conversation_history.popitem(last=False)
-                self._conversation_timestamps.pop(evicted_cid, None)
+                # Second pass: if still at capacity, evict oldest-accessed (front of OrderedDict)
+                while len(self.conversation_history) >= self._max_conversations:
+                    evicted_cid, _ = self.conversation_history.popitem(last=False)
+                    self._conversation_timestamps.pop(evicted_cid, None)
 
-        if conversation_id not in self.conversation_history:
-            self.conversation_history[conversation_id] = []
+            if conversation_key not in self.conversation_history:
+                self.conversation_history[conversation_key] = []
 
-        # Store result and mark as most-recently-used
-        self.conversation_history[conversation_id].append(result)
-        self.conversation_history.move_to_end(conversation_id)
-        self._conversation_timestamps[conversation_id] = now
+            # Store result and mark as most-recently-used
+            self.conversation_history[conversation_key].append(result)
+            self.conversation_history.move_to_end(conversation_key)
+            self._conversation_timestamps[conversation_key] = now
 
-        # Keep only last 10 messages per conversation to avoid memory bloat
-        if len(self.conversation_history[conversation_id]) > 10:
-            self.conversation_history[conversation_id] = self.conversation_history[conversation_id][-10:]
+            # Keep only last 10 messages per conversation to avoid memory bloat
+            if len(self.conversation_history[conversation_key]) > 10:
+                self.conversation_history[conversation_key] = self.conversation_history[conversation_key][-10:]
