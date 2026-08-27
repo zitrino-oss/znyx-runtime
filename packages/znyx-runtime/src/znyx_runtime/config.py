@@ -44,6 +44,12 @@ class RuntimeConfig:
     # Whether to require signed bundles (True when a public key is configured)
     require_signed_bundles: bool = False
 
+    # Whether to additionally require the v2 envelope signature, which binds
+    # bundle identity metadata (bundle_id, org, project, environment, scope).
+    # Off by default so control planes that predate the v2 envelope keep
+    # working; enable once the control plane publishes v2 signatures.
+    require_bundle_sig_v2: bool = False
+
     # Per-evaluation telemetry (events sent to control plane)
     telemetry_enabled: bool = False
 
@@ -106,6 +112,11 @@ class RuntimeConfig:
                 # Provide ZNYX_BUNDLE_PUBLIC_KEY to enforce signature verification.
                 "true" if (os.getenv("ZNYX_BUNDLE_PUBLIC_KEY") or os.getenv("GUARDRAILS_BUNDLE_PUBLIC_KEY")) else "false",
             ).lower() == "true",
+            require_bundle_sig_v2=_env(
+                "ZNYX_REQUIRE_BUNDLE_SIG_V2",
+                "GUARDRAILS_REQUIRE_BUNDLE_SIG_V2",
+                "false",
+            ).lower() == "true",
             telemetry_enabled=_env(
                 "ZNYX_TELEMETRY_ENABLED",
                 "GUARDRAILS_TELEMETRY_ENABLED",
@@ -137,6 +148,14 @@ class RuntimeConfig:
                 "ZNYX_BUNDLE_PUBLIC_KEY is set but ZNYX_REQUIRE_SIGNED_BUNDLES is False. "
                 "Bundle signatures will not be enforced — set ZNYX_REQUIRE_SIGNED_BUNDLES=true "
                 "to enable verification."
+            )
+
+        if is_production() and self.require_signed_bundles and not self.require_bundle_sig_v2:
+            logger.info(
+                "Signed bundles are verified with legacy signature coverage only. "
+                "Set ZNYX_REQUIRE_BUNDLE_SIG_V2=true once the control plane "
+                "publishes v2 envelope signatures to also bind bundle identity "
+                "metadata."
             )
 
         # Managed mode: the runtime token + policy bundle travel over

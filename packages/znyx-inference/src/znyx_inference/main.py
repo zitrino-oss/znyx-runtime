@@ -18,7 +18,6 @@ needs no API key and no outbound internet access beyond fetching model weights.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -129,16 +128,32 @@ async def infer(task: str, req: InferRequest, request: Request):
     texts = req.items()
     t0 = time.perf_counter()
 
-    # When per-request params are provided (e.g. allowed_languages for the language
-    # runner), bypass the batcher and call the runner directly — the batcher groups
-    # texts from different callers and can't carry per-request params.
+    def _key(text: str) -> str:
+        # The full serving identity: exact text + task + model + runner/config scope +
+        # request params. Anything that can change the decision is in the key.
+        return content_key(model_version, text, task=task,
+                           scope=batcher.cache_scope, params=req.params)
+
+    # Per-request params (e.g. allowed_languages for the language runner) can't be
+    # coalesced with other callers' texts, so they run on the batcher's bounded direct
+    # path - same in-flight cap and latency budget, same 429 on saturation - instead of
+    # an unbounded bypass. Single items are cached like the batched path (params are
+    # part of the key).
     if req.params:
-        runner = batcher.runner
+        if len(texts) == 1:
+            key = _key(texts[0])
+            cached = cache.get(key)
+            if cached is not None:
+                resp = _result(cached, model_version).model_dump()
+                return InferResponse(**resp, latency_ms=int((time.perf_counter() - t0) * 1000), cached=True)
         try:
-            outs = await asyncio.to_thread(runner.infer_batch, texts, req.params)
+            outs = await batcher.run_direct(texts, req.params)
+        except Saturated as exc:
+            raise HTTPException(status_code=429, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
         if len(texts) == 1:
+            cache.put(key, outs[0])
             resp = _result(outs[0], model_version).model_dump()
             return InferResponse(**resp, latency_ms=int((time.perf_counter() - t0) * 1000), cached=False)
         return BatchInferResponse(
@@ -161,7 +176,7 @@ async def infer(task: str, req: InferRequest, request: Request):
 
     # Single item → content-hash cache then batch.
     text = texts[0]
-    key = content_key(model_version, text)
+    key = _key(text)
     cached = cache.get(key)
     if cached is not None:
         resp = _result(cached, model_version).model_dump()
@@ -220,9 +235,14 @@ async def get_install_status(job_id: str, request: Request):
 
 @app.post("/v1/models/reload")
 async def reload_model(req: ReloadRequest, request: Request):
-    """Hot-reload a task's runner after a model install."""
+    """Hot-reload a task's runner after a model install.
+
+    Also drops the task's cached decisions: a reload can swap weights without changing
+    the pin (a re-install over the same model_id@revision), and a spec change alone is
+    already covered by the runner/config scope inside every cache key."""
     registry: RunnerRegistry = request.app.state.registry
     info = await registry.reload_task(req.task, req.spec)
+    request.app.state.cache.invalidate_task(req.task)
     return info.model_dump()
 
 

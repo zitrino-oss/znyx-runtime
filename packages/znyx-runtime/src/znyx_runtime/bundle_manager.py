@@ -167,6 +167,7 @@ class BundleManager:
                 self._bundle,
                 public_key_pem=self.config.bundle_public_key or None,
                 require_signature=self.config.require_signed_bundles,
+                require_signature_v2=self.config.require_bundle_sig_v2,
             ):
                 raise ValueError(f"Bundle validation failed: {path}")
             logger.info(f"Loaded bundle from {path} (id={self._bundle.bundle_id})")
@@ -216,6 +217,7 @@ class BundleManager:
                 cached,
                 public_key_pem=self.config.bundle_public_key or None,
                 require_signature=self.config.require_signed_bundles,
+                require_signature_v2=self.config.require_bundle_sig_v2,
             ):
                 self._bundle = cached
                 logger.info(f"Loaded cached bundle from {cache_path}")
@@ -257,6 +259,7 @@ class BundleManager:
             bundle,
             public_key_pem=self.config.bundle_public_key or None,
             require_signature=self.config.require_signed_bundles,
+            require_signature_v2=self.config.require_bundle_sig_v2,
         ):
             raise ValueError("Fetched bundle failed validation")
 

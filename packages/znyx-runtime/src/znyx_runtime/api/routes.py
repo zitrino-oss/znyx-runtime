@@ -13,6 +13,7 @@ from znyx_core.core.models import (
     RetrievalEvaluationRequest, AgentPlanEvaluationRequest, AgentStepEvaluationRequest,
     MemoryWriteEvaluationRequest,
 )
+from znyx_core.engine.evaluator import EvaluatorOverloadedError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -101,6 +102,7 @@ def _runtime_judge_ctx(policy, scoped):
 #   from znyx_runtime.api.routes import verify_runtime_auth, get_evaluator
 verify_runtime_auth = _optional_runtime_auth
 get_evaluator = _get_evaluator
+get_bundle_manager = _get_bundle_manager
 get_heartbeat = _get_heartbeat
 
 
@@ -142,6 +144,9 @@ async def evaluate_input(request: EvaluationRequest) -> EvaluationResponse:
         if hb:
             hb.increment_eval_count()
         return result
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError as e:
         logger.error(f"Policy unavailable: {e}")
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
@@ -177,6 +182,9 @@ async def evaluate_output(request: EvaluationRequest) -> EvaluationResponse:
         if hb:
             hb.increment_eval_count()
         return result
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError as e:
         logger.error(f"Policy unavailable: {e}")
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
@@ -212,6 +220,9 @@ async def evaluate_tool(request: ToolEvaluationRequest) -> EvaluationResponse:
         if hb:
             hb.increment_eval_count()
         return result
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError as e:
         logger.error(f"Policy unavailable: {e}")
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
@@ -255,6 +266,9 @@ async def evaluate_retrieval(request: RetrievalEvaluationRequest) -> EvaluationR
     """Evaluate retrieved RAG chunks for indirect prompt injection before they enter context (LLM01)."""
     try:
         return await _evaluate_stage_runtime(request, "retrieval")
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -274,6 +288,9 @@ async def evaluate_agent_plan(request: AgentPlanEvaluationRequest) -> Evaluation
     """Evaluate a proposed multi-step agent plan for excessive agency (LLM03)."""
     try:
         return await _evaluate_stage_runtime(request, "agent_plan")
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -293,6 +310,9 @@ async def evaluate_agent_step(request: AgentStepEvaluationRequest) -> Evaluation
     """Evaluate a single agent-loop iteration for budget/depth caps (LLM06)."""
     try:
         return await _evaluate_stage_runtime(request, "agent_loop")
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -312,6 +332,9 @@ async def evaluate_memory_write(request: MemoryWriteEvaluationRequest) -> Evalua
     """Evaluate text being written to agent memory for persistent injection (LLM01)."""
     try:
         return await _evaluate_stage_runtime(request, "memory_write")
+    except EvaluatorOverloadedError:
+        raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
+                            headers={"Retry-After": "1"})
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:

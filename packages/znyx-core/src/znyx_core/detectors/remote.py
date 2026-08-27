@@ -78,6 +78,15 @@ class CircuitBreaker:
         return True
 
 
+class MalformedRemoteResponse(ValueError):
+    """Response payload that violates the detector response contract.
+
+    Treated like a transport error: the attempt counts as a circuit-breaker
+    failure and the request resolves through the configured fail_open /
+    fail_closed policy, never silently as ALLOW.
+    """
+
+
 class RemoteDetector:
     """Detector that delegates to a remote HTTP endpoint.
 
@@ -251,8 +260,13 @@ class RemoteDetector:
                     resp.raise_for_status()
                     data = resp.json()
 
+                # Validate the contract BEFORE recording success: a malformed
+                # payload (raised below) is a failure like any transport error,
+                # so it retries, counts against the circuit, and resolves via
+                # the fail_open/fail_closed policy.
+                result = self._parse_response(data)
                 self._circuit.record_success()
-                return self._parse_response(data)
+                return result
 
             except Exception as e:
                 last_error = e
@@ -271,17 +285,36 @@ class RemoteDetector:
         logger.error(f"Remote detector failed after {self.max_retries + 1} attempts: {last_error}")
         return self._fail_result(str(last_error))
 
-    def _parse_response(self, data: Dict[str, Any]) -> DetectorResult:
-        """Parse the remote endpoint response into a DetectorResult."""
+    def _parse_response(self, data: Any) -> DetectorResult:
+        """Parse the remote endpoint response into a DetectorResult.
+
+        Raises MalformedRemoteResponse when the payload is not a JSON object
+        or its decision field is missing or not a valid Decision value. That
+        must not default to ALLOW: a broken (or tampered-with) endpoint would
+        silently bypass a fail-closed configuration.
+        """
+        if not isinstance(data, dict):
+            raise MalformedRemoteResponse(
+                f"expected a JSON object, got {type(data).__name__}"
+            )
+
         decision_str = self._get_nested(data, self.output_decision_field)
+        if decision_str is None:
+            raise MalformedRemoteResponse(
+                f"response missing decision field '{self.output_decision_field}'"
+            )
+        try:
+            decision = Decision(str(decision_str).upper())
+        except ValueError:
+            raise MalformedRemoteResponse(
+                f"invalid decision value {decision_str!r}"
+            ) from None
+
         score = self._get_nested(data, self.output_score_field)
         message = self._get_nested(data, self.output_message_field)
 
-        try:
-            decision = Decision(str(decision_str).upper()) if decision_str else Decision.ALLOW
-        except ValueError:
-            decision = Decision.ALLOW
-
+        # A malformed score alongside a valid decision clamps rather than
+        # fails - the decision is the load-bearing field of the contract.
         try:
             risk_score = int(score) if score is not None else 0
         except (TypeError, ValueError):

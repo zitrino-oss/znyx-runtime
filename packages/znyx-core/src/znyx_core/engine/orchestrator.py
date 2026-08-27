@@ -243,9 +243,10 @@ class DetectorOrchestrator:
 
             # NLI groundedness wiring: build the per-request NLI scorer from the detector's
             # `nli` config block (same factory + egress gate as the quality scorer) and set
-            # it on the instance. The callable can't live in `config` (the registry caches by
-            # json.dumps(config)), so it's an instance attribute set after creation — always
-            # set (None when no nli block) so a cached instance never keeps a stale scorer.
+            # it on the instance. The callable can't live in `config` (the registry digests
+            # json.dumps(config)), so it's an instance attribute set after creation - safe
+            # across concurrent requests because the registry returns a FRESH instance for
+            # these two detectors on every call (they are request-scoped, never cached).
             if policy_key in ("hallucination", "citation_integrity"):
                 detector.nli_scorer = self._build_nli_scorer(config, effective_policy, request)
             t0 = time.perf_counter()
@@ -390,8 +391,11 @@ class DetectorOrchestrator:
                 context=context,
             )
         if policy_key == "jailbreak":
+            # tenant/app scope the conversation history so two tenants reusing
+            # the same conversation id never share escalation state.
             conversation_id = request.metadata.get('conversation_id') if request.metadata else None
-            return detector.detect(text, conversation_id=conversation_id)
+            return detector.detect(text, conversation_id=conversation_id,
+                                   tenant_id=request.tenant_id, app_id=request.app_id)
         if policy_key == "unbounded_consumption":
             # Stateful (LLM06): needs scope + a per-identity key (session > user) for
             # per-session budget accounting and the budget signals in metadata

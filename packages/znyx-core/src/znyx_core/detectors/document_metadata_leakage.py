@@ -1,4 +1,4 @@
-"""Document metadata-leakage detector (deferred backlog, deterministic).
+"""Document metadata-leakage detector (deterministic).
 
 Flags document *artifacts* that leak when office/PDF/web content is pasted or echoed:
 tracked-changes & comment markup, revision history, internal absolute file paths, and

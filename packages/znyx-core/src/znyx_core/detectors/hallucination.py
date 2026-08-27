@@ -10,11 +10,40 @@ import math
 import re
 import string
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
 
 logger = logging.getLogger(__name__)
+
+# Process-wide embedding model, loaded once behind a lock. Detector instances
+# are created per request (their config carries the request's grounding
+# sources), so a per-instance model would be reloaded on every call; sharing
+# also removes the double-load race two concurrent first calls used to have.
+_EMBED_MODEL = None
+_EMBED_LOCK = threading.Lock()
+
+
+def _load_shared_embed_model():
+    """Return the shared SentenceTransformer, or None when the package is not
+    installed (callers fall back to token overlap)."""
+    global _EMBED_MODEL
+    if _EMBED_MODEL is not None:
+        return _EMBED_MODEL
+    with _EMBED_LOCK:
+        if _EMBED_MODEL is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                _EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+            except ImportError:
+                logger.warning(
+                    "sentence-transformers not installed - falling back to token_overlap. "
+                    "Install with: pip install sentence-transformers"
+                )
+                return None
+        return _EMBED_MODEL
+
 
 # Common English stopwords (kept small - no external deps)
 STOPWORDS: Set[str] = {
@@ -102,7 +131,7 @@ class HallucinationDetector:
         for ts in self._source_token_sets:
             self._all_source_tokens.update(ts)
 
-        # Embedding model (lazy loaded)
+        # Embedding model (lazy loaded, shared process-wide - see module top)
         self._embed_model = None
 
         # NLI groundedness: an entailment scorer (premise, hypotheses) -> list[float].
@@ -114,19 +143,12 @@ class HallucinationDetector:
         self.min_nli_entailment = float(config.get("min_nli_entailment", 0.5))
 
     def _get_embed_model(self):
-        """Lazy-load sentence-transformers model."""
+        """Lazy-load the shared sentence-transformers model (module singleton).
+        A test-injected instance model takes precedence."""
         if self._embed_model is not None:
             return self._embed_model
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-            return self._embed_model
-        except ImportError:
-            logger.warning(
-                "sentence-transformers not installed - falling back to token_overlap. "
-                "Install with: pip install sentence-transformers"
-            )
-            return None
+        self._embed_model = _load_shared_embed_model()
+        return self._embed_model
 
     def _check_claim_token_overlap(self, claim: str) -> Tuple[float, str]:
         """Check a single claim using token overlap. Returns (score, best_source_snippet)."""

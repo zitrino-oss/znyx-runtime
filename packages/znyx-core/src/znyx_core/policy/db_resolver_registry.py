@@ -2,10 +2,10 @@
 
 The OSS engine never constructs a DB-backed resolver itself — that path belongs
 to the control plane, which owns the database schema. The control plane registers
-a factory here at import time (see ``app/control_plane/__init__.py``); the engine
-calls :func:`get_db_policy_resolver` only when a caller supplies a DB session.
+a factory here at import time; the engine calls :func:`get_db_policy_resolver`
+only when a caller supplies a DB session.
 
-This keeps ``znyx_core`` free of any ``app.control_plane`` import, so the shared
+This keeps ``znyx_core`` free of any control-plane import, so the shared
 engine ships in the OSS ``znyx-core`` package with a clean import closure.
 """
 from typing import Any, Callable, Optional
@@ -29,6 +29,6 @@ def get_db_policy_resolver(db: Any, cache_ttl: int = 60) -> Any:
     if _factory is None:
         raise RuntimeError(
             "No DB policy resolver registered. The database-backed policy path "
-            "requires the control plane; import app.control_plane to register it."
+            "requires a control plane, which registers the factory at startup."
         )
     return _factory(db, cache_ttl=cache_ttl)

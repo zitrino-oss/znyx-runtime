@@ -173,7 +173,7 @@ def _resolve_ml_endpoints(backends: Dict[str, "DetectorBackend"]) -> None:
 
     ``in_boundary`` is inferred safe-by-default from the resolved host, mirroring
     ``ml_catalog.default_strategy_for``: true only for genuine loopback (where the call never
-    leaves the pod, so the F4 egress gate correctly does not apply), false otherwise so an
+    leaves the pod, so the egress gate correctly does not apply), false otherwise so an
     off-box sidecar is treated as a boundary crossing and gets allowlist / residency /
     redaction / fail-closed audit. An explicit ``in_boundary`` in the policy is preserved.
     """

@@ -1400,7 +1400,8 @@ class TopicDetector:
 
         # Request/imperative patterns - if the user is actively asking for
         # blocked content these override any informational/warning signal that
-        # might also appear in the same sentence (issue #24: context bypass).
+        # might also appear in the same sentence (an imperative request wrapped
+        # in innocuous framing was previously bypassing the topic check).
         request_patterns = [
             r'\b(give me|tell me|show me|explain|provide)\b',
             r'\b(I need|I want|please)\b',

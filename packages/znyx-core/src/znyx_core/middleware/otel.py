@@ -14,11 +14,22 @@ import os
 import re
 import logging
 from typing import Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
+
+
+def strip_url_for_export(url: str) -> str:
+    """Return the URL with query string and fragment removed.
+
+    Query parameters can carry tokens or personal data, so exported span
+    attributes keep only scheme, host, and path.
+    """
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 # W3C traceparent format: version-trace_id-parent_id-trace_flags
 _TRACEPARENT_RE = re.compile(
@@ -121,7 +132,8 @@ class OTelMiddleware(BaseHTTPMiddleware):
             if parsed:
                 span.set_attribute("trace.parent_id", parsed[2])
             span.set_attribute("http.method", request.method)
-            span.set_attribute("http.url", str(request.url))
+            span.set_attribute("http.url", strip_url_for_export(str(request.url)))
+            span.set_attribute("http.target", request.url.path)
 
             response = await call_next(request)
 

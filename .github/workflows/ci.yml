@@ -1,7 +1,9 @@
 name: CI
 
-# Byte-compile and import check. Runs on every PR and on pushes to main,
-# providing a status check that branch protection can require before merge.
+# Package-owned behavioral tests, byte-compile / import checks, a wheel-build
+# install smoke test, and a lightweight dependency audit. Runs on every PR and
+# on pushes to main, providing status checks that branch protection can
+# require before merge.
 on:
   push:
     branches: [main, master]
@@ -17,8 +19,80 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Compile & import check
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install packages
+        # Lean install: no [onnx]/[export]/[torch] extras. tests/ was written
+        # to run on this dependency-free path (the inference tests exercise
+        # the stub runner), which is also what a plain `pip install` gets.
+        run: pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference
+
+      - name: Byte-compile
+        run: python -m compileall -q packages
+
+      - name: Import check
+        run: python -c "import znyx_core, znyx_runtime, znyx_inference"
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  wheel-smoke:
+    name: Wheel build + install smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build tool
+        run: python -m pip install --upgrade build
+
+      - name: Build wheels
+        run: |
+          set -eu
+          for pkg in znyx-core znyx-runtime znyx-inference; do
+            python -m build --wheel --outdir dist "packages/$pkg"
+          done
+
+      - name: Install each wheel into a fresh venv and import it
+        # --find-links lets pip resolve the intra-repo znyx-core dependency
+        # from the wheel just built instead of reaching out to PyPI, while
+        # the packages' third-party deps (fastapi, pydantic, ...) still
+        # resolve normally.
+        run: |
+          set -eu
+          for pkg in znyx-core znyx-runtime znyx-inference; do
+            mod="${pkg//-/_}"
+            echo "::group::$pkg"
+            venv=".smoke-venv-$pkg"
+            python -m venv "$venv"
+            "$venv/bin/pip" install --quiet --find-links dist "$pkg"
+            "$venv/bin/python" -c "import importlib; m = importlib.import_module('$mod'); v = getattr(m, '__version__', None); print(f'$pkg: import ok, __version__={v!r}' if v is not None else f'$pkg: import ok, no __version__ attribute')"
+            rm -rf "$venv"
+            echo "::endgroup::"
+          done
+
+  pip-audit:
+    name: pip-audit (installed environment)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -29,11 +103,16 @@ jobs:
           cache: pip
 
       - name: Install packages
-        # Install the shippable packages so the import check exercises real deps.
-        run: pip install ./packages/znyx-core ./packages/znyx-runtime
+        run: pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference
 
-      - name: Byte-compile
-        run: python -m compileall -q packages
+      - name: Install pip-audit
+        run: pip install pip-audit
 
-      - name: Import check
-        run: python -c "import znyx_core, znyx_runtime"
+      - name: Audit resolved environment
+        # Advisory only here: audit.yml runs pip-audit --strict against the
+        # pinned requirements files and gates on it. This leg checks whatever
+        # actually resolved in this job's environment and is informational,
+        # so a new advisory in a transitive dependency doesn't block merges
+        # before the pinned-requirements audit has a chance to catch up.
+        run: pip-audit
+        continue-on-error: true

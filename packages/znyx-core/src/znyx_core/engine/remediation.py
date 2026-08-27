@@ -16,7 +16,11 @@ Supported actions:
 """
 import json
 import logging
+import os
 import re
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from znyx_core.core.models import (
@@ -33,6 +37,67 @@ logger = logging.getLogger(__name__)
 _DEFAULT_REFRAIN = "I'm unable to provide that response."
 _DEFAULT_REASK = "Your previous response was flagged. Please rephrase your answer."
 
+# Same "~/.znyx/<name>.spool" convention as znyx_runtime.audit_sink._DEFAULT_SPOOL /
+# znyx_runtime.judge_audit_sink._DEFAULT_JUDGE_SPOOL, so a single-host deploy has the
+# runtime and the control plane agree on a path with zero explicit wiring.
+_DEFAULT_ASK_HUMAN_SPOOL = Path.home() / ".znyx" / "ask-human.spool"
+
+
+class AskHumanSpool:
+    """Durable append-only JSON-lines spool of ask_human review requests.
+
+    The runtime is deliberately DB-free (see the module docstring), so
+    ``RemediationHandler._do_ask_human`` cannot enqueue directly into a control
+    plane's review queue. It durably spools the request here instead; a
+    control plane drains the spool and inserts each item into its own review
+    queue on the other end.
+
+    Mirrors ``znyx_runtime.audit_sink.SpoolAuditSink`` / ``znyx_runtime.
+    judge_audit_sink.JudgeAuditSpool`` exactly: one JSON object per line, an
+    append + flush + fsync before returning, and a lock guarding concurrent
+    writers. Reimplemented here (rather than imported) because znyx_core does not
+    -- and must not -- depend on znyx_runtime.
+    """
+
+    def __init__(self, spool_path: Optional[str] = None):
+        self.path = Path(spool_path) if spool_path else _DEFAULT_ASK_HUMAN_SPOOL
+        self._lock = threading.Lock()
+
+    def _append_sync(self, line: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def record(self, event: Dict[str, Any]) -> None:
+        """Durably append one ask_human event. Best-effort: a write failure is
+        logged and swallowed -- the BLOCK decision the caller already returned
+        does not depend on the review actually reaching the queue, so remediation
+        must never raise here."""
+        line = json.dumps(event, separators=(",", ":"), sort_keys=True, default=str)
+        try:
+            with self._lock:
+                self._append_sync(line)
+        except Exception as exc:  # noqa: BLE001 - never fail the response over a spool write
+            logger.warning("ask_human spool write failed (review not queued): %s", exc)
+
+    def read_all(self) -> List[Dict[str, Any]]:
+        """Every spooled event (used by the CP drainer / tests). A corrupt/partial
+        line is skipped so one bad record can't abort the drain."""
+        if not self.path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for raw in self.path.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                out.append(json.loads(raw))
+            except json.JSONDecodeError as exc:
+                logger.warning("skipping unparseable ask_human spool line: %s", exc)
+        return out
+
 
 class RemediationHandler:
     """Stateless handler that applies on_fail remediation to an evaluation result.
@@ -44,6 +109,16 @@ class RemediationHandler:
 
     # Class-level registry of custom handler functions
     _custom_handlers: Dict[str, Any] = {}
+
+    def __init__(self, ask_human_spool_path: Optional[str] = None):
+        """
+        Args:
+            ask_human_spool_path: Override for the ask_human durable spool file.
+                None uses ``ZNYX_ASK_HUMAN_SPOOL`` if set, else ``~/.znyx/ask-human.spool``.
+        """
+        self._ask_human_spool = AskHumanSpool(
+            ask_human_spool_path or os.getenv("ZNYX_ASK_HUMAN_SPOOL") or None
+        )
 
     @classmethod
     def register_custom_handler(cls, name: str, handler: Any) -> None:
@@ -71,12 +146,22 @@ class RemediationHandler:
         response: EvaluationResponse,
         policy: Dict[str, Any],
         detector_results: Optional[List[DetectorResult]] = None,
+        request: Optional[Any] = None,
     ) -> EvaluationResponse:
         """Apply remediation based on policy on_fail settings.
 
         Looks at each detector section's ``on_fail`` and applies the **first**
         matching action whose detector actually triggered.  If no on_fail is
         configured, the response passes through unchanged.
+
+        Args:
+            request: The originating evaluation request (``EvaluationRequest`` /
+                ``ToolEvaluationRequest``), if the caller has one. Optional and
+                unused by every action except ``ask_human``, which reads
+                ``tenant_id``/``app_id``/``env``/``text`` off it (via ``getattr``, so
+                any request-shaped object works) to durably record the review with
+                enough context for a human reviewer. Omitting it still queues the
+                review; it is just recorded with no org scope or input text.
         """
         if response.decision == Decision.ALLOW:
             return response
@@ -86,7 +171,7 @@ class RemediationHandler:
         if action is None or action == RemediationAction.NOOP:
             return response
 
-        result = self._execute(action, config, response)
+        result = self._execute(action, config, response, request)
         response.remediation = result
 
         # Side-effects: modify response based on action outcome
@@ -164,9 +249,15 @@ class RemediationHandler:
 
     def _execute(
         self, action: RemediationAction, config: Dict[str, Any],
-        response: EvaluationResponse,
+        response: EvaluationResponse, request: Optional[Any] = None,
     ) -> RemediationResult:
         """Execute a single remediation action."""
+        # ask_human is dispatched separately: it is the one action that reads the
+        # originating request (for org scope + input text), so it needs an extra
+        # argument the uniform dict-dispatch below doesn't pass to the others.
+        if action == RemediationAction.ASK_HUMAN:
+            return self._do_ask_human(config, response, request)
+
         handler = {
             RemediationAction.REASK: self._do_reask,
             RemediationAction.FIX: self._do_fix,
@@ -174,7 +265,6 @@ class RemediationHandler:
             RemediationAction.REFRAIN: self._do_refrain,
             RemediationAction.EXCEPTION: self._do_exception,
             RemediationAction.CUSTOM: self._do_custom,
-            RemediationAction.ASK_HUMAN: self._do_ask_human,
         }.get(action)
 
         if handler is None:
@@ -283,11 +373,18 @@ class RemediationHandler:
                 error=f"Handler error: {e}",
             )
 
-    def _do_ask_human(self, config: Dict[str, Any], response: EvaluationResponse) -> RemediationResult:
+    def _do_ask_human(
+        self, config: Dict[str, Any], response: EvaluationResponse,
+        request: Optional[Any] = None,
+    ) -> RemediationResult:
         """Queue the evaluation for human review.
 
-        The response is held in a PENDING state until a human reviewer
-        approves or rejects it via the review queue API.
+        The response is held in a PENDING state until a human reviewer approves or
+        rejects it via the review queue API. The runtime has no DB (see module
+        docstring), so the review request is durably spooled here rather than
+        inserted directly; a control plane drains the spool into its own review
+        queue, the same spool-then-drain transport as the egress and judge audit
+        trails.
         """
         queue_name = config.get("queue", "default")
         timeout_minutes = config.get("timeout_minutes", 60)
@@ -296,6 +393,30 @@ class RemediationHandler:
         # Generate a review ID that the caller can poll
         import uuid
         review_id = str(uuid.uuid4())
+
+        self._ask_human_spool.record({
+            "review_id": review_id,
+            "queue_name": queue_name,
+            "timeout_minutes": timeout_minutes,
+            "message": message,
+            # org/tenant scope, mirroring znyx_core.engine.egress's
+            # `org_scope=getattr(request, "tenant_id", None)` -- None when the caller
+            # didn't pass a request, or it isn't set on it.
+            "org_scope": getattr(request, "tenant_id", None) if request is not None else None,
+            "app_id": getattr(request, "app_id", None) if request is not None else None,
+            "env": getattr(request, "env", None) if request is not None else None,
+            "request_id": response.request_id,
+            "trace_id": response.trace_id,
+            # The flagged text lives on the request, not the response -- fall back to
+            # sanitized_text (e.g. tool-arg evaluation) when there is no request.
+            "input_text": (
+                getattr(request, "text", None) if request is not None else response.sanitized_text
+            ),
+            "decision": getattr(response.decision, "value", str(response.decision)),
+            "risk_score": response.risk_score,
+            "rule_hits": [h.model_dump() for h in (response.rule_hits or [])],
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        })
 
         return RemediationResult(
             action=RemediationAction.ASK_HUMAN,

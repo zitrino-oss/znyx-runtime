@@ -8,6 +8,7 @@ Implements:
 """
 import time
 import hashlib
+import threading
 from typing import List, Dict, Any, Optional
 from collections import defaultdict, deque
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
@@ -90,6 +91,10 @@ class AbuseDetector:
         # Cleanup tracking
         self.last_cleanup = time.time()
 
+        # Guards the shared rate/flood state above. The pure checks
+        # (payload size, repetitive content) stay lock-free.
+        self._lock = threading.Lock()
+
     def _make_key(self, tenant_id: str, app_id: str, user_id: Optional[str] = None) -> str:
         """Create rate limit key from identifiers"""
         if user_id:
@@ -98,24 +103,25 @@ class AbuseDetector:
 
     def _cleanup_old_entries(self):
         """Periodically cleanup old entries (simple memory management)"""
-        now = time.time()
+        with self._lock:
+            now = time.time()
 
-        # Cleanup every 5 minutes
-        if now - self.last_cleanup < 300:
-            return
+            # Cleanup every 5 minutes
+            if now - self.last_cleanup < 300:
+                return
 
-        # Remove old prompt hashes
-        for key in list(self.prompt_hashes.keys()):
-            hashes = self.prompt_hashes[key]
-            # Remove entries older than window
-            while hashes and (now - hashes[0][1]) > self.prompt_flood_window:
-                hashes.popleft()
+            # Remove old prompt hashes
+            for key in list(self.prompt_hashes.keys()):
+                hashes = self.prompt_hashes[key]
+                # Remove entries older than window
+                while hashes and (now - hashes[0][1]) > self.prompt_flood_window:
+                    hashes.popleft()
 
-            # Remove key if empty
-            if not hashes:
-                del self.prompt_hashes[key]
+                # Remove key if empty
+                if not hashes:
+                    del self.prompt_hashes[key]
 
-        self.last_cleanup = now
+            self.last_cleanup = now
 
     def check_payload_size(self, text: str, context: str = "input") -> Optional[RuleHit]:
         """
@@ -166,24 +172,25 @@ class AbuseDetector:
         """
         key = self._make_key(tenant_id, app_id, user_id)
 
-        # Get or create token bucket
-        if key not in self.rate_limiters:
-            # Convert per-minute to per-second rate
-            rate_per_second = self.rate_limit_per_minute / 60.0
-            self.rate_limiters[key] = TokenBucket(
-                rate=rate_per_second,
-                capacity=self.rate_limit_per_minute
-            )
+        with self._lock:
+            # Get or create token bucket
+            if key not in self.rate_limiters:
+                # Convert per-minute to per-second rate
+                rate_per_second = self.rate_limit_per_minute / 60.0
+                self.rate_limiters[key] = TokenBucket(
+                    rate=rate_per_second,
+                    capacity=self.rate_limit_per_minute
+                )
 
-        bucket = self.rate_limiters[key]
+            bucket = self.rate_limiters[key]
 
-        # Try to consume 1 token
-        if not bucket.consume(1):
-            return RuleHit(
-                rule_id="abuse.rate_limited",
-                severity=Severity.MEDIUM,
-                message=f"Rate limit exceeded: {self.rate_limit_per_minute} requests per minute"
-            )
+            # Try to consume 1 token
+            if not bucket.consume(1):
+                return RuleHit(
+                    rule_id="abuse.rate_limited",
+                    severity=Severity.MEDIUM,
+                    message=f"Rate limit exceeded: {self.rate_limit_per_minute} requests per minute"
+                )
 
         return None
 
@@ -212,18 +219,19 @@ class AbuseDetector:
         text_hash = hashlib.sha256(text.encode()).hexdigest()
         now = time.time()
 
-        # Get hash history for this key
-        hashes = self.prompt_hashes[key]
+        with self._lock:
+            # Get hash history for this key
+            hashes = self.prompt_hashes[key]
 
-        # Remove old entries
-        while hashes and (now - hashes[0][1]) > self.prompt_flood_window:
-            hashes.popleft()
+            # Remove old entries
+            while hashes and (now - hashes[0][1]) > self.prompt_flood_window:
+                hashes.popleft()
 
-        # Count occurrences of this hash
-        count = sum(1 for h, _ in hashes if h == text_hash)
+            # Count occurrences of this hash
+            count = sum(1 for h, _ in hashes if h == text_hash)
 
-        # Add current hash
-        hashes.append((text_hash, now))
+            # Add current hash
+            hashes.append((text_hash, now))
 
         # Check if threshold exceeded
         if count >= self.prompt_flood_threshold:

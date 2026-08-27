@@ -33,7 +33,7 @@ from znyx_runtime.install_state import record_run
 from znyx_runtime.api.routes import router
 from znyx_runtime.api.stream_routes import router as stream_router
 from znyx_core.engine.evaluator import GuardrailsEvaluator
-from znyx_core.detectors.plugin import PluginRegistry, init_plugins
+from znyx_core.detectors.plugin import plugin_registry, init_plugins
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -50,22 +50,28 @@ def _build_welcome_banner(version: str, console_url: str, inner_width: int = 54)
     def line(text: str) -> str:
         return "║ " + text.ljust(inner_width - 2) + " ║"
 
-    return "\n".join([
+    rows = [
         top,
         line(f"Welcome to ZNYX AI Runtime v{version}"),
         blank,
         line("Running in LOCAL mode - policies from YAML file."),
         line("Your data never leaves this machine."),
-        blank,
-        line("Want a policy editor, traces, and analytics?"),
-        line(f"-> {console_url}"),
+    ]
+    if console_url:
+        rows += [
+            blank,
+            line("Policy editor, traces, and analytics:"),
+            line(f"-> {console_url}"),
+        ]
+    rows += [
         blank,
         line("No telemetry by default - never phones home."),
         line("Opt in to anonymous install heartbeats:"),
         line("  export ZNYX_TELEMETRY=true"),
         line("  (ZNYX_HEARTBEAT_URL overrides the destination)"),
         bot,
-    ])
+    ]
+    return "\n".join(rows)
 
 
 _WELCOME_BANNER = _build_welcome_banner(VERSION, CONSOLE_URL)
@@ -132,8 +138,11 @@ async def lifespan(app: FastAPI):
     heartbeat = Heartbeat(enabled=config.heartbeat_enabled, mode=config.mode)
     await heartbeat.start()
 
-    # Initialize plugin registry for custom detectors
-    plugin_registry = PluginRegistry()
+    # Initialize plugin registry for custom detectors. `plugin_registry` here is the
+    # module-global instance init_plugins() populates (imported above, not a fresh
+    # PluginRegistry()) -- there must be exactly one registry instance by the time the
+    # evaluator is built below, or GUARDRAILS_PLUGIN_DIR custom detectors loaded by
+    # init_plugins() would land in an object request-serving code never sees.
     init_plugins()
 
     # Egress audit: durable, fail-closed spool sink the escalation gate writes to
@@ -197,8 +206,8 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass  # never block startup on telemetry
 
-    # Upgrade nudge every 5th run in local mode
-    if config.mode == "local" and run_count > 1 and run_count % 5 == 0:
+    # Periodic reminder, only when the operator has configured a console URL.
+    if config.mode == "local" and CONSOLE_URL and run_count > 1 and run_count % 5 == 0:
         logger.info(
             f"[znyx] TIP: Run {run_count} - connect to the console for policy management "
             f"-> {CONSOLE_URL}"

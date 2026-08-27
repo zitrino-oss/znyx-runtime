@@ -2,10 +2,17 @@ import asyncio
 import functools
 import json
 import logging
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional, Callable
 from datetime import datetime, timezone
+
+from znyx_core.config.tunables import (
+    DETECTOR_DEADLINE_SECONDS,
+    DETECTOR_QUEUE_MAX,
+    DETECTOR_WORKERS,
+)
 
 from znyx_core.core.models import EvaluationRequest, EvaluationResponse, DetectorResult, Decision, ToolEvaluationRequest, Stage
 from znyx_core.core.decision import DecisionAggregator
@@ -17,16 +24,48 @@ from znyx_core.engine.remediation import RemediationHandler
 
 logger = logging.getLogger(__name__)
 
-# Single-worker executor for the synchronous detector pipeline. Running it OFF
-# the event loop keeps the loop free for I/O / other requests; running it on a
-# SINGLE worker SERIALIZES detector execution. Serialization is required because
-# the stateful detectors (abuse rate-limit buckets, jailbreak conversation
-# history) are long-lived shared instances with NO internal locking — a
-# multi-worker pool would race (corrupt the buckets / mutate an OrderedDict mid
-# iteration). The GIL means >1 worker wouldn't speed up the pure-Python regex
-# work anyway, so a single worker costs nothing and is safe. ALL run_detectors
-# callers must go through this executor so two never run concurrently.
-_DETECTOR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="detector")
+
+class EvaluatorOverloadedError(Exception):
+    """Raised when the detector pool's admission queue is full.
+
+    Callers should map this to HTTP 503 (retryable, e.g. with Retry-After).
+    Deliberately NOT a RuntimeError subclass: the runtime routes translate
+    RuntimeError into the "Policy unavailable" fail-closed 503, which has
+    different semantics from a saturated-but-healthy evaluator.
+    """
+
+
+class _DetectorDeadlineExceeded(Exception):
+    """Internal sentinel: the detector pipeline missed its per-request deadline."""
+
+
+def _retrieve_late_result(fut) -> None:
+    """Consume the result of a timed-out (zombie) detector future so the event
+    loop never logs an unretrieved exception."""
+    if not fut.cancelled():
+        fut.exception()
+
+
+# Bounded thread pool for the synchronous detector pipeline. Running it OFF
+# the event loop keeps the loop free for I/O / other requests; multiple
+# workers pay off exactly when detectors block on I/O (remote detectors, NLI
+# scoring, judge calls) and are GIL-neutral for the pure-Python regex work.
+# Concurrency is safe because every stateful detector (abuse, jailbreak,
+# unbounded_consumption, corpus_poisoning_monitor) guards its mutable state
+# with a per-instance lock, and the registry caches instances per
+# (name, config digest) - see engine/detector_registry.py. Set
+# ZNYX_DETECTOR_WORKERS=1 to restore strict serialization.
+#
+# Admission is bounded: at most workers + ZNYX_DETECTOR_QUEUE_MAX evaluations
+# may be in flight or queued; past that _run_detectors raises
+# EvaluatorOverloadedError (mapped to HTTP 503 by the routes) instead of
+# queueing without bound. A permit is held until the pipeline call finishes,
+# so timed-out zombies still count against admission while they run.
+# All three globals are read at call time so tests can monkeypatch them.
+_DETECTOR_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, DETECTOR_WORKERS),
+                                        thread_name_prefix="detector")
+_ADMISSION = threading.Semaphore(max(1, DETECTOR_WORKERS) + max(0, DETECTOR_QUEUE_MAX))
+_DEADLINE_S = max(0.0, DETECTOR_DEADLINE_SECONDS)
 
 # Optional metrics collector - graceful no-op if not available
 try:
@@ -67,15 +106,36 @@ class GuardrailsEvaluator:
         self._remediation = RemediationHandler()
 
     async def _run_detectors(self, *args, **kwargs):
-        """Run the synchronous orchestrator off the event loop on the single
-        shared detector worker (see _DETECTOR_EXECUTOR): serialized + race-free.
-        In the worker thread there is no running loop, so RemoteDetector/judge
-        take their asyncio.run path."""
+        """Run the synchronous orchestrator off the event loop on the shared
+        detector pool (see _DETECTOR_EXECUTOR). Admission is bounded: when the
+        pool and its queue are saturated this raises EvaluatorOverloadedError
+        immediately rather than queueing without bound. When a deadline is
+        configured, a request past it raises _DetectorDeadlineExceeded; the
+        future is shielded (never cancelled) so the work item always runs to
+        completion and releases its admission permit. In the worker thread
+        there is no running loop, so RemoteDetector/judge take their
+        asyncio.run path."""
+        if not _ADMISSION.acquire(blocking=False):
+            raise EvaluatorOverloadedError("detector queue is full")
+        call = functools.partial(self._orchestrator.run_detectors, *args, **kwargs)
+
+        def _call():
+            try:
+                return call()
+            finally:
+                _ADMISSION.release()
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            _DETECTOR_EXECUTOR,
-            functools.partial(self._orchestrator.run_detectors, *args, **kwargs),
-        )
+        fut = loop.run_in_executor(_DETECTOR_EXECUTOR, _call)
+        if _DEADLINE_S <= 0:
+            return await fut
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=_DEADLINE_S)
+        except asyncio.TimeoutError:
+            # The zombie keeps running (permit released in _call's finally);
+            # consume its eventual result so the loop never warns about it.
+            fut.add_done_callback(_retrieve_late_result)
+            raise _DetectorDeadlineExceeded()
 
     async def evaluate(
         self,
@@ -112,12 +172,18 @@ class GuardrailsEvaluator:
         # actual stage (input/output/retrieval/tool/agent_plan/agent_loop/memory_write)
         # rather than the old input-vs-output branch, so a new stage's detectors are
         # selected correctly instead of the stage being treated as output.
-        # Offload the synchronous detector pipeline to the single shared worker
-        # (frees the event loop without racing the long-lived stateful detectors).
-        orch = await self._run_detectors(
-            request.text, policy, request,
-            context=context, judge_ctx=judge_ctx,
-        )
+        # Offload the synchronous detector pipeline to the shared bounded pool
+        # (frees the event loop; the stateful detectors lock their own state).
+        try:
+            orch = await self._run_detectors(
+                request.text, policy, request,
+                context=context, judge_ctx=judge_ctx,
+            )
+        except _DetectorDeadlineExceeded:
+            # Fail closed, mirroring the policy-resolution failure path.
+            # EvaluatorOverloadedError intentionally propagates to the route.
+            return self._deadline_block_response(request, policy_version,
+                                                 start_time, context)
 
         # Aggregate all results
         final_result = DecisionAggregator.aggregate(orch.results)
@@ -183,8 +249,9 @@ class GuardrailsEvaluator:
                 metadata=request.metadata,
             )
 
-        # Apply on_fail remediation if configured
-        response = self._remediation.apply(response, policy, orch.results)
+        # Apply on_fail remediation if configured. `request` lets ask_human record
+        # org scope + the flagged text on its durable spool (see RemediationHandler.apply).
+        response = self._remediation.apply(response, policy, orch.results, request)
 
         self._log_evaluation(request, response, policy_version)
         self._emit_telemetry(request, response, latency_ms, context)
@@ -243,8 +310,12 @@ class GuardrailsEvaluator:
                 session_id=getattr(request, "session_id", None),
                 span_id=getattr(request, "span_id", None),
             )
-            orch = await self._run_detectors(tool_result_text, policy, stage_req,
-                                             context="tool", judge_ctx=judge_ctx)
+            try:
+                orch = await self._run_detectors(tool_result_text, policy, stage_req,
+                                                 context="tool", judge_ctx=judge_ctx)
+            except _DetectorDeadlineExceeded:
+                return self._deadline_block_response(request, policy_version,
+                                                     start_time, "tool")
             results.extend(orch.results)
             detector_timings = orch.detector_timings
 
@@ -265,7 +336,7 @@ class GuardrailsEvaluator:
 
         # Apply on_fail remediation (e.g. tool_output_injection.on_fail: ask_human),
         # consistent with the input/output evaluate path.
-        response = self._remediation.apply(response, policy, results)
+        response = self._remediation.apply(response, policy, results, request)
 
         latency_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
         response.latency_ms = latency_ms
@@ -355,6 +426,33 @@ class GuardrailsEvaluator:
         )
 
     # -- private helpers ----------------------------------------------------
+
+    def _deadline_block_response(self, request, policy_version: str,
+                                 start_time, context: str) -> EvaluationResponse:
+        """Fail-closed BLOCK for an evaluation whose detector pipeline missed
+        the ZNYX_DETECTOR_DEADLINE_SECONDS deadline. Logged, telemetered and
+        metriced like any other decision so the miss is observable."""
+        response = EvaluationResponse(
+            request_id=request.request_id,
+            decision=Decision.BLOCK,
+            risk_score=100,
+            policy_version=policy_version,
+            rule_hits=[],
+            user_message="Request blocked: evaluation deadline exceeded.",
+            developer_message=(
+                f"Detector pipeline exceeded the {_DEADLINE_S}s deadline "
+                f"(ZNYX_DETECTOR_DEADLINE_SECONDS); failing closed."
+            ),
+        )
+        latency_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+        response.latency_ms = latency_ms
+        response.trace_id = getattr(request, "trace_id", None) or str(uuid.uuid4())
+        response.session_id = getattr(request, "session_id", None)
+        response.span_id = getattr(request, "span_id", None)
+        self._log_evaluation(request, response, policy_version)
+        self._emit_telemetry(request, response, latency_ms, context)
+        self._record_metrics(context, response, latency_ms / 1000.0)
+        return response
 
     async def resolve_policy(self, request, db=None):
         """Public: resolve a request's policy, or return a fail-closed BLOCK
