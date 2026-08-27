@@ -1,9 +1,13 @@
 """
 Global API Rate Limiting Middleware
 
-In-memory sliding window rate limiter for FastAPI/Starlette.
-Limits requests by client IP and optionally by API key.
-Configurable via environment variables.
+Rate limiter for FastAPI/Starlette. Limits requests by client IP and
+optionally by API key. When a Redis URL is configured (ZNYX_REDIS_URL or
+REDIS_URL) counting happens in Redis so the limit is shared across
+replicas; otherwise an in-memory sliding window is used (per-pod limits).
+The redis package is an optional dependency - if it is missing or Redis
+becomes unreachable, the middleware logs the degradation and falls back
+to the in-memory limiter. Configurable via environment variables.
 """
 import hashlib
 import os
@@ -82,6 +86,69 @@ class SlidingWindowCounter:
                 logger.debug(f"Rate limiter cleanup: removed {len(stale_keys)} stale entries")
 
 
+class RedisFixedWindowCounter:
+    """Fixed-window rate limiter backed by Redis, shared across replicas.
+
+    Uses INCR plus EXPIRE on a key scoped to the current minute window.
+    The window id is part of the key, so a lost EXPIRE can only leak a
+    small stale key - it never corrupts counting.
+    """
+
+    def __init__(self, client, requests_per_minute: int, burst: int,
+                 prefix: str = "znyx:ratelimit"):
+        self._client = client
+        self.requests_per_minute = requests_per_minute
+        self.burst = burst
+        self.window = 60.0  # 1 minute window
+        self.prefix = prefix
+
+    async def is_allowed(self, key: str) -> Tuple[bool, int, int, float]:
+        """
+        Check if a request is allowed for the given key.
+
+        Returns:
+            (allowed, limit, remaining, reset_at)
+        """
+        now = time.time()
+        window_id = int(now // self.window)
+        reset_at = (window_id + 1) * self.window
+        limit = self.requests_per_minute + self.burst
+
+        redis_key = f"{self.prefix}:{key}:{window_id}"
+        count = await self._client.incr(redis_key)
+        if count == 1:
+            await self._client.expire(redis_key, int(self.window * 2))
+
+        remaining = max(0, limit - count)
+        return count <= limit, limit, remaining, reset_at
+
+
+def _create_redis_client(url: str):
+    """Build an async Redis client, or None when unavailable.
+
+    The redis package is an optional dependency - the runtime must not
+    require it, so it is imported lazily and failure means in-memory
+    fallback rather than a crash.
+    """
+    try:
+        import redis.asyncio as aioredis
+    except ImportError:
+        logger.warning(
+            "A Redis URL is configured for rate limiting but the 'redis' "
+            "package is not installed; falling back to in-memory per-pod "
+            "limits. Install the redis package to enable shared limits."
+        )
+        return None
+    try:
+        return aioredis.from_url(url)
+    except Exception as e:
+        logger.warning(
+            "Could not create Redis client for rate limiting (%s); "
+            "falling back to in-memory per-pod limits", e,
+        )
+        return None
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
     FastAPI/Starlette middleware for global API rate limiting.
@@ -93,9 +160,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         RATE_LIMIT_REQUESTS_PER_MINUTE  - max requests per minute (default: 60)
         RATE_LIMIT_BURST                - extra burst allowance (default: 10)
         RATE_LIMIT_ENABLED              - enable/disable (default: true)
+        ZNYX_REDIS_URL / REDIS_URL      - Redis backend for replica-shared limits
+        TRUSTED_PROXY_DEPTH             - trusted reverse proxies in front (default: 0)
     """
 
-    def __init__(self, app, enabled=None, requests_per_minute=None, burst=None):
+    def __init__(self, app, enabled=None, requests_per_minute=None, burst=None,
+                 redis_client=None):
         super().__init__(app)
         self.enabled = (
             enabled if enabled is not None
@@ -140,12 +210,27 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             os.getenv("TRUSTED_PROXY_DEPTH", "0")
         )
 
+        # In-memory limiters always exist: they are the primary backend when
+        # no Redis is configured and the fallback when Redis is unreachable.
         self.ip_limiter = SlidingWindowCounter(self.requests_per_minute, self.burst)
         self.key_limiter = SlidingWindowCounter(self.requests_per_minute, self.burst)
 
+        # Redis-backed shared limiter (optional). A client can be injected
+        # directly (tests, custom pooling); otherwise it is built lazily
+        # from the configured URL.
+        self._redis_limiter = None
+        self._redis_degraded = False
+        if self.enabled:
+            if redis_client is None and _redis_url:
+                redis_client = _create_redis_client(_redis_url)
+            if redis_client is not None:
+                self._redis_limiter = RedisFixedWindowCounter(
+                    redis_client, self.requests_per_minute, self.burst,
+                )
+
         self._cleanup_task = None
         if self.enabled:
-            backend = "Redis" if _redis_url else "in-memory"
+            backend = "Redis" if self._redis_limiter is not None else "in-memory"
             logger.info(
                 "Rate limiting enabled (%s backend): %s/min + %s burst",
                 backend, self.requests_per_minute, self.burst,
@@ -155,7 +240,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         """Extract client IP, respecting trusted proxy depth.
 
         When ``TRUSTED_PROXY_DEPTH=0`` (default) the header is ignored
-        entirely — only the TCP-level peer address is used.  This is
+        entirely - only the TCP-level peer address is used.  This is
         the safest option when there is no reverse proxy.
 
         When ``TRUSTED_PROXY_DEPTH=N`` (e.g. 1 for a single ALB/nginx),
@@ -172,6 +257,31 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 if abs(idx) <= len(parts):
                     return parts[idx]
         return request.client.host if request.client else "unknown"
+
+    async def _check(self, fallback_limiter: SlidingWindowCounter,
+                     key: str) -> Tuple[bool, int, int, float]:
+        """Run the shared Redis limiter when configured, else the in-memory one.
+
+        Redis failures degrade to per-pod in-memory limits so the API stays
+        up; the degradation is logged once and again on recovery.
+        """
+        if self._redis_limiter is not None:
+            try:
+                result = await self._redis_limiter.is_allowed(key)
+                if self._redis_degraded:
+                    self._redis_degraded = False
+                    logger.info(
+                        "Redis rate limiter recovered; shared limits restored"
+                    )
+                return result
+            except Exception as e:
+                if not self._redis_degraded:
+                    self._redis_degraded = True
+                    logger.warning(
+                        "Redis rate limiter error (%s); falling back to "
+                        "in-memory per-pod limits", e,
+                    )
+        return await fallback_limiter.is_allowed(key)
 
     async def _ensure_cleanup_task(self):
         """Start the periodic cleanup task if not already running."""
@@ -205,7 +315,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Check IP-based rate limit
         client_ip = self._get_client_ip(request)
         ip_key = f"ip:{client_ip}"
-        allowed, limit, remaining, reset_at = await self.ip_limiter.is_allowed(ip_key)
+        allowed, limit, remaining, reset_at = await self._check(self.ip_limiter, ip_key)
 
         if not allowed:
             retry_after = max(1, int(reset_at - time.time()))
@@ -224,7 +334,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         api_key = request.headers.get("x-api-key")
         if api_key:
             ak_key = f"key:{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
-            ak_allowed, ak_limit, ak_remaining, ak_reset = await self.key_limiter.is_allowed(ak_key)
+            ak_allowed, ak_limit, ak_remaining, ak_reset = await self._check(self.key_limiter, ak_key)
             if not ak_allowed:
                 retry_after = max(1, int(ak_reset - time.time()))
                 return JSONResponse(
