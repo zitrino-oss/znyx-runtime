@@ -1,14 +1,13 @@
 # Regional PII benchmark corpus v1.1 - labelled samples for every regional
-# identifier added in roadmap item #11.
+# identifier the PII detector ships.
 #
-# Coverage target (from roadmap line 1291):
+# Coverage target:
 #   3+ positive samples AND 3+ near-miss negatives per shipped pattern.
 #
 # Acceptance criteria:
 #   recall >= 0.95 on positives
 #   false-positive rate <= 0.01 on negatives (ANY regional hit counts as FP)
 #
-# Run via: tests/test_regional_pii_benchmark.py
 
 dataset_name: regional-pii-v1.1
 version: 2
@@ -16,7 +15,7 @@ created: 2026-04-19
 
 # =================================================================
 # POSITIVE SAMPLES - every pattern has at least 3. Checksum-validated
-# types use generated valid vectors (see scripts/gen_test_vectors.py).
+# types use generated valid vectors.
 # =================================================================
 positive_samples:
   # ---------- India: PAN ----------

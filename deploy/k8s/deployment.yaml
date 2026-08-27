@@ -2,15 +2,12 @@
 #
 # The sidecar is co-located deliberately: the runtime then reaches it on
 # http://localhost:9000 with nothing configured, and because that address is genuinely
-# loopback the ML layer is correctly treated as in-boundary (the F4 egress gate does not
+# loopback the ML layer is correctly treated as in-boundary (the egress gate does not
 # apply to a call that never leaves the pod). No address is stored in the control plane and
 # none is shipped in the policy bundle.
 #
-# To enable ML: create the secret below, then uncomment the `inference` container and the
-# `volumes` block at the bottom.
-#
-#   kubectl create secret generic znyx-inference-secrets \
-#     --from-literal=ZNYX_INFERENCE_API_KEY=gr_...        # Console → project → Keys
+# To enable ML: uncomment the `inference` container and the `volumes` block at the bottom.
+# The sidecar needs no secret of its own (see the notes on the container below).
 #
 # Note the trade-off of same-pod co-location: each replica provisions and holds its own copy
 # of the weights in a pod-local emptyDir, so a replaced pod re-downloads them. That is the

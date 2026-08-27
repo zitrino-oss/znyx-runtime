@@ -1,12 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# EXAMPLE (not seeded): deterministic → local_ml escalation (P2 unit 4)
+# EXAMPLE (not seeded): deterministic → local_ml escalation
 #
 # This shows how to upgrade a deterministic detector with a model-backed second
-# layer via the F2 strategy + F3 inference sidecar. The same blocks are produced
+# layer via the strategy engine + inference sidecar. The same blocks are produced
 # programmatically by `znyx_core.engine.ml_catalog.default_strategy_for(detector)`
 # and served to the console at GET /v1/ml/strategy-defaults.
 #
-# ⚠️  SCORECARD GATE (P2): a detector with a model-backed strategy is gated. To
+# ⚠️  SCORECARD GATE: a detector with a model-backed strategy is gated. To
 #     PUBLISH a policy/pack that contains these blocks you need a passing scorecard
 #     for the PINNED model version (advisory tier); to let the ML layer BLOCK/REDACT
 #     you need the stricter enforcement tier. Without one, publish is blocked, or the
@@ -20,7 +20,7 @@
 # the deterministic decision (graceful degradation).
 #
 # 🔒  in_boundary AND EGRESS — READ THIS: `in_boundary: true` means the call is treated
-#     as NOT crossing the trust boundary, so the F4 egress gate is SKIPPED entirely (no
+#     as NOT crossing the trust boundary, so the egress gate is SKIPPED entirely (no
 #     allowlist / residency / redaction / fail-closed audit). That is correct ONLY for a
 #     genuinely co-located loopback sidecar (localhost / 127.0.0.1). If you change
 #     `endpoint_url` to ANY other host, you MUST set `in_boundary: false` or raw,

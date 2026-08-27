@@ -8,9 +8,8 @@ the trace UI, scorecards, model cards, and benchmark scoring agree:
   * **Confidence bands** — coarse 0–1 confidence buckets.
   * **Score normalization** — mapping each layer's native score onto one 0–100 scale.
 
-Documented for humans in ``docs/label-semantics.md`` (keep the two in sync — the doc
-quotes these constants). Answers the research question "how to normalize scores
-across layers".
+This module is the reference for normalizing scores from every layer onto one
+shared scale.
 """
 from __future__ import annotations
 

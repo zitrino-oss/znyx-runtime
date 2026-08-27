@@ -1,4 +1,4 @@
-"""Numerical consistency detector (deferred backlog, deterministic).
+"""Numerical consistency detector (deterministic).
 
 Flags EXPLICIT arithmetic equations in text whose stated result is wrong — e.g.
 ``2 + 2 = 5``, ``$10 + $20 = $40``, ``10% + 20% = 35%``. It only evaluates a literal

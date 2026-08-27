@@ -1,19 +1,18 @@
 """Shared API-key authentication with pluggable validation backend.
 
-Historically this module imported directly from ``app.control_plane.db.models``
-— that coupling made the runtime impossible to deploy without the control
-plane's database schema. The abstraction here solves that: the shared layer
-declares a ``AuthValidator`` protocol and a module-level registry, and each
-process (CP, runtime, tests) registers the validator it wants to use at
-startup.
+Historically this module was coupled to one specific database schema, which
+made the runtime impossible to deploy on its own. The abstraction here solves
+that: the shared layer declares a ``AuthValidator`` protocol and a
+module-level registry, and each process (control plane, runtime, tests)
+registers the validator it wants to use at startup.
 
-- Control plane registers a DB-backed validator that looks up APIKey rows.
+- A control plane registers a DB-backed validator that looks up APIKey rows.
 - Runtime (if it ever needs bearer-auth) can register an in-memory validator
-  or an HTTP-proxy validator that calls the CP over the wire.
+  or an HTTP-proxy validator that calls a control plane over the wire.
 - Tests register a stub validator that returns a hand-crafted APIKeyRecord.
 
-The default behaviour is backwards-compatible: if no validator is registered,
-we lazily import the CP DB validator so existing deploys keep working.
+If nothing is registered, resolving a validator raises: authentication fails
+closed rather than falling back to anything implicit.
 """
 from __future__ import annotations
 
@@ -90,10 +89,10 @@ def register_auth_validator(validator: AuthValidator) -> None:
 def register_default_auth_validator_factory(factory: Callable[[], AuthValidator]) -> None:
     """Register the fallback validator factory used when none is explicitly set.
 
-    The control plane registers its DB-backed validator here on import (see
-    ``app/control_plane/__init__.py``). Keeping it in a registry rather than a
-    direct import means ``znyx_core`` carries no ``app.control_plane`` import,
-    so the shared engine ships cleanly in OSS ``znyx-core``.
+    A control plane registers its DB-backed validator here on import. Keeping
+    it in a registry rather than a direct import means ``znyx_core`` carries no
+    control-plane import, so the shared engine ships cleanly in OSS
+    ``znyx-core``.
     """
 
     global _default_validator_factory
@@ -111,7 +110,8 @@ def _default_validator() -> AuthValidator:
     if _default_validator_factory is None:
         raise RuntimeError(
             "No auth validator registered and no default factory available. "
-            "Register one via register_auth_validator() or import app.control_plane."
+            "Register one via register_auth_validator(), or run behind a "
+            "control plane that registers its own validator."
         )
     return _default_validator_factory()
 

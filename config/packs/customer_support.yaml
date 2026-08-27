@@ -184,7 +184,6 @@ deployment_template:
       per_tenant_rpm: 1200
       per_user_rpm: 60
   required_env:
-    - ZNYX_LICENSE_KEY
     - POSTGRES_URL
     - OTEL_ENDPOINT
 

@@ -3,7 +3,7 @@
 # Aadhaar/PAN + NL BSN), forced secret blocking, and self-harm protections
 # appropriate for patient-facing chatbots and clinical workflows.
 #
-# Maintained as an official vertical pack. Load via scripts/seed_packs.py.
+# Maintained as an official vertical pack.
 
 name: healthcare
 display_name: "Healthcare & PHI"
@@ -191,7 +191,7 @@ deployment_template:
     - path: docker-compose.healthcare.yml
       description: "Runtime + control plane wired for healthcare defaults"
     - path: env.healthcare.example
-      description: "Required env vars: ZNYX_LICENSE_KEY, POSTGRES_URL, OTEL_ENABLED=true"
+      description: "Required env vars: POSTGRES_URL, OTEL_ENABLED=true"
   helm_values_example:
     runtime:
       replicas: 3
@@ -203,7 +203,6 @@ deployment_template:
       trace_storage: true
       retention_days: 2555  # 7 years for HIPAA
   required_env:
-    - ZNYX_LICENSE_KEY
     - POSTGRES_URL
     - OTEL_ENDPOINT
     - TRACE_STORAGE_ENABLED
@@ -240,7 +239,7 @@ evidence_summary:
     - "Jailbreak detection fires at WARN severity; a policy tier upgrade to BLOCK is available via the jailbreak detector's action config"
   out_of_scope:
     - "HL7 FHIR payload parsing (use a pre-processor)"
-    - "DICOM image PHI burned into pixels (requires OCR - see roadmap #10)"
+    - "DICOM image PHI burned into pixels (requires OCR; not yet supported)"
     - "Clinical decision support correctness (not a guardrail concern)"
   limitations:
     - "Detection is pattern-based; novel local identifier formats require custom detector registration"
