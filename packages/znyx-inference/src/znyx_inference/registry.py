@@ -18,6 +18,7 @@ import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
 from znyx_inference.batching import BatchProcessor
+from znyx_inference.cache import spec_fingerprint
 from znyx_inference.config import InferenceConfig
 from znyx_inference.contract import ModelInfo
 from znyx_inference.runners.base import Runner, RunnerUnavailable, StubRunner
@@ -85,6 +86,10 @@ class RunnerRegistry:
                 max_wait_ms=self.config.max_wait_ms,
                 max_queue=self.config.max_queue,
                 budget_ms=self.config.budget_ms,
+                # Serving identity beyond the pin: runner kind + full spec digest, so
+                # cache keys distinguish two loads of one model that differ in threshold
+                # or any other spec option (and a reconfigure lands in fresh keys).
+                cache_scope=f"{kind}:{spec_fingerprint(spec)}",
             )
             # When the spec pins a model, that pin IS the served identity (heavy runners
             # already derive model_version from it; the stub reports its own). Keeping the
