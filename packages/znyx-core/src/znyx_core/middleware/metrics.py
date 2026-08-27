@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # Default histogram buckets (seconds) - tuned for HTTP / evaluation latency
 DEFAULT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 
+# Label value that absorbs series once a metric hits its label-set cap
+OVERFLOW_LABEL_VALUE = "other"
+
 
 def _labels_key(labels: Optional[Dict[str, str]]) -> Tuple[Tuple[str, str], ...]:
     """Convert a labels dict to a hashable, sorted tuple of pairs."""
@@ -59,6 +62,12 @@ class MetricsCollector:
         self._initialized = True
 
         self._mu = threading.Lock()
+
+        # Cardinality guard: cap distinct label-sets per metric so unbounded
+        # label values (raw URL paths, client-supplied ids) cannot grow
+        # memory forever. Overflow collapses into a single "other" series.
+        from znyx_core.config.tunables import METRICS_MAX_LABEL_SETS
+        self._max_label_sets = METRICS_MAX_LABEL_SETS
 
         # counters: {name: {labels_key: float}}
         self._counters: Dict[str, Dict[Tuple, float]] = defaultdict(lambda: defaultdict(float))
@@ -105,6 +114,18 @@ class MetricsCollector:
         if metric_type == "histogram":
             self._histogram_buckets[name] = buckets or DEFAULT_BUCKETS
 
+    def _bounded_key(self, series: Dict[Tuple, object],
+                     key: Tuple[Tuple[str, str], ...]) -> Tuple[Tuple[str, str], ...]:
+        """Return ``key``, or an overflow key once the metric is at its cap.
+
+        Existing series keep updating; only NEW label-sets beyond the cap are
+        collapsed (every label value becomes ``other``). Must be called with
+        ``self._mu`` held.
+        """
+        if key in series or len(series) < self._max_label_sets:
+            return key
+        return tuple((k, OVERFLOW_LABEL_VALUE) for k, _ in key)
+
     # ------------------------------------------------------------------
     # Counter
     # ------------------------------------------------------------------
@@ -113,7 +134,8 @@ class MetricsCollector:
                     labels: Optional[Dict[str, str]] = None) -> None:
         key = _labels_key(labels)
         with self._mu:
-            self._counters[name][key] += value
+            series = self._counters[name]
+            series[self._bounded_key(series, key)] += value
 
     # ------------------------------------------------------------------
     # Gauge
@@ -123,19 +145,22 @@ class MetricsCollector:
                   labels: Optional[Dict[str, str]] = None) -> None:
         key = _labels_key(labels)
         with self._mu:
-            self._gauges[name][key] = value
+            series = self._gauges[name]
+            series[self._bounded_key(series, key)] = value
 
     def gauge_inc(self, name: str, value: float = 1.0,
                   labels: Optional[Dict[str, str]] = None) -> None:
         key = _labels_key(labels)
         with self._mu:
-            self._gauges[name][key] += value
+            series = self._gauges[name]
+            series[self._bounded_key(series, key)] += value
 
     def gauge_dec(self, name: str, value: float = 1.0,
                   labels: Optional[Dict[str, str]] = None) -> None:
         key = _labels_key(labels)
         with self._mu:
-            self._gauges[name][key] -= value
+            series = self._gauges[name]
+            series[self._bounded_key(series, key)] -= value
 
     # ------------------------------------------------------------------
     # Histogram
@@ -146,6 +171,7 @@ class MetricsCollector:
         key = _labels_key(labels)
         buckets = self._histogram_buckets.get(name, DEFAULT_BUCKETS)
         with self._mu:
+            key = self._bounded_key(self._histograms[name], key)
             if key not in self._histograms[name]:
                 self._histograms[name][key] = {
                     "buckets": {b: 0 for b in buckets},
@@ -255,7 +281,6 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         method = request.method
-        path = request.url.path
 
         self.collector.gauge_inc("guardrails_active_connections")
         start = time.perf_counter()
@@ -268,6 +293,16 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
         duration = time.perf_counter() - start
         status_code = str(response.status_code)
+
+        # Label by the matched route template ("/items/{item_id}") rather than
+        # the raw path, so path parameters do not create a series per value.
+        # Routing has run by now, so the scope carries the matched route (set
+        # by FastAPI). Unmatched requests fall back to the raw path, which the
+        # collector's label-set cap keeps bounded.
+        route = request.scope.get("route")
+        path = (getattr(route, "path_format", None)
+                or getattr(route, "path", None)
+                or request.url.path)
 
         self.collector.gauge_dec("guardrails_active_connections")
         self.collector.counter_inc(
