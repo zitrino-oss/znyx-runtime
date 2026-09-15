@@ -110,6 +110,36 @@ _TRIGRAM_PROFILES: Dict[str, List[str]] = {
 }
 
 
+# The hand-written profiles above carry two outright data bugs, cleaned once at import:
+#   * repeated rows — "ato" appears 3x in it, "prz"/"ych" 2x each in pl, "ent"/"rea" 2x
+#     in ro — which silently shrink the denominator in _profile_similarity;
+#   * four-character rows — "inte" in sv, "ikke" in da — which can never match a
+#     trigram, so they are dead weight that only ever depresses those two languages.
+#
+# NOT fixed here: the profiles differ in DEPTH (30 rows for en/es/fr/de/it, 20 for the
+# rest). A shallower profile lists individually more-common trigrams, so it earns a
+# higher coverage fraction on equivalent text and can win the argmax for the wrong
+# reason. Equalising by truncating every profile to the shallowest was measured and
+# REJECTED: an 18-row cut falls through the middle of the English profile, dropping the
+# very trigrams ("ith", "nce", "thi", "wit") that carry ordinary English sentences, and
+# hands "This is a perfectly normal English sentence..." to Italian. Closing the depth
+# gap needs real corpus frequencies for the 20-row languages, not a reshuffle of these.
+def _normalise_profile(profile: List[str]) -> List[str]:
+    """Drop non-trigrams and duplicates, preserving descending-frequency order."""
+    seen: Dict[str, None] = {}
+    for trigram in profile:
+        if len(trigram) == 3:
+            seen.setdefault(trigram, None)
+    return list(seen)
+
+
+_CLEAN_PROFILES: Dict[str, List[str]] = {
+    lang: _normalise_profile(profile)
+    for lang, profile in _TRIGRAM_PROFILES.items()
+    if profile                           # script-detected languages carry no trigrams
+}
+
+
 def _get_trigrams(text: str) -> Counter:
     """Extract character trigram frequencies from text."""
     text = re.sub(r"[^a-záàâãäåæçèéêëìíîïðñòóôõöùúûüýþÿœšžğışöüçěřůąćęłńóśźżăîâșțéèêëàâùûôïüöäß]", "", text.lower())
@@ -120,7 +150,11 @@ def _get_trigrams(text: str) -> Counter:
 
 
 def _profile_similarity(text_trigrams: Counter, profile: List[str]) -> float:
-    """Compute similarity between text trigrams and a language profile."""
+    """Fraction of a language's profile found among the text's most frequent trigrams.
+
+    Callers pass a profile from _CLEAN_PROFILES, so the denominator is the profile's
+    de-duplicated length and repeated/oversized rows no longer inflate the score.
+    """
     if not profile or not text_trigrams:
         return 0.0
     profile_set = set(profile)
@@ -154,17 +188,58 @@ class LanguageDetector:
         self.action = config.get("action", "BLOCK")
         self.detect_mixed = config.get("detect_mixed", False)
         self.min_text_length = config.get("min_text_length", 20)
+        # Deliberately CONSERVATIVE, and chosen by measurement rather than taste: over
+        # 14 known-language and 8 noise samples, 0.10 keeps 13/14 true positives while
+        # suppressing gibberish, random filler and code (0.000–0.100).
+        #
+        # What it does NOT do, so nobody reads more into it than is there: it cannot
+        # separate a language from its near neighbours when the neighbour has no
+        # profile. Catalan scores 0.250 as Portuguese and Hungarian 0.143 as Italian —
+        # at or above several genuine detections — so both still pass the gate and are
+        # still mislabelled. Raising the threshold does not fix that; it drops real
+        # detections first (0.15 costs 4 of 14). Only real profile data for those
+        # languages will. See the multilingual-coverage tracker item.
+        self.min_confidence = config.get("min_confidence", 0.10)
+        # Opt back in to BLOCKING on a trigram-identified (Latin-script) language.
+        # OFF by default because that identification is measurably unsound — see
+        # ``detect`` for the evidence and what the downgrade does. Kept as a switch
+        # rather than removed outright so an operator whose traffic is known to be
+        # one Latin language (or who accepts the error rate) can restore the old
+        # behaviour without forking the detector.
+        self.block_on_latin_script = bool(config.get("block_on_latin_script", False))
+
+    # Identification sources. The distinction matters for enforcement: the script
+    # path counts Unicode code points and is essentially exact, while the trigram
+    # path guesses from a hand-written frequency table and frequently guesses wrong.
+    _SOURCE_SCRIPT = "script"
+    _SOURCE_TRIGRAM = "trigram"
+    _SOURCE_NONE = "none"
 
     def _identify_language(self, text: str) -> Tuple[str, float]:
         """
         Identify the primary language of text.
         Returns (language_code, confidence).
+
+        ``min_confidence`` gates the TRIGRAM path only. The script path has its own
+        gate (a script must be >30% of the text) and its confidence is a character-
+        density ratio, not a match score — the two numbers are not on the same scale,
+        so one threshold cannot serve both.
+        """
+        lang, confidence, _ = self._identify_language_with_source(text)
+        return lang, confidence
+
+    def _identify_language_with_source(self, text: str) -> Tuple[str, float, str]:
+        """``_identify_language`` plus WHICH path produced the answer.
+
+        Split out rather than widening ``_identify_language``'s return: that method is
+        part of the detector's de-facto internal API (tests and the mixed-language path
+        call it), and a 2-tuple that silently became a 3-tuple would break them.
         """
         # Step 1: Script-based detection (for non-Latin scripts)
         scripts = _detect_scripts(text)
         total_chars = sum(scripts.values())
         if total_chars == 0:
-            return "unknown", 0.0
+            return "unknown", 0.0, self._SOURCE_NONE
 
         # Find dominant non-Latin script
         for script, count in sorted(scripts.items(), key=lambda x: -x[1]):
@@ -174,25 +249,35 @@ class LanguageDetector:
             if ratio > 0.3 and script in _SCRIPT_LANGUAGES:
                 # Dominant non-Latin script
                 langs = _SCRIPT_LANGUAGES[script]
-                return langs[0], min(ratio + 0.2, 1.0)
+                return langs[0], min(ratio + 0.2, 1.0), self._SOURCE_SCRIPT
 
         # Step 2: Trigram-based detection (for Latin-script languages)
         text_trigrams = _get_trigrams(text)
         if not text_trigrams:
-            return "unknown", 0.0
+            return "unknown", 0.0, self._SOURCE_NONE
 
         best_lang = "unknown"
         best_score = 0.0
 
-        for lang, profile in _TRIGRAM_PROFILES.items():
-            if not profile:
-                continue
+        for lang, profile in _CLEAN_PROFILES.items():
             score = _profile_similarity(text_trigrams, profile)
             if score > best_score:
                 best_score = score
                 best_lang = lang
 
-        return best_lang, best_score
+        # The argmax above always names SOME language, including for text in a language
+        # with no profile at all (Vietnamese, Hungarian, Czech, Indonesian...) and for
+        # gibberish. Handing detect() a label it barely matched means enforcing an
+        # allowlist against a guess, so below min_confidence report 'unknown' instead —
+        # which detect() already treats as "do not enforce".
+        if best_score < self.min_confidence:
+            logger.debug(
+                "language: best match '%s' scored %.3f, below min_confidence %.2f — "
+                "reporting 'unknown'", best_lang, best_score, self.min_confidence,
+            )
+            return "unknown", best_score, self._SOURCE_NONE
+
+        return best_lang, best_score, self._SOURCE_TRIGRAM
 
     def _detect_mixed_languages(self, text: str) -> List[str]:
         """Detect if text contains multiple languages."""
@@ -222,7 +307,7 @@ class LanguageDetector:
         rule_hits: List[RuleHit] = []
 
         # Detect primary language
-        lang, confidence = self._identify_language(text)
+        lang, confidence, source = self._identify_language_with_source(text)
 
         # Check blocked languages
         if lang in self.blocked_languages:
@@ -259,10 +344,48 @@ class LanguageDetector:
         risk_score = min(100, high_count * 60 + (len(rule_hits) - high_count) * 20)
 
         decision = Decision.BLOCK if self.action == "BLOCK" else Decision.WARN
+        developer_message = f"language: detected '{lang}' (confidence={confidence:.2f})"
+
+        # Do not BLOCK on a Latin-script guess.
+        #
+        # The trigram path scores a language as (profile entries matched / profile
+        # length), so a SHORTER profile scores higher on identical evidence. Profiles
+        # are hand-written at unequal depth (pt=20, da=19 vs es=29, fr=30, de=30), and
+        # the short ones win systematically. Measured on paragraph-length text with
+        # correct diacritics: Spanish→pt (0.350), French→pt (0.350), German→da (0.316).
+        # For the Spanish sample the text matched the SAME six pan-Romance trigrams in
+        # both the es and pt profiles; pt won only on the smaller denominator.
+        #
+        # The practical consequence is that a policy of blocked_languages=["pt"] blocks
+        # that customer's Spanish and French users, and allowed_languages=["es"] blocks
+        # their Spanish ones — confidently, with no signal that the label is a guess.
+        #
+        # ``min_confidence`` cannot fix this and is not a substitute: the WRONG answers
+        # score 0.30-0.35, ABOVE most correct ones, so no threshold separates them.
+        # Three alternative scoring functions (depth-equalised truncation, frequency-
+        # weighting, rank-weighting) were measured and none beat the current one; the
+        # profiles themselves have to be rebuilt from real corpus data. Until then the
+        # honest enforcement posture is to report, not to act.
+        #
+        # The SCRIPT path is untouched: it counts Unicode code points, so Cyrillic /
+        # CJK / Arabic / Hebrew / Greek / Thai identification is exact and still BLOCKs.
+        # Only hits that DEPEND on the unreliable label are downgraded — a script-based
+        # mixed_content hit still blocks on its own, as before.
+        if (decision == Decision.BLOCK
+                and source == self._SOURCE_TRIGRAM
+                and not self.block_on_latin_script):
+            label_dependent = {"language.blocked_language", "language.not_in_allowed"}
+            if all(h.rule_id in label_dependent for h in rule_hits):
+                decision = Decision.WARN
+                developer_message += (
+                    " — downgraded BLOCK→WARN: Latin-script identification is by trigram"
+                    " match and cannot reliably separate related languages (es/pt/fr,"
+                    " de/da). Set language.block_on_latin_script=true to enforce anyway."
+                )
 
         return DetectorResult(
             decision=decision,
             risk_score=risk_score,
             rule_hits=rule_hits,
-            developer_message=f"language: detected '{lang}' (confidence={confidence:.2f})",
+            developer_message=developer_message,
         )

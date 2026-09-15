@@ -216,6 +216,19 @@ class DetectorOrchestrator:
 
         effective_policy = {**policy, **alias_overrides}
 
+        # benchmark_mode: measuring a model is not enforcing against it. A benchmark
+        # denies no request, so the scorecard gate has nothing to protect — and leaving it
+        # on is circular: a benchmark is how a detector EARNS the scorecard that the gate
+        # demands, so gating it means the run reports WARN for every BLOCK the model got
+        # right and the accuracy it publishes describes the gate, not the model. Off only
+        # for this in-memory evaluation; `validate_policy_strict` refuses to publish a
+        # policy carrying the flag, so it can never reach an environment serving traffic.
+        # isinstance, not `or {}`: a malformed runtime_policy (a string, a list) must leave
+        # the gate ON and never raise — this runs on the enforcement path, so crashing here
+        # would take out policy evaluation entirely.
+        _rp = effective_policy.get("runtime_policy")
+        gate_enabled = not (isinstance(_rp, dict) and _rp.get("benchmark_mode"))
+
         for policy_key, default_enabled, ctx_filter, can_transform in _DETECTOR_PIPELINE:
             config = effective_policy.get(policy_key, {})
             if not config.get('enabled', False):
@@ -281,7 +294,8 @@ class DetectorOrchestrator:
             # gate didn't pass (stamped into the policy at publish via `_scorecard_gate`)
             # has its BLOCK/REDACT downgraded to WARN. Defence in depth — the publish-time
             # blocker is primary; this protects DB-less runtimes honouring a stamped bundle.
-            result = self._verify_and_apply_scorecard_gate(policy_key, config, result)
+            result = self._verify_and_apply_scorecard_gate(
+                policy_key, config, result, gate_enabled=gate_enabled)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             orch.results.append(result)
 
@@ -354,7 +368,8 @@ class DetectorOrchestrator:
                 std_key, DetectorResult(decision=Decision.ALLOW, risk_score=0),
                 std_strategy, orch.current_text, request=request,
                 egress_sink=self.egress_sink, judge_caller=judge_caller)
-            result = self._verify_and_apply_scorecard_gate(std_key, std_config, result)
+            result = self._verify_and_apply_scorecard_gate(
+                std_key, std_config, result, gate_enabled=gate_enabled)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             orch.results.append(result)
             if result.decision == Decision.BLOCK:
@@ -452,7 +467,8 @@ class DetectorOrchestrator:
         return detector.detect(text)
 
     def _verify_and_apply_scorecard_gate(self, detector_id: str, config: Dict[str, Any],
-                                         result: "DetectorResult") -> "DetectorResult":
+                                         result: "DetectorResult", *,
+                                         gate_enabled: bool = True) -> "DetectorResult":
         """Instance wrapper that adds tamper-evident stamp verification (console-less tier)
         on top of the pure ``_apply_scorecard_gate`` decision logic.
 
@@ -461,7 +477,13 @@ class DetectorOrchestrator:
         this detector + model_version + validated_at; otherwise the stamp is neutralised
         (forced to not-passed) so the gate downgrades BLOCK/REDACT to WARN. With no key
         configured this is a pass-through (trust mode), so behaviour is unchanged for managed
-        bundles (protected by the bundle signature) and for existing unsigned YAML."""
+        bundles (protected by the bundle signature) and for existing unsigned YAML.
+
+        ``gate_enabled=False`` (benchmark_mode) skips the gate entirely so the model's own
+        verdict is what the caller observes — see ``_run``. Defaults to True so every other
+        caller keeps today's fail-closed behaviour."""
+        if not gate_enabled:
+            return result
         if self._scorecard_public_key and isinstance(config, dict):
             gate = config.get("_scorecard_gate")
             if isinstance(gate, dict) and gate.get("enforcement_passed") is True:

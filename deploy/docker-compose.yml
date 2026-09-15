@@ -79,6 +79,10 @@ services:
     environment:
       PORT: "9000"
       ZNYX_INFERENCE_ARTIFACTS_DIR: "/models"
+      # Load the full canonical ML task catalog (classifier/nli/embedding pins for every
+      # task in ml_catalog.py) instead of the 3-task stub default. Artifacts already fetched
+      # into the inference-models volume load straight from local cache — no re-download.
+      ZNYX_INFERENCE_PROFILE: "heavy"
       # No control-plane settings here, deliberately. Model provisioning is driven by the
       # runtime over the compose network (POST /v1/models/desired), so this service holds no
       # credential and reads no policy. With no runtime attached it simply serves whatever is

@@ -361,6 +361,21 @@ class LanguageConfig(DetectorConfig):
     blocked_languages: Optional[List[str]] = None
     detect_mixed: bool = False
     min_text_length: int = 20
+    # Trigram-path confidence floor. Below it the detector reports 'unknown' and
+    # enforces nothing, rather than blocking on a low-scoring guess. Raise to trade
+    # missed detections for fewer false blocks; 0.0 restores the pre-gate behaviour.
+    # Does not apply to the script path (Cyrillic/CJK/Arabic/...), which gates on
+    # its own >30% character-density rule.
+    min_confidence: float = Field(default=0.10, ge=0.0, le=1.0)
+    # Allow BLOCK on a Latin-script (trigram-identified) language. OFF by default:
+    # that identification mistakes Spanish and French for Portuguese and German for
+    # Danish on ordinary text, because the score divides by profile length and the
+    # hand-written profiles are of unequal depth. With this off, such findings are
+    # reported as WARN and the rule hits are unchanged; non-Latin scripts (Cyrillic,
+    # CJK, Arabic, ...) are identified by code point and still BLOCK either way.
+    # Turn on only if the traffic is known to be a single Latin language, or the
+    # false-block rate is acceptable. See LanguageDetector.detect for the measurements.
+    block_on_latin_script: bool = False
 
 
 class BiasConfig(DetectorConfig):
@@ -774,6 +789,23 @@ def validate_policy_strict(policy_dict: dict) -> PolicyValidationResult:
                     "detector or setting and will be ignored by the engine."
                 ),
             ))
+
+    # benchmark_mode disables the scorecard enforcement gate, which is only ever correct
+    # for an in-memory benchmark evaluation (see benchmark_worker._as_benchmark_policy).
+    # A BLOCKER, not a warning: in a published policy it is an enforcement bypass, letting
+    # an unproven model-backed detector BLOCK live traffic with no passing scorecard. The
+    # worker sets it on the claimed policy at evaluation time and never persists it, so a
+    # policy reaching this function with the flag set is a misuse.
+    rp = policy_dict.get("runtime_policy")
+    if isinstance(rp, dict) and rp.get("benchmark_mode"):
+        blockers.append(PolicyValidationIssue(
+            code="benchmark_mode_not_publishable", loc="runtime_policy.benchmark_mode",
+            message=(
+                "'runtime_policy.benchmark_mode' disables the scorecard enforcement gate "
+                "and cannot be published. It is set by the benchmark worker for a single "
+                "evaluation; remove it from the policy."
+            ),
+        ))
 
     return PolicyValidationResult(valid=not blockers, blockers=blockers, warnings=warnings)
 

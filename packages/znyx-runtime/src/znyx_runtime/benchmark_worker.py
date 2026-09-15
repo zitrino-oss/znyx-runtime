@@ -54,6 +54,29 @@ _POLL_MIN_SECONDS = 5.0
 _POLL_MAX_SECONDS = 60.0
 
 
+def _as_benchmark_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark a claimed policy as a benchmark evaluation.
+
+    ``runtime_policy.benchmark_mode`` turns off the scorecard enforcement gate for this
+    evaluation only. The gate exists to stop an unproven model-backed detector from
+    BLOCKing real traffic, and a benchmark is not real traffic — it denies no request.
+    Leaving it on is circular: the benchmark is how a detector earns the scorecard the
+    gate demands, so every BLOCK the model got right would be recorded as WARN and the
+    accuracy published under ``model_id@revision`` would describe the gate, not the model.
+
+    Copied rather than mutated: the claim response is the control plane's policy and is
+    also what a caller may log. The flag is never written back — and
+    ``validate_policy_strict`` refuses to publish a policy carrying it, so it cannot reach
+    an environment that serves traffic.
+    """
+    # isinstance rather than `or {}`: a malformed runtime_policy would make the dict
+    # unpack below raise, failing a whole run over a policy defect the engine itself
+    # tolerates. Replacing a non-dict is the same outcome the engine reaches anyway.
+    existing = policy.get("runtime_policy")
+    base = existing if isinstance(existing, dict) else {}
+    return {**policy, "runtime_policy": {**base, "benchmark_mode": True}}
+
+
 class BenchmarkWorker:
     """Claims queued benchmark runs and evaluates them against the local sidecar."""
 
@@ -126,7 +149,7 @@ class BenchmarkWorker:
             return False
 
         run_id = claimed.get("run_id")
-        policy = claimed.get("policy") or {}
+        policy = _as_benchmark_policy(claimed.get("policy") or {})
         total = int(claimed.get("total_samples") or 0)
         logger.info("benchmark-worker: claimed run %s (%s samples)", run_id, total)
 
