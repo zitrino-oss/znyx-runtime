@@ -11,8 +11,8 @@ Supported actions:
     fix        - strip the offending text (uses sanitized_text or regex)
     filter_field - remove named JSON fields from structured output
     refrain    - replace the output with a canned "I can't help with that" message
-    exception  - signal the caller to raise an error
-    custom     - delegate to a user-supplied handler name (future extension)
+    exception  - block and carry an error the SDK turns into a raise
+    custom     - delegate to a user-supplied handler registered by name
 """
 import json
 import logging
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # Default canned responses
 _DEFAULT_REFRAIN = "I'm unable to provide that response."
 _DEFAULT_REASK = "Your previous response was flagged. Please rephrase your answer."
+_DEFAULT_EXCEPTION = "Guardrail violation detected"
 
 # Same "~/.znyx/<name>.spool" convention as znyx_runtime.audit_sink._DEFAULT_SPOOL /
 # znyx_runtime.judge_audit_sink._DEFAULT_JUDGE_SPOOL, so a single-host deploy has the
@@ -199,6 +200,42 @@ class RemediationHandler:
                     idx = parts.index("review_id") if "review_id" in parts else -1
                     if idx >= 0 and idx + 1 < len(parts):
                         response.pending_review_id = parts[idx + 1]
+            elif action == RemediationAction.EXCEPTION:
+                # The runtime is an HTTP service and cannot raise inside the caller's
+                # process, so "raise" is expressed as a BLOCK carrying the error; the SDK
+                # turns it into an exception, distinguishing it from an ordinary block by
+                # ``response.remediation.action``.
+                #
+                # Without this branch the action was inert: ``_do_exception`` attached the
+                # message to ``response.remediation.error`` and nothing ever read it, so a
+                # policy asking to hard-fail silently got whatever the detector decided —
+                # including WARN, i.e. the request went through. Failing OPEN is the worst
+                # possible reading of an on_fail named "exception".
+                message = result.error or _DEFAULT_EXCEPTION
+                response.decision = Decision.BLOCK
+                response.user_message = message
+                response.developer_message = message
+            elif action == RemediationAction.CUSTOM:
+                # Consume what the handler returned, with the same meanings the built-in
+                # actions give these fields, so a custom handler is a peer of fix/refrain
+                # rather than a second-class path.
+                #
+                # Before this branch the handler RAN and its result was discarded. That is
+                # worse than not supporting custom handlers at all: the author sees their
+                # handler invoked and its side effects happen, while the response is
+                # untouched — a silent no-op that looks wired up.
+                #
+                # Only reached when the handler reported success. A handler that is missing,
+                # unregistered or raised leaves ``applied`` False and the detector's own
+                # decision stands — which is already non-ALLOW here, so a broken handler
+                # cannot turn a block into a pass.
+                if result.fixed_text is not None:
+                    response.sanitized_text = result.fixed_text
+                    response.decision = Decision.TRANSFORM
+                elif result.refrain_message:
+                    response.sanitized_text = result.refrain_message
+                    response.user_message = result.refrain_message
+                    response.decision = Decision.BLOCK
 
         return response
 
@@ -323,7 +360,7 @@ class RemediationHandler:
         )
 
     def _do_exception(self, config: Dict[str, Any], response: EvaluationResponse) -> RemediationResult:
-        error_msg = config.get("message", "Guardrail violation detected")
+        error_msg = config.get("message", _DEFAULT_EXCEPTION)
         return RemediationResult(
             action=RemediationAction.EXCEPTION,
             applied=True,
