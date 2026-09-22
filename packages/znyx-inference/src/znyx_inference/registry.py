@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 from znyx_inference.batching import BatchProcessor
@@ -24,6 +25,14 @@ from znyx_inference.contract import ModelInfo
 from znyx_inference.runners.base import Runner, RunnerUnavailable, StubRunner
 
 logger = logging.getLogger(__name__)
+
+# Refuse to load a non-stub model whose spec carries no sha256. Off by default so existing
+# unpinned deployments keep working (they get a warning per load instead); on, it makes the
+# integrity claim real — `verify_pinned` can only verify a digest it was given.
+_REQUIRE_PINNED = (
+    os.getenv("ZNYX_INFERENCE_REQUIRE_PINNED", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # runner_kind → factory(task: str, spec: dict) -> Runner. The dependency-free stub is
 # always present; heavy kinds are lazy-imported on demand (their modules don't import
@@ -110,6 +119,22 @@ class RunnerRegistry:
                 logger.info("inference task '%s' (runner=%s) loaded: %s%s",
                            task, kind, model_version,
                            "" if active else " (variant, not the active slot)")
+                # An unpinned real model loaded fine but its bytes were never verified:
+                # `verify_pinned` only checks a digest when the spec carries one, so without
+                # a sha256 the artifact directory is trusted as-is. Say so, once per load —
+                # otherwise a deployment reports itself as serving pinned models while
+                # nothing is actually pinned, and a swapped or truncated artifact loads
+                # silently. ZNYX_INFERENCE_REQUIRE_PINNED=true turns this into a refusal.
+                if not spec.get("sha256"):
+                    if _REQUIRE_PINNED:
+                        raise RunnerUnavailable(
+                            f"model {model_version} has no sha256 pin and "
+                            "ZNYX_INFERENCE_REQUIRE_PINNED is set; add the digest to the "
+                            "task spec (artifact_sha256() computes it) or unset the flag")
+                    logger.warning(
+                        "inference task '%s' is serving %s UNPINNED (no sha256 in its spec) "
+                        "— the artifact is trusted as-is and a swapped or truncated model "
+                        "would load silently", task, model_version)
             return batcher, info
         except Exception as exc:  # noqa: BLE001
             # Any load failure (RunnerUnavailable, or an unexpected OSError/ValueError
@@ -176,6 +201,23 @@ class RunnerRegistry:
 
     def serves(self, task: str, model_id: str, revision: Optional[str] = None) -> bool:
         return self.get_for(task, model_id, revision) is not None
+
+    def active_is_stub(self, task: str) -> bool:
+        """True when the task's ACTIVE slot is the dependency-free StubRunner, whose verdicts
+        are fabricated from keyword heuristics rather than a model."""
+        info = self._models.get(task)
+        return info is not None and info.runner == "stub"
+
+    def real_variants(self, task: str) -> List[str]:
+        """``model_version`` of every loaded non-stub variant for ``task``.
+
+        Used to tell an UNPINNED caller what it could have asked for. Real models arrive as
+        variants (the reconciler loads a pin beside the active slot rather than replacing
+        it), so a deployment can have working weights while the active slot is still a stub.
+        """
+        return [info.model_version
+                for (v_task, _key), info in self._variant_models.items()
+                if v_task == task and info.available and info.runner != "stub"]
 
     def list_models(self) -> List[ModelInfo]:
         return list(self._models.values()) + list(self._variant_models.values())

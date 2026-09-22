@@ -271,11 +271,25 @@ DETECTOR_ML_DEFAULTS: Dict[str, DetectorMLDefault] = {
     "jailbreak":        DetectorMLDefault("jailbreak",        "prompt_injection", (35, 70), 800),
     "toxicity":         DetectorMLDefault("toxicity",         "toxicity",         (40, 75), 800),
     "topic_restriction": DetectorMLDefault("topic_restriction", "topic_intent",   (35, 70), 600),
-    # Additive ML layers (always-run, worst-of): the deterministic decision is preserved and
-    # the ML runner adds what it alone catches. pii_ner = unstructured PII (names/addresses)
-    # on top of the regex/checksum PII redaction; language = the language-aware runner.
+    # Additive ML layer (always-run, worst-of): the deterministic decision is preserved and
+    # the ML runner adds what it alone catches. Correct for pii because the two layers are
+    # COMPLEMENTARY — regex/checksum finds structured PII (cards, SSNs) and pii_ner finds
+    # unstructured entities (names, addresses); the union is the answer, and worst-of never
+    # discards a finding either layer made alone.
     "pii":              DetectorMLDefault("pii",      "pii_ner",  additive=True, timeout_ms=800),
-    "language":         DetectorMLDefault("language", "language", additive=True, timeout_ms=800),
+    # language is NOT additive, despite also being an always-run ML layer. Its two layers are
+    # COMPETING classifiers, not complementary ones: both answer the single question "what
+    # language is this?", so the better answer must win rather than the more alarmist one.
+    # Under worst-of merge the deterministic trigram identifier holds a veto over the model,
+    # and it is far weaker — measured on ml-language-en-es it misread 46/105 plain English
+    # sentences as fr/ro/de/nl at 0.05-0.20 confidence, and its BLOCK overrode the model's
+    # correct ALLOW (P(en)=0.99). That is a 43.8% false-positive rate the model cannot fix
+    # while it can be outvoted, and it fails the enforcement gate's 5% ceiling on its own.
+    # With no band and no additive flag the ML layer always runs and REPLACES the
+    # deterministic result; `fallback_to_deterministic` still covers a sidecar outage, which
+    # is why the deterministic layer also gained a min_confidence floor (see
+    # detectors/language.py) so the fallback cannot block on a low-confidence guess.
+    "language":         DetectorMLDefault("language", "language", timeout_ms=800),
 }
 
 

@@ -153,18 +153,62 @@ def _fallback_result(fallback: str, deterministic_result: DetectorResult, mode: 
     return (deterministic_result, _DETERMINISTIC, f"fallback_to_deterministic:{mode}")
 
 
-def _additive_merge(det: DetectorResult, ml: DetectorResult) -> DetectorResult:
+def apply_redaction_spans(text: str, spans: List[tuple]) -> str:
+    """Replace each (start, end, label) range in ``text`` with ``[LABEL]``.
+
+    Overlaps are resolved longest-match-wins BEFORE anything is replaced, then replacement
+    runs from the end of the string backwards. Both halves matter: replacing from the end
+    keeps earlier offsets valid, but only while the spans are disjoint. Two overlapping
+    spans — a regex EMAIL match and an NER entity landing on the same characters, say —
+    would otherwise have the second replacement index into an already-rewritten string with
+    offsets taken from the original, splicing a fragment of the live text back into the
+    output. Every span here is an offset into ``text`` as evaluated; nothing else is safe.
+    """
+    if not spans:
+        return text
+    ordered = sorted(spans, key=lambda s: (s[0], -(s[1] - s[0])))
+    kept, last_end = [], 0
+    for start, end, label in ordered:
+        if start >= last_end and 0 <= start < end <= len(text):
+            kept.append((start, end, label))
+            last_end = end
+    out = text
+    for start, end, label in reversed(kept):
+        out = out[:start] + f"[{str(label).upper()}]" + out[end:]
+    return out
+
+
+def _additive_merge(det: DetectorResult, ml: DetectorResult,
+                    text: Optional[str] = None) -> DetectorResult:
     """Combine a deterministic result with an additive ML layer's result: worst-of decision,
-    max risk, union of rule_hits, and the deterministic layer's redaction/transform text kept
-    when present (so e.g. regex PII redaction survives while NER adds its unstructured-PII
-    findings). The deterministic decision is never lost — that's the point of additive."""
+    max risk, union of rule_hits, and redaction recomputed from BOTH layers' spans.
+
+    The deterministic decision is never lost — that's the point of additive.
+
+    Redaction is recomputed over the ORIGINAL ``text`` from the union of
+    ``det.redaction_spans`` and ``ml.redaction_spans`` rather than by combining the two
+    layers' already-redacted strings, which cannot be done correctly: the deterministic
+    layer has rewritten the text, so the ML layer's offsets (taken against the original) no
+    longer describe it. Merging in span space and replacing once keeps a single offset
+    space, and lets the overlap resolution handle a regex match and a model entity that
+    cover the same characters.
+
+    Without spans from either side, or without ``text``, this falls back to the previous
+    behaviour of preferring the deterministic layer's sanitized text — so a model that
+    reports only a score (no offsets) still can't claim a redaction it didn't perform.
+    """
     from znyx_core.core.labels import decision_rank
     keep = det if decision_rank(det.decision) >= decision_rank(ml.decision) else ml
-    return keep.model_copy(update={
+    update = {
         "risk_score": max(det.risk_score, ml.risk_score),
         "rule_hits": list(det.rule_hits) + list(ml.rule_hits),
         "sanitized_text": det.sanitized_text or ml.sanitized_text,
-    })
+    }
+    spans = list(det.redaction_spans or []) + list(ml.redaction_spans or [])
+    if spans and text is not None:
+        update["sanitized_text"] = apply_redaction_spans(text, spans)
+        update["redaction_spans"] = spans
+    return keep.model_copy(update=update)
 
 
 def _layer_from_result(mode: str, result: DetectorResult, selected: bool) -> LayerResult:
@@ -315,7 +359,10 @@ def run_with_strategy(
     # replacing it. Only when a real ML result was selected (no fallback fired) — a
     # fallback already preserves the deterministic decision on its own.
     if strategy.additive and fallback_path is None and selected_mode != _DETERMINISTIC:
-        selected_result = _additive_merge(deterministic_result, selected_result)
+        # `text` is the string BOTH layers scored, so it is the one offset space every
+        # span refers to — redaction is recomputed against it, never against either
+        # layer's already-rewritten copy.
+        selected_result = _additive_merge(deterministic_result, selected_result, text)
         det_layer.selected = True  # both layers contributed to the additive verdict
 
     return selected_result.model_copy(update={

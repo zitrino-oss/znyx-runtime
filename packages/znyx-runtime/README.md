@@ -20,8 +20,18 @@ The runtime is deliberately thin: FastAPI, uvicorn, httpx, and
 No database, no heavy ML libraries. Point it at a sidecar endpoint to enable
 model-backed detectors; without one, it runs the deterministic rules path.
 
+A model-backed detector is held at advisory `WARN` until it has been measured
+against a labelled dataset. The second subcommand is how you do that, with no
+control plane involved:
+
+```bash
+znyx-runtime benchmark --bundle policies.yaml --detector toxicity \
+    --dataset labelled.jsonl --stamp
+```
+
 See the [repository README](https://github.com/zitrino-oss/znyx-runtime) for
-configuration, deployment manifests, and the evaluate API.
+configuration, deployment manifests, the evaluate API, and the dataset format and
+gate thresholds that command uses.
 
 ## License
 

@@ -41,13 +41,30 @@ class LanguageRunner(OnnxTextRunner):
             return self._output(0.0, None)
         eff_allowed = allowed if allowed is not None else self._allowed
         eff_blocked = blocked if blocked is not None else self._blocked
-        top_lang, top_p = max(lang_probs.items(), key=lambda kv: kv[1])
-        tl = top_lang.lower()
         unsafe = 0.0
-        if eff_blocked and tl in eff_blocked:
-            unsafe = top_p
-        elif eff_allowed and tl != "unknown" and tl not in eff_allowed:
-            unsafe = top_p
+        if eff_blocked:
+            # Blocklist: the probability mass sitting ON blocked languages. Summed rather
+            # than top-only, so two blocked languages splitting the mass still add up.
+            unsafe = sum(p for lang, p in lang_probs.items()
+                         if lang.lower() in eff_blocked)
+        elif eff_allowed:
+            # Allowlist: the mass OUTSIDE the allowed set — deliberately NOT the top label's
+            # probability. An allowlist asks "is this an allowed language?", and deciding on
+            # the top label answers a different question ("which banned language is it?"),
+            # which fails OPEN for any language absent from the model's label set: the model
+            # must spread its mass over labels it knows, so no single one clears the
+            # threshold. Danish scores top `tr`=0.22 — under a 0.5 threshold that ALLOWS
+            # Danish through an English-only policy. Mass-based, the same input reads
+            # 1 - P(en) = 1 - 0.058 = 0.94 and is correctly blocked. The model never has to
+            # name the language; being confident it is not English is enough.
+            #
+            # NOTE: unlike the previous top-label rule, an "unknown"/"other" label is no
+            # longer exempt — its mass is outside the allowed set, so it counts as risk.
+            # For an allowlist that is the correct reading: "I cannot tell that this is
+            # English" must not mean "allow".
+            allowed_mass = sum(p for lang, p in lang_probs.items()
+                               if lang.lower() in eff_allowed)
+            unsafe = max(0.0, 1.0 - allowed_mass)
         return self._output(unsafe, lang_probs)
 
     def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:

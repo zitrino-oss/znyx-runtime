@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, List, Literal, Tuple
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -415,6 +415,19 @@ class DetectorResult(BaseModel):
     threshold: Optional[float] = Field(default=None, description="Decision threshold applied to the selected layer")
     calibration_dataset_id: Optional[str] = Field(default=None, description="Dataset id the calibration was fit on")
     layer_results: List[LayerResult] = Field(default_factory=list, description="One entry per execution-mode attempt (escalation)")
+    # Character ranges of the ORIGINAL evaluated text this layer wants replaced, as
+    # (start, end, label) with end exclusive. Populated by a token-level model (NER) through
+    # the RemoteDetector, and by a deterministic detector reporting its own redactable matches.
+    #
+    # It exists so redaction is computed ONCE, over the original text, from every layer's
+    # spans together. Redacting per layer cannot work: the first layer rewrites the string, so
+    # the second layer's offsets — taken against the original — land at shifted positions and
+    # splice fragments of the live PII back into the output. Offsets are only meaningful
+    # against the exact text that was evaluated.
+    redaction_spans: List[Tuple[int, int, str]] = Field(
+        default_factory=list,
+        description="(start, end, label) character ranges this layer would redact",
+    )
 
     @field_validator("label_scores")
     @classmethod

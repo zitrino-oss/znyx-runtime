@@ -32,7 +32,12 @@ def transport(monkeypatch):
 
     monkeypatch.setattr(remote_mod, "httpx",
                         types.SimpleNamespace(AsyncClient=factory))
-    return holder
+    # The detector pools its client per event loop and the loop is process-wide, so a client
+    # built from a previous test's factory would still be cached here — serving this test's
+    # requests to the previous test's handler. Drop the pool on both sides of the test.
+    remote_mod.reset_transport_pool()
+    yield holder
+    remote_mod.reset_transport_pool()
 
 
 def _detector(**overrides):

@@ -154,6 +154,24 @@ class LanguageDetector:
         self.action = config.get("action", "BLOCK")
         self.detect_mixed = config.get("detect_mixed", False)
         self.min_text_length = config.get("min_text_length", 20)
+        # Below this identification confidence the language is treated as unidentified and
+        # NO allow/block rule is applied (fail-open) rather than enforcing a guess.
+        #
+        # 0.5 is not arbitrary — it is the seam between this detector's two identification
+        # paths, which differ enormously in quality:
+        #   * script detection (Arabic/CJK/Thai/Cyrillic/...) returns min(ratio+0.2, 1.0)
+        #     for a dominant script, so a real hit is ALWAYS >= 0.5. Reliable: a different
+        #     alphabet is unambiguous. Still enforced.
+        #   * trigram profile matching (Latin-script languages) returns raw profile
+        #     similarity, measured at <= 0.37 across every sample of ml-language-en-es —
+        #     correct and incorrect identifications overlap almost completely (English:
+        #     correct median 0.167 vs wrong median 0.100). It misread 46/105 plain English
+        #     sentences as fr/ro/de/nl and BLOCKED them. Not fit to enforce; now suppressed.
+        # So the default keeps the trustworthy signal and switches off the noise. Latin-script
+        # language policy is the ML layer's job (see ml_catalog DETECTOR_ML_DEFAULTS), and
+        # this detector is the sidecar-outage fallback — a fallback must not block 44% of
+        # legitimate traffic. Set 0.0 to restore the old enforce-any-guess behaviour.
+        self.min_confidence = float(config.get("min_confidence", 0.5))
 
     def _identify_language(self, text: str) -> Tuple[str, float]:
         """
@@ -224,6 +242,13 @@ class LanguageDetector:
         # Detect primary language
         lang, confidence = self._identify_language(text)
 
+        # An identification we do not trust enforces nothing. Downgrade it to "unknown" so
+        # both the blocked- and allowed-list checks below skip it, rather than blocking on a
+        # guess (see min_confidence). The language is still reported in developer_message.
+        identified = lang
+        if confidence < self.min_confidence:
+            lang = "unknown"
+
         # Check blocked languages
         if lang in self.blocked_languages:
             rule_hits.append(RuleHit(
@@ -264,5 +289,6 @@ class LanguageDetector:
             decision=decision,
             risk_score=risk_score,
             rule_hits=rule_hits,
-            developer_message=f"language: detected '{lang}' (confidence={confidence:.2f})",
+            developer_message=(f"language: detected '{identified}' "
+                               f"(confidence={confidence:.2f})"),
         )

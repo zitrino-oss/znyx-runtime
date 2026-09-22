@@ -2,7 +2,7 @@
 extended RemoteDetector speaks. Kept dependency-free (pydantic only)."""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -50,6 +50,22 @@ class InferResult(BaseModel):
     calibrated_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     threshold: Optional[float] = None
     model_version: str                              # model_id@revision (stable)
+    # Character ranges in the request text attributed to an entity: [start, end, label],
+    # end-exclusive. Only token-level runners (NER) emit this; it lets a REDACT-action
+    # detector replace what the model found instead of only learning that it exists.
+    # Offsets are relative to the text AS SENT — apply them to that exact string.
+    entity_spans: Optional[List[Tuple[int, int, str]]] = None
+
+    @field_validator("entity_spans")
+    @classmethod
+    def _spans_are_well_formed(cls, v):
+        """Reject inverted or negative ranges at the boundary. A bad span would be spliced
+        straight into a redaction, so it must not reach a caller as a valid-looking one."""
+        if v is not None:
+            for start, end, _label in v:
+                if start < 0 or end <= start:
+                    raise ValueError(f"entity span ({start}, {end}) is not a forward range")
+        return v
 
     @field_validator("label_scores")
     @classmethod

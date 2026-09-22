@@ -19,6 +19,7 @@ needs no API key and no outbound internet access beyond fetching model weights.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -43,6 +44,14 @@ from znyx_inference.registry import RunnerRegistry
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
 logger = logging.getLogger(__name__)
+
+# Escape hatch for _resolve_batcher's unpinned-request guard: accept a StubRunner verdict
+# even when the task has real weights loaded. Off by default — a fabricated verdict that
+# looks like a real one is the more dangerous default.
+_ALLOW_STUB_WHEN_REAL_LOADED = (
+    os.getenv("ZNYX_INFERENCE_ALLOW_STUB_WHEN_REAL_LOADED", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 
 @asynccontextmanager
@@ -75,6 +84,8 @@ def _result(out, model_version: str) -> InferResult:
         decision=out.decision, risk_score=out.risk_score, confidence=out.confidence,
         label_scores=out.label_scores, calibrated_score=out.calibrated_score,
         threshold=out.threshold, model_version=model_version,
+        # getattr: the StubRunner and older runner builds have no such attribute
+        entity_spans=getattr(out, "entity_spans", None),
     )
 
 
@@ -88,6 +99,23 @@ def _resolve_batcher(registry: RunnerRegistry, task: str, req: InferRequest):
         batcher = registry.get(task)
         if batcher is None:
             raise HTTPException(status_code=503, detail=f"task '{task}' unavailable")
+        # Same principle as the 409 below, applied to the unpinned case: when real weights
+        # are loaded for this task but the active slot is still the stub, an unpinned request
+        # would be answered by the StubRunner — whose verdict is a keyword heuristic, not a
+        # model, and which returns a confident-looking BLOCK at risk 100. A caller reading
+        # `decision`/`risk_score` cannot tell that apart from a real inference, so a
+        # deployment that has working weights must not hand back a fabricated one. Refuse and
+        # name the model to pin. (Deployments with no real weights are unaffected — the stub
+        # is then the honest answer and this branch never fires.)
+        if registry.active_is_stub(task):
+            available = registry.real_variants(task)
+            if available and not _ALLOW_STUB_WHEN_REAL_LOADED:
+                raise HTTPException(status_code=409, detail=(
+                    f"task '{task}' has real weights loaded but its active slot is the stub; "
+                    f"pin a model to be scored by it (available: {', '.join(available)}). "
+                    f"Serve them in the active slot via ZNYX_INFERENCE_TASKS, or set "
+                    f"ZNYX_INFERENCE_ALLOW_STUB_WHEN_REAL_LOADED=true to accept stub output."
+                ))
         return batcher, registry.model_version(task) or "unknown"
 
     resolved = registry.get_for(task, req.model_id, req.revision)
