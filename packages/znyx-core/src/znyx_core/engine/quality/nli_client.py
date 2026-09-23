@@ -55,22 +55,77 @@ class NliEgressPolicy:
     model_version: Optional[str] = None
 
 
-def _entailment_from_result(result: Dict[str, Any]) -> float:
-    """Entailment probability from one ``InferResult``.
+class ClaimScore(float):
+    """Entailment probability that also carries the full NLI label distribution.
 
-    Prefers an explicit ``label_scores["entailment"]``; otherwise derives it from the
-    contract's ``risk_score`` (the NLI runner sets ``risk = 1 - entailment``)."""
-    label_scores = result.get("label_scores")
-    if isinstance(label_scores, dict) and "entailment" in label_scores:
-        try:
-            return min(1.0, max(0.0, float(label_scores["entailment"])))
-        except (TypeError, ValueError):
-            pass
-    risk = result.get("risk_score")
+    Subclasses ``float`` so the published ``(premise, hypotheses) -> list[float]``
+    contract is unchanged - every existing consumer keeps comparing, ordering and
+    ``max()``-ing these exactly as before, and a plain float from an injected test
+    scorer stays valid.
+
+    The extra labels exist because entailment alone cannot separate the two ways a
+    claim fails to be entailed, and they need opposite handling:
+
+    * ``neutral``       - the source does not speak to this claim. Unsupported, NOT false.
+    * ``contradiction`` - the source states the opposite. This is the real hallucination.
+
+    Scoring only on ``1 - entailment`` collapses those into one number, which ranks a
+    truthful paraphrase (high neutral) below an outright false claim (high
+    contradiction). See ``HallucinationDetector`` for the banding that uses this.
+
+    ``labelled`` is False when the sidecar returned only ``risk_score`` and the label
+    distribution had to be derived: contradiction is then unrecoverable, so a consumer
+    must not read ``contradiction == 0.0`` as evidence of non-contradiction.
+    """
+
+    __slots__ = ("entailment", "contradiction", "neutral", "labelled")
+
+    def __new__(cls, entailment: float, contradiction: float = 0.0,
+                neutral: float = 0.0, labelled: bool = False) -> "ClaimScore":
+        obj = super().__new__(cls, entailment)
+        obj.entailment = float(entailment)
+        obj.contradiction = float(contradiction)
+        obj.neutral = float(neutral)
+        obj.labelled = bool(labelled)
+        return obj
+
+
+def _clamp01(value: Any) -> Optional[float]:
     try:
-        return min(1.0, max(0.0, 1.0 - float(risk) / 100.0))
+        return min(1.0, max(0.0, float(value)))
     except (TypeError, ValueError):
-        return 0.0
+        return None
+
+
+def _claim_score_from_result(result: Dict[str, Any]) -> ClaimScore:
+    """Full label distribution from one ``InferResult``.
+
+    Prefers explicit ``label_scores`` (the NLI runner emits contradiction/neutral/
+    entailment); otherwise derives entailment from the contract's ``risk_score``
+    (``risk = 1 - entailment``) and marks the result unlabelled, since contradiction
+    cannot be recovered from a single scalar."""
+    label_scores = result.get("label_scores")
+    if isinstance(label_scores, dict):
+        # Models spell these "entailment" / "ENTAILMENT" / "Entailment".
+        lower = {str(k).lower(): v for k, v in label_scores.items()}
+        entail = _clamp01(lower.get("entailment"))
+        if entail is not None:
+            return ClaimScore(
+                entail,
+                contradiction=_clamp01(lower.get("contradiction")) or 0.0,
+                neutral=_clamp01(lower.get("neutral")) or 0.0,
+                labelled=True,
+            )
+    risk = _clamp01(result.get("risk_score") if result.get("risk_score") is None
+                    else float(result.get("risk_score")) / 100.0)
+    entail = 0.0 if risk is None else 1.0 - risk
+    return ClaimScore(entail, labelled=False)
+
+
+def _entailment_from_result(result: Dict[str, Any]) -> float:
+    """Entailment probability from one ``InferResult``. Retained as the narrow
+    entailment-only view of :func:`_claim_score_from_result`."""
+    return float(_claim_score_from_result(result))
 
 
 def make_inference_nli_scorer(
@@ -162,7 +217,7 @@ def make_inference_nli_scorer(
             got = len(results) if isinstance(results, list) else "n/a"
             raise ValueError(
                 f"inference NLI returned {got} results for {len(hypotheses)} hypotheses")
-        return [_entailment_from_result(r) for r in results]
+        return [_claim_score_from_result(r) for r in results]
 
     return scorer
 
