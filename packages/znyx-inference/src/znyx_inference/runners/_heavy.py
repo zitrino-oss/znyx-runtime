@@ -47,7 +47,8 @@ class HeavyRunner(Runner):
             return "WARN"
         return "ALLOW"
 
-    def _output(self, unsafe_prob: float, label_scores: Dict[str, float] | None = None) -> InferOutput:
+    def _output(self, unsafe_prob: float, label_scores: Dict[str, float] | None = None,
+                entity_spans=None) -> InferOutput:
         unsafe_prob = max(0.0, min(1.0, float(unsafe_prob)))
         # Defensively clamp every label score into the contract's [0,1] range so a
         # runner's raw value (e.g. a negative cosine) can't turn a successful inference
@@ -62,6 +63,7 @@ class HeavyRunner(Runner):
             calibrated_score=round(unsafe_prob, 4),
             label_scores=label_scores,
             threshold=self.threshold,
+            entity_spans=entity_spans or None,
         )
 
     def infer_batch(self, texts: List[str], params: dict | None = None) -> List[InferOutput]:

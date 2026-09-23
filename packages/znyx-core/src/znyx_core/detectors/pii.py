@@ -1214,6 +1214,14 @@ class PIIDetector:
                 risk_score=risk_score,
                 rule_hits=rule_hits,
                 sanitized_text=sanitized_text,
+                # Publish the spans alongside the redacted text. An additive ML layer (the
+                # pii_ner model) finds entities this regex layer cannot — names, addresses —
+                # and reports them as offsets into the SAME original text. Redaction has to
+                # be recomputed from both sets together (see escalation._additive_merge),
+                # because applying the model's original-text offsets to `sanitized_text`
+                # (already rewritten here) would splice at shifted positions.
+                redaction_spans=[(s, e, t) for s, e, t, _m, cfg in pii_spans
+                                 if self._get_type_action(cfg) == 'REDACT'],
                 developer_message=f"PII redacted: {len(rule_hits)} item(s)"
             )
 
@@ -1360,14 +1368,43 @@ class PIIDetector:
         if not spans:
             return text
 
-        # Sort spans by start position in reverse to replace from end to start
-        sorted_spans = sorted(spans, key=lambda x: x[0], reverse=True)
+        # Only types whose action is REDACT rewrite the text; BLOCK/WARN types are reported
+        # but never replaced. Filter FIRST so they take no part in the overlap resolution
+        # below — letting a non-redacting span win over an overlapping redacting one would
+        # leave that PII in the clear, which is worse than the bug being fixed here.
+        redactable = [s for s in spans if self._get_type_action(s[4]) == 'REDACT']
+        if not redactable:
+            return text
 
+        # Resolve OVERLAPS before replacing anything. Replacing from the end keeps earlier
+        # offsets valid only while the spans are disjoint, and they are not: several patterns
+        # match inside one another. The USERNAME pattern, for instance, matches "@example"
+        # inside the EMAIL match for "sarah.chen@example.com":
+        #     (  0, 22) EMAIL     'sarah.chen@example.com'
+        #     ( 10, 18) USERNAME  '@example'
+        # Applied in sequence, the USERNAME replacement rewrites the string first, and the
+        # EMAIL replacement then indexes the ALREADY-REWRITTEN string with offsets taken from
+        # the original — splicing a fragment of the live PII back into the output:
+        #     'sarah.chen@example.com'  ->  '[EMAIL]om'
+        #     'hello@acme.com'          ->  '[EMAIL]].com'   (leaks a stray bracket too)
+        # The leak is generic to any overlapping pair, so guard it here rather than by
+        # narrowing individual patterns.
+        #
+        # Longest-match-wins: order by start ascending and, at equal starts, widest first,
+        # then keep a span only when it begins at or after the end of the last one kept.
+        redactable.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+        kept: List[Tuple[int, int, str, str, str]] = []
+        last_end = 0
+        for span in redactable:
+            if span[0] >= last_end:
+                kept.append(span)
+                last_end = span[1]
+
+        # `kept` is disjoint and ascending, so replacing from the end leaves every remaining
+        # offset valid.
         result = text
-        for start, end, pii_type, matched_text, config_type in sorted_spans:
-            # Only redact if the type action is REDACT (not BLOCK)
-            if self._get_type_action(config_type) == 'REDACT':
-                replacement = self._get_redaction_replacement(pii_type, matched_text)
-                result = result[:start] + replacement + result[end:]
+        for start, end, pii_type, matched_text, _config_type in reversed(kept):
+            replacement = self._get_redaction_replacement(pii_type, matched_text)
+            result = result[:start] + replacement + result[end:]
 
         return result

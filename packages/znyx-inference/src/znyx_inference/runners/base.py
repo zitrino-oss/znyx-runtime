@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class RunnerUnavailable(Exception):
@@ -27,6 +27,19 @@ class InferOutput:
     label_scores: Optional[Dict[str, float]] = None
     calibrated_score: Optional[float] = None
     threshold: Optional[float] = None
+    # Character ranges in the REQUEST text the model attributes to an entity, as
+    # ``(start, end, label)`` — end-exclusive, matching ``re.Match.span()``.
+    #
+    # Only token-level runners populate this; a sequence classifier scores the whole input
+    # and has nothing to point at. It exists so a REDACT-action detector can redact what the
+    # model found: "a person's name is present (0.99)" cannot be turned into a replacement
+    # without knowing WHERE, so a detector receiving only a score would report a redaction it
+    # never performed.
+    #
+    # Offsets are relative to the text exactly as SENT, so a caller must apply them to that
+    # same string — never to a copy it has already rewritten, or the splices land at shifted
+    # positions and leak fragments of the original.
+    entity_spans: Optional[List[Tuple[int, int, str]]] = None
 
 
 class Runner:

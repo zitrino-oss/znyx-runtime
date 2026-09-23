@@ -116,6 +116,117 @@ model list, licenses (including which carry special terms), and the fetch-and-pi
 workflow. The runtime reaches the sidecar only over HTTP; there is no in-process
 model loading in the runtime itself.
 
+## Certifying a model so it can block
+
+A model-backed detector cannot **block** until it has earned it. Until then the
+runtime downgrades its `BLOCK`/`REDACT` to an advisory `WARN`, and an unstamped
+model-backed detector is downgraded too — so this is fail-closed, not opt-in.
+
+`znyx-runtime benchmark` is how you earn it without a control plane. It runs the
+same pipeline the runtime runs, computes the same metrics, applies the same gate,
+and writes the verdict back into your policy file.
+
+```bash
+# 1. read the verdict (writes nothing)
+znyx-runtime benchmark \
+    --bundle config/policies.yaml \
+    --detector toxicity \
+    --dataset my-labelled-data.jsonl
+
+# 2. accept it — writes _scorecard_gate into the policy
+znyx-runtime benchmark ... --stamp
+
+# 3. sign it, so a tampered stamp is detectable
+znyx-runtime benchmark ... --stamp --signing-key ed25519.pem
+```
+
+The detector needs a `strategy` with a model mode and a `backends` entry, or
+there is nothing to certify:
+
+```yaml
+toxicity:
+  enabled: true
+  action: BLOCK
+  strategy:
+    order: [local_deterministic, local_ml]
+    fallback: fallback_to_deterministic
+  backends:
+    local_ml:
+      task: toxicity                  # the sidecar TASK, not the detector name
+      model_id: unitary/toxic-bert
+      revision: main
+      endpoint_url: http://localhost:9000/v1/infer/toxicity
+```
+
+### The dataset is what certifies the model
+
+Nothing else validates it. Your labels are the ground truth, the metrics are
+arithmetic, and the gate is a threshold comparison — there is no human sign-off
+step, and `--stamp` writes the measured verdict rather than a chosen one.
+
+JSONL (one object per line), a JSON array, or CSV with a header:
+
+```json
+{"text": "you are worthless", "expected_decision": "BLOCK", "language": "en"}
+{"text": "thanks for your help", "expected_decision": "ALLOW", "language": "en"}
+```
+
+`text` and `expected_decision` are required; `language` defaults to `--default-language`.
+Use `output_text` with `--stage output`.
+
+Two things the gate needs from the data:
+
+- **At least 100 samples per language.** It takes the minimum across language
+  buckets, so a third language needs 100 of its own.
+- **Realistic negatives, including hard ones** that share surface features with
+  the positives. A positives-only set cannot produce AUROC at all (one class),
+  and an easy negative set reports `fp_rate` 0 by construction while certifying
+  nothing.
+
+Also worth knowing: `f1` and `precision` depend on how your set is balanced. A
+50/50 set does not describe traffic that is 1% violations. `AUROC` is the
+prevalence-independent number.
+
+### Gate thresholds
+
+| Metric | Advisory | Enforcement |
+|--------|----------|-------------|
+| `f1` ≥ | 0.60 | 0.80 |
+| `auroc` ≥ | 0.70 | 0.85 |
+| `ece` ≤ | 0.15 | 0.10 |
+| `fp_rate` ≤ | 0.15 | 0.05 |
+| `p95_latency_ms` ≤ | 1500 | 1000 |
+| samples per language ≥ | 50 | 100 |
+| validated within | 365 days | 180 days |
+
+A missing metric counts as a failure. `--category healthcare|legal|finance`
+applies stricter bars. Exit code is `3` when `--stamp` was asked for and the
+enforcement gate was not met, so CI can gate on it.
+
+Two more flags: `--scope tenants.acme.apps.bot` selects a sub-tree of a
+hierarchical policy file, and `--out scorecard.json` writes the full scorecard
+(every metric, both gate verdicts and their individual failures) alongside the
+printed report.
+
+### Read this line every time
+
+```
+model-layer fired: 115/115
+```
+
+If it reads `0/115`, every sample fell back to the deterministic layer — the
+sidecar was unreachable, or no sample entered the escalation band — and the
+metrics describe your rules, not the model. `--stamp` refuses in that case
+rather than certifying the wrong layer.
+
+### Verifying stamps
+
+`_scorecard_gate` is not covered by the bundle signature, so by default the
+runtime trusts what the policy says. Sign the stamp with `--signing-key` and
+start the runtime with `ZNYX_SCORECARD_PUBLIC_KEY` set: it then verifies the
+signature and ignores any stamp that is missing or invalid, failing closed to
+`WARN`. A hand-edited `enforcement_passed: true` no longer grants enforcement.
+
 ## Configuration
 
 Key environment variables:

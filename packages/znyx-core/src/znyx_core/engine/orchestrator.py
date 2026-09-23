@@ -180,6 +180,7 @@ class DetectorOrchestrator:
     def run_detectors(
         self, text: str, policy: Dict[str, Any],
         request: "EvaluationRequest", context: str = "input", *, judge_ctx=None,
+        certify_model: bool = False,
     ) -> OrchestrationResult:
         """Generalized stage dispatch.
 
@@ -189,14 +190,19 @@ class DetectorOrchestrator:
         ``stages`` list or the pipeline's default ``ctx_filter``. This replaces the
         old input-vs-output branch so a new stage is routed correctly rather than
         being mistreated as output.
+
+        ``certify_model`` — see ``_verify_and_apply_scorecard_gate``. Benchmark/
+        certification callers only; never set it for tenant traffic.
         """
-        return self._run(text, policy, request, context=context, judge_ctx=judge_ctx)
+        return self._run(text, policy, request, context=context, judge_ctx=judge_ctx,
+                         certify_model=certify_model)
 
     # -- internal pipeline runner -------------------------------------------
 
     def _run(
         self, text: str, policy: Dict[str, Any],
         request: "EvaluationRequest", context: str, *, judge_ctx=None,
+        certify_model: bool = False,
     ) -> OrchestrationResult:
         # Dispatcher boundary: the stage must be a known Stage value. Reject
         # arbitrary strings so an unknown stage can't silently run the default
@@ -281,7 +287,8 @@ class DetectorOrchestrator:
             # gate didn't pass (stamped into the policy at publish via `_scorecard_gate`)
             # has its BLOCK/REDACT downgraded to WARN. Defence in depth — the publish-time
             # blocker is primary; this protects DB-less runtimes honouring a stamped bundle.
-            result = self._verify_and_apply_scorecard_gate(policy_key, config, result)
+            result = self._verify_and_apply_scorecard_gate(policy_key, config, result,
+                                                           certify_model=certify_model)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             orch.results.append(result)
 
@@ -354,7 +361,8 @@ class DetectorOrchestrator:
                 std_key, DetectorResult(decision=Decision.ALLOW, risk_score=0),
                 std_strategy, orch.current_text, request=request,
                 egress_sink=self.egress_sink, judge_caller=judge_caller)
-            result = self._verify_and_apply_scorecard_gate(std_key, std_config, result)
+            result = self._verify_and_apply_scorecard_gate(std_key, std_config, result,
+                                                           certify_model=certify_model)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             orch.results.append(result)
             if result.decision == Decision.BLOCK:
@@ -452,7 +460,8 @@ class DetectorOrchestrator:
         return detector.detect(text)
 
     def _verify_and_apply_scorecard_gate(self, detector_id: str, config: Dict[str, Any],
-                                         result: "DetectorResult") -> "DetectorResult":
+                                         result: "DetectorResult", *,
+                                         certify_model: bool = False) -> "DetectorResult":
         """Instance wrapper that adds tamper-evident stamp verification (console-less tier)
         on top of the pure ``_apply_scorecard_gate`` decision logic.
 
@@ -461,7 +470,25 @@ class DetectorOrchestrator:
         this detector + model_version + validated_at; otherwise the stamp is neutralised
         (forced to not-passed) so the gate downgrades BLOCK/REDACT to WARN. With no key
         configured this is a pass-through (trust mode), so behaviour is unchanged for managed
-        bundles (protected by the bundle signature) and for existing unsigned YAML."""
+        bundles (protected by the bundle signature) and for existing unsigned YAML.
+
+        ``certify_model=True`` SKIPS the gate entirely, so the detector's own BLOCK/REDACT
+        survives. It exists for certification runs (the benchmark that PRODUCES a scorecard),
+        where the gate is circular: the run measures the model in order to decide whether it
+        may enforce, so gating it makes the per-sample record report a downgraded WARN for a
+        model that actually said BLOCK. Metrics are unaffected either way — eval_metrics
+        scores "flagged vs ALLOW", and WARN is flagged — so this changes the RECORD, not any
+        score.
+
+        SECURITY: this is a gate bypass. It is a keyword-only Python argument, passed per
+        call, and deliberately NOT a field on ``EvaluationRequest`` and NOT a policy key —
+        so it is unreachable from the wire and from a bundle. It must never be wired to
+        request-derived or policy-derived data: doing so would let a caller switch off its
+        own enforcement gate. The only callers are the benchmark worker and the offline
+        scorecard CLI, both of which construct their own request in-process.
+        """
+        if certify_model:
+            return result
         if self._scorecard_public_key and isinstance(config, dict):
             gate = config.get("_scorecard_gate")
             if isinstance(gate, dict) and gate.get("enforcement_passed") is True:

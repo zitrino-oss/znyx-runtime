@@ -361,6 +361,11 @@ class LanguageConfig(DetectorConfig):
     blocked_languages: Optional[List[str]] = None
     detect_mixed: bool = False
     min_text_length: int = 20
+    # Minimum identification confidence before any allow/block rule is enforced; below it
+    # the language reads as unidentified and nothing is flagged. The 0.5 default is the seam
+    # between reliable script detection (>= 0.5) and the noisy Latin-script trigram path
+    # (<= 0.37) — see LanguageDetector.min_confidence. 0.0 restores the old behaviour.
+    min_confidence: float = 0.5
 
 
 class BiasConfig(DetectorConfig):

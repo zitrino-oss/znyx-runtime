@@ -9,11 +9,13 @@ detector that supports:
   - Health-check endpoint
 """
 import asyncio
+import atexit
 import logging
 import re
+import threading
 import time
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -21,6 +23,102 @@ from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.net_guard import resolve_egress_target, UnsafeEgressURL
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# Pooled transport.
+#
+# Every call used to build a new ``httpx.AsyncClient`` (inside the retry loop, so once per
+# ATTEMPT), and the sync entrypoint wrapped each call in a new event loop — a fresh
+# ThreadPoolExecutor plus ``asyncio.run`` when a loop was already running, or a bare
+# ``asyncio.run`` when not. So a co-located sidecar inference measured ~30-75ms of model time
+# inside ~1.5s of loop creation, TCP handshake and teardown, repeated per request. Measured on
+# a 115-sample benchmark against localhost: p95 1614ms, of which the model was ~31ms.
+#
+# The two costs are coupled: an AsyncClient's connection pool is bound to the loop that
+# created it, so pooling the client requires a stable loop to pool it on. Hence both parts
+# here — one long-lived loop for callers that have none, and one client per loop.
+_CLIENT_LOCK = threading.Lock()
+_CLIENTS: "Dict[asyncio.AbstractEventLoop, httpx.AsyncClient]" = {}
+
+_LOOP_LOCK = threading.Lock()
+_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _client() -> httpx.AsyncClient:
+    """The pooled client for the RUNNING loop, created on first use.
+
+    Keyed by loop because a client's pool is not portable across loops: reusing one from a
+    different loop yields closed-transport errors under load. Timeouts are passed per request
+    instead of being baked in, since each retry attempt shrinks its own budget against the
+    total deadline.
+    """
+    loop = asyncio.get_running_loop()
+    client = _CLIENTS.get(loop)
+    if client is not None and not client.is_closed:
+        return client
+    with _CLIENT_LOCK:
+        client = _CLIENTS.get(loop)
+        if client is None or client.is_closed:
+            # httpx's own defaults (100 connections, 20 keep-alive) are what we want, so no
+            # limits are passed — it also keeps this working under a stubbed httpx module.
+            client = httpx.AsyncClient(timeout=None)   # per-request; see _detect_async
+            _CLIENTS[loop] = client
+        return client
+
+
+def reset_transport_pool() -> None:
+    """Drop every pooled client. For tests that swap the transport underneath us.
+
+    A pooled client outlives the call that created it, so a suite that monkeypatches the
+    httpx module per test would otherwise have the second test served by the first test's
+    mock transport — its handler never called, its assertions passing on stale wiring.
+    Clients are dropped rather than closed: the loop they belong to may not be running here,
+    and an un-awaited close would warn without achieving anything.
+    """
+    with _CLIENT_LOCK:
+        _CLIENTS.clear()
+
+
+def _shared_loop() -> asyncio.AbstractEventLoop:
+    """A process-wide event loop on a daemon thread, for synchronous callers.
+
+    The synchronous ``detect()`` has no loop of its own. Running one per call throws away the
+    connection pool every time; this gives every such call the same loop, so the pooled client
+    above survives between them. Daemon so it never holds up interpreter exit.
+    """
+    global _LOOP
+    if _LOOP is not None and not _LOOP.is_closed():
+        return _LOOP
+    with _LOOP_LOCK:
+        if _LOOP is None or _LOOP.is_closed():
+            _LOOP = asyncio.new_event_loop()
+            threading.Thread(
+                target=_LOOP.run_forever,
+                name="znyx-remote-io",
+                daemon=True,
+            ).start()
+        return _LOOP
+
+
+@atexit.register
+def _close_pooled_clients() -> None:
+    """Best-effort shutdown so a short-lived process (the benchmark CLI) doesn't exit with
+    unclosed-transport warnings. Never raises: at interpreter exit the loop may already be
+    gone, and a noisy traceback here would mask the real work's result."""
+    loop = _LOOP
+    for lp, client in list(_CLIENTS.items()):
+        try:
+            if lp is loop and lp.is_running():
+                asyncio.run_coroutine_threadsafe(client.aclose(), lp).result(timeout=2)
+        except Exception:  # noqa: BLE001 - shutdown path, nothing useful to do
+            pass
+    _CLIENTS.clear()
+    try:
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _slug(value: Any) -> str:
@@ -176,25 +274,19 @@ class RemoteDetector:
     def detect(self, text: str) -> DetectorResult:
         """Synchronous wrapper for the async detection call.
 
-        When called from the synchronous orchestrator pipeline, we run
-        the async method via asyncio.  If already inside an event loop
-        (FastAPI), this is invoked via ``asyncio.run`` in a thread.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        Runs the coroutine on the process-wide loop (``_shared_loop``) and blocks for the
+        result. Both cases go the same way — a caller already inside a running loop must not
+        block it, and a caller with no loop would otherwise create one per call and discard
+        the connection pool with it.
 
-        if loop and loop.is_running():
-            # We're in an async context - run sync via new event loop in thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, self._detect_async(text))
-                # Cap the thread wait by the total deadline when one is set.
-                wait = (self.total_deadline + 5) if self.total_deadline else (self.timeout + 5)
-                return future.result(timeout=wait)
-        else:
-            return asyncio.run(self._detect_async(text))
+        Prefer ``detect_async`` from async callers (the escalation path does): it needs no
+        hand-off at all.
+        """
+        future = asyncio.run_coroutine_threadsafe(self._detect_async(text), _shared_loop())
+        # Cap the wait by the total deadline when one is set; the coroutine enforces its own
+        # per-attempt timeouts, so this is only a backstop against a wedged transport.
+        wait = (self.total_deadline + 5) if self.total_deadline else (self.timeout + 5)
+        return future.result(timeout=wait)
 
     async def detect_async(self, text: str) -> DetectorResult:
         """Native async entrypoint — no thread hop.
@@ -250,15 +342,18 @@ class RemoteDetector:
                 attempt_timeout = self.timeout
 
             try:
-                async with httpx.AsyncClient(timeout=attempt_timeout) as client:
-                    resp = await client.post(
-                        target.connect_url,
-                        json=payload,
-                        headers={**headers, "Host": target.host_header},
-                        extensions={"sni_hostname": target.sni_hostname},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+                # Pooled per loop, so the connection survives between attempts and between
+                # calls. The timeout is per-request because each attempt shrinks its budget
+                # against the total deadline computed above.
+                resp = await _client().post(
+                    target.connect_url,
+                    json=payload,
+                    headers={**headers, "Host": target.host_header},
+                    extensions={"sni_hostname": target.sni_hostname},
+                    timeout=attempt_timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
                 # Validate the contract BEFORE recording success: a malformed
                 # payload (raised below) is a failure like any transport error,
@@ -352,7 +447,33 @@ class RemoteDetector:
             model_version=(
                 str(mv) if (mv := self._get_nested(data, self.output_model_version_field)) is not None else None
             ),
+            redaction_spans=self._coerce_spans(self._get_nested(data, "entity_spans")),
         )
+
+    @staticmethod
+    def _coerce_spans(raw) -> List[Tuple[int, int, str]]:
+        """Parse a token-level model's ``entity_spans`` into (start, end, label) triples.
+
+        Offsets are spliced into text, so anything malformed is DROPPED rather than passed
+        on: a bad range would either raise mid-redaction or replace the wrong characters.
+        A non-list, a short row, non-integer bounds, or a non-forward range all skip that
+        row and leave the rest usable — the detector then simply redacts less, never wrongly.
+        """
+        if not isinstance(raw, (list, tuple)):
+            return []
+        spans: List[Tuple[int, int, str]] = []
+        for row in raw:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            try:
+                start, end = int(row[0]), int(row[1])
+            except (TypeError, ValueError):
+                continue
+            if start < 0 or end <= start:
+                continue
+            label = str(row[2]) if len(row) > 2 and row[2] is not None else "PII"
+            spans.append((start, end, label))
+        return spans
 
     def _rule_id(self, suffix: str) -> str:
         """Task-scoped rule id, so an ML-layer hit is attributable in the audit trail.

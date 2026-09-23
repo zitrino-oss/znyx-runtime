@@ -190,7 +190,14 @@ class BenchmarkWorker:
         import time
         t0 = time.perf_counter()
         try:
-            resp = await self.evaluator.evaluate(request, context=stage, policy=policy)
+            # certify_model=True: this run EXISTS to measure the model and decide whether it
+            # may enforce, so the scorecard gate must not downgrade its BLOCK/REDACT to WARN
+            # first — that would record a decision the model never made. Scores are
+            # unaffected (eval_metrics counts WARN as flagged, same as BLOCK); only the
+            # recorded decision changes. Safe here because this request is built in-process
+            # by the worker after claiming a control-plane job: no tenant input reaches it.
+            resp = await self.evaluator.evaluate(request, context=stage, policy=policy,
+                                                 certify_model=True)
             latency_ms = int((time.perf_counter() - t0) * 1000)
             return {
                 "sample_id": item.get("sample_id"),

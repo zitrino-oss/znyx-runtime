@@ -145,6 +145,7 @@ class GuardrailsEvaluator:
         db=None,
         *,
         judge_ctx=None,
+        certify_model: bool = False,
     ) -> EvaluationResponse:
         """
         Evaluate text against all guardrails.
@@ -158,6 +159,13 @@ class GuardrailsEvaluator:
                 it, escalation judges run multi-judge consensus and quality judges record
                 audit + honour deny-of-wallet budgets. None = judges use the plain transport
                 with no CP enforcement (zero behaviour change for current callers).
+            certify_model: CERTIFICATION RUNS ONLY. Skips the scorecard enforcement gate so a
+                model-backed detector's own BLOCK/REDACT survives instead of being downgraded
+                to advisory WARN. Set by the benchmark worker / offline scorecard CLI, which
+                build their own request in-process. It is keyword-only and is deliberately
+                not part of EvaluationRequest or the policy, so no wire caller can reach it —
+                see DetectorOrchestrator._verify_and_apply_scorecard_gate. Never set this for
+                tenant traffic.
         """
         start_time = datetime.now(timezone.utc)
 
@@ -178,6 +186,7 @@ class GuardrailsEvaluator:
             orch = await self._run_detectors(
                 request.text, policy, request,
                 context=context, judge_ctx=judge_ctx,
+                certify_model=certify_model,
             )
         except _DetectorDeadlineExceeded:
             # Fail closed, mirroring the policy-resolution failure path.
@@ -260,8 +269,11 @@ class GuardrailsEvaluator:
 
     async def evaluate_tool(self, request: ToolEvaluationRequest,
                             policy: Optional[Dict[str, Any]] = None,
-                            db=None, *, judge_ctx=None) -> EvaluationResponse:
-        """Evaluate tool invocation against governance policies."""
+                            db=None, *, judge_ctx=None,
+                            certify_model: bool = False) -> EvaluationResponse:
+        """Evaluate tool invocation against governance policies.
+
+        ``certify_model`` — certification runs only; see ``evaluate``."""
         start_time = datetime.now(timezone.utc)
 
         if policy is None:
@@ -312,7 +324,8 @@ class GuardrailsEvaluator:
             )
             try:
                 orch = await self._run_detectors(tool_result_text, policy, stage_req,
-                                                 context="tool", judge_ctx=judge_ctx)
+                                                 context="tool", judge_ctx=judge_ctx,
+                                                 certify_model=certify_model)
             except _DetectorDeadlineExceeded:
                 return self._deadline_block_response(request, policy_version,
                                                      start_time, "tool")
