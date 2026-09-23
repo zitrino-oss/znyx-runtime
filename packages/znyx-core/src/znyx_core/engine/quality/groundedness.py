@@ -15,6 +15,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional
 
 from znyx_core.core.models import QualityScore
+from znyx_core.engine.quality.claims import split_atomic_claims
 
 logger = logging.getLogger(__name__)
 
@@ -139,13 +140,19 @@ def score_groundedness(
             details="No grounding sources provided; score defaults to 1.0.",
         )
 
-    # Split output into atomic claims (sentence granularity).
     claims = _sentence_split(output_text)
     if not claims:
         return QualityScore(metric="groundedness", score=1.0, details="Output too short to evaluate.")
 
     # Preferred path: NLI entailment via the inference service.
+    #
+    # Entailment is all-or-nothing over the whole hypothesis, so a sentence joining two
+    # facts drawn from two passages is entailed by neither on its own and returns neutral
+    # — scoring a truthful answer as ungrounded. Split to genuinely atomic claims first;
+    # the token-overlap fallback below keeps whole sentences, where a per-claim ratio
+    # already degrades gracefully and re-splitting would shift long-standing scores.
     if nli_scorer is not None:
+        claims = [frag for sentence in claims for frag in split_atomic_claims(sentence)] or claims
         try:
             return _score_with_nli(claims, sources, nli_scorer)
         except Exception as exc:  # noqa: BLE001 — degrade to token overlap, never fail the request
