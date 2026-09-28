@@ -21,6 +21,7 @@ import platform
 from datetime import datetime, timezone
 from typing import Optional
 
+from znyx_runtime import __version__
 from znyx_runtime.install_state import get_install_id
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,10 @@ def heartbeat_endpoint() -> str:
 
 
 HEARTBEAT_INTERVAL = 86400  # 24 hours
-VERSION = "1.0.0"
+
+# Re-exported for the existing callers that import heartbeat.VERSION; the single
+# source of truth is the installed package metadata (see znyx_runtime.__init__).
+VERSION = __version__
 
 
 def _build_payload(

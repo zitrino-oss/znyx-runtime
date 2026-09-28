@@ -25,6 +25,8 @@ from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from znyx_runtime import __version__
+from znyx_runtime.sdk_registry import get_sdk_registry
 from znyx_runtime.config import RuntimeConfig
 from znyx_runtime.bundle_manager import BundleManager
 from znyx_runtime.telemetry import TelemetryEmitter
@@ -233,7 +235,7 @@ _RT_PROD = is_production()
 app = FastAPI(
     title="ZNYX Runtime",
     description="Lightweight, stateless guardrails evaluation engine for LLM applications",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan,
     docs_url=None if _RT_PROD else "/docs",
     redoc_url=None if _RT_PROD else "/redoc",
@@ -309,6 +311,31 @@ class LocalModeNudgeMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(LocalModeNudgeMiddleware)
 
+
+class SdkIdentificationMiddleware(BaseHTTPMiddleware):
+    """Record the calling SDK's identity from X-Znyx-Sdk / X-Znyx-Sdk-Version.
+
+    Middleware rather than an endpoint dependency because every evaluate route
+    takes its pydantic body as `request` and holds no FastAPI Request; adding one
+    to each would churn seven signatures and still miss the streaming routes.
+
+    Headers are untrusted caller input - sanitised in the registry, used only as
+    display metadata, never for policy. Wrapped so identification can never fail
+    an evaluation.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        try:
+            source = request.headers.get("x-znyx-sdk")
+            if source:
+                get_sdk_registry().record(source, request.headers.get("x-znyx-sdk-version"))
+        except Exception:  # noqa: BLE001 - identification must never break a request
+            pass
+        return await call_next(request)
+
+
+app.add_middleware(SdkIdentificationMiddleware)
+
 # Prometheus metrics middleware + /metrics endpoint. Same shared collector
 # the CP uses, so the same business counters (evaluations_total, decisions,
 # detector_hits) work without rewiring.
@@ -357,7 +384,7 @@ app.include_router(stream_router)
 async def root():
     return {
         "service": "ZNYX Runtime",
-        "version": "1.0.0",
+        "version": __version__,
         "mode": config.mode if config else "initializing",
         "endpoints": {
             "evaluation": "/v1/evaluate/{input|output|tool}",

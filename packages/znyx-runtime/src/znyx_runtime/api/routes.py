@@ -14,6 +14,7 @@ from znyx_core.core.models import (
     MemoryWriteEvaluationRequest,
 )
 from znyx_core.engine.evaluator import EvaluatorOverloadedError
+from znyx_runtime.sdk_registry import get_sdk_registry
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -355,6 +356,22 @@ async def readiness_check() -> HealthResponse:
     if bm.is_ready:
         return HealthResponse(status="ready")
     raise HTTPException(status_code=503, detail="Not ready - no policy loaded")
+
+
+@router.get("/v1/sdk-clients", include_in_schema=False)
+async def sdk_clients():
+    """Which SDKs have called this runtime since it started.
+
+    The same list the runtime sends to the control plane on its heartbeat, exposed
+    directly so an operator can confirm SDK identification is working without
+    standing up a control plane and waiting out a heartbeat cycle.
+
+    In-memory and per-process: it resets on restart, and a multi-replica deployment
+    answers only for the replica that served this request. Carries no secrets - SDK
+    name and version are the same metadata the caller volunteered in its headers -
+    and it is kept out of the OpenAPI schema as a diagnostic, not a public contract.
+    """
+    return {"sdk_clients": get_sdk_registry().snapshot()}
 
 
 @router.get("/v1/bundle/status")

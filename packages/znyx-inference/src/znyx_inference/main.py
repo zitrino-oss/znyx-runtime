@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 
+from znyx_inference import __version__
 from znyx_inference.batching import Saturated
 from znyx_inference.cache import ContentHashCache, content_key
 from znyx_inference.config import InferenceConfig
@@ -76,7 +77,7 @@ async def lifespan(app: FastAPI):
         await registry.stop_all()
 
 
-app = FastAPI(title="ZNYX Inference Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="ZNYX Inference Service", version=__version__, lifespan=lifespan)
 
 
 def _result(out, model_version: str) -> InferResult:
