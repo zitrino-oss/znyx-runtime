@@ -2,6 +2,8 @@ from enum import Enum
 from typing import Optional, Dict, Any, List, Literal, Tuple
 from pydantic import BaseModel, Field, field_validator
 
+from znyx_core import __version__ as _CORE_VERSION
+
 
 class Decision(str, Enum):
     ALLOW = "ALLOW"
@@ -388,7 +390,9 @@ class EvaluationResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    version: str = "1.0.0"
+    # Defaults to the installed znyx-core version rather than a literal, so a
+    # /healthz probe never reports a release the process is not actually running.
+    version: str = _CORE_VERSION
 
 
 class DetectorResult(BaseModel):

@@ -25,6 +25,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from znyx_runtime.sdk_registry import get_sdk_registry
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 10.0
@@ -72,6 +74,14 @@ class RuntimeReporter:
             # the sidecar-shaped payload; it carries the same value as policy_hash.
             "bundle_etag": bundle_info.get("policy_hash"),
         }
+
+        # Which SDKs have called this runtime. Absent on a runtime nothing has
+        # called yet, and omitted entirely rather than sent as [] so an older
+        # control plane's stored value is not blanked by a fresh process that
+        # has simply not been called since it started.
+        sdks = get_sdk_registry().snapshot()
+        if sdks:
+            payload["sdk_versions"] = sdks
         # A project-scoped token serves several environments, so name which one this is.
         # Prefer what the bundle itself says over the env var: the bundle is authoritative
         # about the scope it was published for.

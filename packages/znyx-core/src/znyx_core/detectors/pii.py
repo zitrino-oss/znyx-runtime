@@ -618,17 +618,18 @@ class PIIDetector:
 
         Args:
             config: Configuration dict with keys:
-                - action: "REDACT" or "BLOCK" (default: "REDACT") - default action
+                - action: "REDACT"/"TRANSFORM", "BLOCK" or "ALLOW"
+                          (default: "REDACT") - default action
                 - enabled: bool (default: True)
                 - redaction_strategy: "full" or "partial" (default: "full")
                 - skip_private_ips: bool (default: True)
                 - types: dict of per-type configurations (optional)
                     Each type can have:
                     - enabled: bool
-                    - action: "REDACT" or "BLOCK"
+                    - action: "REDACT"/"TRANSFORM", "BLOCK" or "ALLOW"
         """
         self.config = config
-        self.default_action = config.get('action', 'REDACT')
+        self.default_action = self._normalize_action(config.get('action', 'REDACT'))
         self.enabled = config.get('enabled', True)
         self.redaction_strategy = config.get('redaction_strategy', 'full')
         self.skip_private_ips = config.get('skip_private_ips', True)
@@ -645,7 +646,8 @@ class PIIDetector:
                     type_cfg = {'enabled': type_cfg}
                 self.type_configs[pii_type] = {
                     'enabled': type_cfg.get('enabled', default_cfg['enabled']),
-                    'action': type_cfg.get('action', self.default_action),
+                    'action': self._normalize_action(
+                        type_cfg.get('action', self.default_action)),
                 }
             else:
                 # Use defaults with the configured default action
@@ -663,6 +665,36 @@ class PIIDetector:
                     self.custom_compiled_patterns.append((name, re.compile(regex, re.IGNORECASE)))
                 except re.error:
                     pass  # skip invalid regex
+
+    # The console writes the policy vocabulary — "TRANSFORM" for redaction, "ALLOW" for
+    # log-only — while this detector was written against "REDACT"/"BLOCK". Left untranslated,
+    # "TRANSFORM" matched neither branch: nothing blocked, nothing redacted, yet the result
+    # still reported Decision.REDACT, so PII passed through in the clear under a label saying
+    # it had been removed. Normalize once, here, so the ~40 `== 'BLOCK'` / `== 'REDACT'`
+    # tests downstream keep working against a closed set of three values.
+    _ACTION_ALIASES = {
+        'REDACT': 'REDACT',
+        'TRANSFORM': 'REDACT',
+        'MASK': 'REDACT',
+        'ANONYMIZE': 'REDACT',
+        'BLOCK': 'BLOCK',
+        'DENY': 'BLOCK',
+        'ALLOW': 'ALLOW',
+        'WARN': 'ALLOW',
+        'LOG': 'ALLOW',
+        'NONE': 'ALLOW',
+    }
+
+    @classmethod
+    def _normalize_action(cls, action: Any) -> str:
+        """Map a configured action onto one of REDACT | BLOCK | ALLOW.
+
+        Unrecognised values fall back to REDACT so that a typo strips the PII rather
+        than quietly emitting it.
+        """
+        if not isinstance(action, str):
+            return 'REDACT'
+        return cls._ACTION_ALIASES.get(action.strip().upper(), 'REDACT')
 
     def _is_type_enabled(self, pii_type: str) -> bool:
         """Check if a PII type is enabled for detection."""
@@ -1207,23 +1239,37 @@ class PIIDetector:
                 user_message="Your message contains sensitive information and cannot be processed.",
                 developer_message=f"PII blocked: {len(set(blocked_types))} type(s) - {', '.join(set(blocked_types))}"
             )
-        else:  # All detected types are configured to REDACT
-            sanitized_text = self._redact_pii(text, pii_spans)
+        # Nothing is set to BLOCK. Publish the spans alongside the redacted text: an additive
+        # ML layer (the pii_ner model) finds entities this regex layer cannot — names,
+        # addresses — and reports them as offsets into the SAME original text. Redaction has
+        # to be recomputed from both sets together (see escalation._additive_merge), because
+        # applying the model's original-text offsets to `sanitized_text` (already rewritten
+        # here) would splice at shifted positions.
+        redaction_spans = [(s, e, t) for s, e, t, _m, cfg in pii_spans
+                           if self._get_type_action(cfg) == 'REDACT']
+
+        # Every detected type is set to ALLOW — report the findings, rewrite nothing. This
+        # has to say ALLOW rather than REDACT: a REDACT carrying untouched text both misleads
+        # the caller and outranks genuine ALLOWs in the "worst wins" aggregation downstream.
+        if not redaction_spans:
             return DetectorResult(
-                decision=Decision.REDACT,
+                decision=Decision.ALLOW,
                 risk_score=risk_score,
                 rule_hits=rule_hits,
-                sanitized_text=sanitized_text,
-                # Publish the spans alongside the redacted text. An additive ML layer (the
-                # pii_ner model) finds entities this regex layer cannot — names, addresses —
-                # and reports them as offsets into the SAME original text. Redaction has to
-                # be recomputed from both sets together (see escalation._additive_merge),
-                # because applying the model's original-text offsets to `sanitized_text`
-                # (already rewritten here) would splice at shifted positions.
-                redaction_spans=[(s, e, t) for s, e, t, _m, cfg in pii_spans
-                                 if self._get_type_action(cfg) == 'REDACT'],
-                developer_message=f"PII redacted: {len(rule_hits)} item(s)"
+                developer_message=(
+                    f"PII detected but action=ALLOW: {len(rule_hits)} item(s) reported, "
+                    "none redacted"
+                )
             )
+
+        return DetectorResult(
+            decision=Decision.REDACT,
+            risk_score=risk_score,
+            rule_hits=rule_hits,
+            sanitized_text=self._redact_pii(text, pii_spans),
+            redaction_spans=redaction_spans,
+            developer_message=f"PII redacted: {len(rule_hits)} item(s)"
+        )
 
     @staticmethod
     def _calculate_risk_score(rule_hits: List[RuleHit]) -> int:

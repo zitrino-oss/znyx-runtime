@@ -9,3 +9,12 @@ package's runners, lazy-imported at load time, and only in the inference Docker 
 dependency-free StubRunner, so the contract / cache / batching / registry are testable
 anywhere.
 """
+
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("znyx-inference")
+except PackageNotFoundError:  # not installed (source-tree import)
+    __version__ = "0.0.0+unknown"
+
+__all__ = ["__version__"]

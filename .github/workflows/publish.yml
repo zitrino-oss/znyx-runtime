@@ -26,26 +26,106 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to publish (manual runs only; a Release publishes all)"
+        type: choice
+        default: all
+        options:
+          - all
+          - znyx-core
+          - znyx-runtime
+          - znyx-inference
+      version:
+        description: "Version to publish, e.g. 1.2.0 (leave blank to use the tag/ref you run against)"
+        type: string
+        required: false
+        default: ""
 
 # Least privilege by default; jobs opt into more only where needed.
 permissions:
   contents: read
 
 jobs:
+  # Derive the version to publish from the release tag (or the tag the workflow was
+  # manually run against). Fails clearly if no valid semver can be found.
+  #
+  # This is the single source of the published version for EVERY artifact - PyPI
+  # packages, standalone binaries and Docker image tags - so they cannot disagree.
+  # Previously each package's pyproject.toml carried the version and the image was
+  # tagged from github.ref_name, which meant two failure modes:
+  #   * tag v1.1.0 without bumping the manifests -> PyPI silently skipped the upload
+  #     (skip-existing) while the images still shipped as v1.1.0, so an image claimed
+  #     a version that had no PyPI counterpart and whose code reported the old number;
+  #   * a manual run from a branch -> images tagged `znyx/runtime:main`.
+  # Deriving once and stamping it in removes both.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      packages: ${{ steps.plan.outputs.packages }}
+      publish_all: ${{ steps.plan.outputs.publish_all }}
+    steps:
+      - id: derive
+        env:
+          # Precedence: explicit manual `version` input > release tag > the ref the
+          # workflow was run against. The input is empty ('') on release runs and
+          # when left blank on manual runs, so it falls through cleanly.
+          RAW_TAG: ${{ github.event.inputs.version || github.event.release.tag_name || github.ref_name }}
+        run: |
+          VERSION="${RAW_TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.+].+)?$'; then
+            echo "::error::Could not derive a version. Ref/tag/input '$RAW_TAG' -> '$VERSION' is not valid semver (expected like v1.2.0). Publish by creating a GitHub Release tagged vX.Y.Z, run the workflow against a tag, or set the 'version' input (e.g. 1.2.0)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: $VERSION"
+      # Which packages this run publishes, as the matrix the pypi job consumes.
+      # Built here rather than filtered with a job-level `if` because the matrix
+      # context is not available in `jobs.<id>.if` - only github/needs/vars/inputs.
+      - id: plan
+        env:
+          # Empty on release runs, so a Release always publishes everything.
+          SELECTED: ${{ github.event.inputs.package }}
+        run: |
+          SELECTED="${SELECTED:-all}"
+          if [ "$SELECTED" = "all" ]; then
+            echo 'packages=["packages/znyx-core","packages/znyx-runtime","packages/znyx-inference"]' >> "$GITHUB_OUTPUT"
+            echo "publish_all=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packages=[\"packages/${SELECTED}\"]" >> "$GITHUB_OUTPUT"
+            echo "publish_all=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Publishing: $SELECTED"
+
   pypi:
+    needs: version
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       contents: read
       id-token: write # OIDC token for PyPI Trusted Publishing
     strategy:
+      # A Release publishes all three; a manual run may target one (see the plan step).
       matrix:
-        package: [packages/znyx-core, packages/znyx-runtime, packages/znyx-inference]
+        package: ${{ fromJSON(needs.version.outputs.packages) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+      - name: Set version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # The released version comes from the tag, not the checked-in manifest,
+          # so a forgotten manifest bump can no longer publish the wrong number.
+          sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" ${{ matrix.package }}/pyproject.toml
+          # Keep the three packages in lockstep: znyx-runtime and znyx-inference each
+          # depend on znyx-core, and leaving the floor at an older release would let
+          # pip satisfy a new runtime with a stale core.
+          sed -i -E "s/znyx-core>=[0-9][^\"]*/znyx-core>=${VERSION}/" ${{ matrix.package }}/pyproject.toml
+          grep -E "^version|znyx-core>=" ${{ matrix.package }}/pyproject.toml
       - name: Build
         run: |
           python -m pip install --upgrade build twine
@@ -66,6 +146,9 @@ jobs:
   # run). Assets are uploaded when the workflow runs for a published release
   # or is dispatched against a tag, so missing binaries can be backfilled.
   binaries:
+    needs: version
+    # Artifacts that bundle all packages, so only for a Release or a full manual run.
+    if: ${{ github.event_name == 'release' || needs.version.outputs.publish_all == 'true' }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write # attach the binaries to the GitHub release
@@ -88,6 +171,17 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+      - name: Set version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Stamped before install so `znyx-runtime --version` and /healthz inside the
+          # binary report the released number rather than the checked-in manifest.
+          for pkg in znyx-core znyx-runtime; do
+            sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" "packages/$pkg/pyproject.toml"
+            sed -i -E "s/znyx-core>=[0-9][^\"]*/znyx-core>=${VERSION}/" "packages/$pkg/pyproject.toml"
+          done
       - name: Build binary
         shell: bash
         run: |
@@ -138,6 +232,8 @@ jobs:
           gh release upload "$TAG" "dist/$FILE" "dist/$FILE.sha256" --clobber
 
   image:
+    needs: version
+    if: ${{ github.event_name == 'release' || needs.version.outputs.publish_all == 'true' }}
     runs-on: ubuntu-latest
     environment: dockerhub
     permissions:
@@ -151,6 +247,17 @@ jobs:
             image_name: znyx/inference
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Both Dockerfiles COPY these packages and pip install them, so the version
+          # baked into the image comes from the manifests - stamp them here and the
+          # image tag and the version the running code reports can no longer disagree.
+          for pkg in znyx-core znyx-runtime znyx-inference; do
+            sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" "packages/$pkg/pyproject.toml"
+            sed -i -E "s/znyx-core>=[0-9][^\"]*/znyx-core>=${VERSION}/" "packages/$pkg/pyproject.toml"
+          done
       - name: Log in to registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -162,4 +269,10 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ matrix.image_name }}:latest,${{ matrix.image_name }}:${{ github.ref_name }}
+          # Tagged from the derived version, not github.ref_name: a manual run from a
+          # branch used to publish `znyx/runtime:main`. The v-prefixed tag is kept as
+          # an alias so anything already pulling `:vX.Y.Z` keeps working.
+          tags: |
+            ${{ matrix.image_name }}:latest
+            ${{ matrix.image_name }}:${{ needs.version.outputs.version }}
+            ${{ matrix.image_name }}:v${{ needs.version.outputs.version }}
