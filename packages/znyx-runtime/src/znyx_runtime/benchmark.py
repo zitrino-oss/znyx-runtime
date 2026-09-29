@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from znyx_runtime.console import safe_print
 from znyx_core.engine import eval_metrics
 from znyx_core.engine.scorecard_gate import (
     ADVISORY,
@@ -225,7 +226,7 @@ async def _run(samples: List[Dict[str, Any]], detector: str, stage: str,
         except Exception as exc:  # noqa: BLE001 — a failed sample is an ERROR result, not a crash
             actual, risk = "ERROR", 0
             errors += 1
-            print(f"  ! sample {idx} errored: {exc}", file=sys.stderr)
+            safe_print(f"  ! sample {idx} errored: {exc}", file=sys.stderr)
 
         expected = s["expected"]
         confusion.setdefault(expected, {})
@@ -277,28 +278,28 @@ def _fmt(v: Any) -> str:
 
 def _print_report(detector: str, model_version: str, scorecard: Dict[str, Any],
                   run: Dict[str, Any], advisory, enforcement) -> None:
-    print(f"\nScorecard — detector '{detector}', model {model_version}")
-    print(f"  samples: {run['n']}   errors: {run['errors']}   "
+    safe_print(f"\nScorecard — detector '{detector}', model {model_version}")
+    safe_print(f"  samples: {run['n']}   errors: {run['errors']}   "
           f"model-layer fired: {run['escalated']}/{run['n']}")
-    print("  metrics:")
+    safe_print("  metrics:")
     for k in ("precision", "recall", "f1", "fp_rate", "auroc", "auprc", "ece"):
-        print(f"    {k:<10} {_fmt(scorecard.get(k))}")
-    print(f"    {'p95_ms':<10} {_fmt(scorecard.get('p95_latency_ms'))}")
+        safe_print(f"    {k:<10} {_fmt(scorecard.get(k))}")
+    safe_print(f"    {'p95_ms':<10} {_fmt(scorecard.get('p95_latency_ms'))}")
     cm = scorecard.get("binary_confusion", {})
-    print(f"    confusion  tp={cm.get('tp')} fp={cm.get('fp')} "
+    safe_print(f"    confusion  tp={cm.get('tp')} fp={cm.get('fp')} "
           f"fn={cm.get('fn')} tn={cm.get('tn')}")
-    print("  per-language samples: " +
+    safe_print("  per-language samples: " +
           ", ".join(f"{k}={v['samples']}" for k, v in scorecard["per_language"].items()))
 
     for name, res in ((ADVISORY, advisory), (ENFORCEMENT, enforcement)):
         verdict = "PASS" if res.passed else "FAIL"
-        print(f"\n  {name.upper()} gate: {verdict}")
+        safe_print(f"\n  {name.upper()} gate: {verdict}")
         for fail in res.failures:
-            print(f"    - {fail['metric']}: need {fail['op']} {fail['required']}, "
+            safe_print(f"    - {fail['metric']}: need {fail['op']} {fail['required']}, "
                   f"got {_fmt(fail['actual'])}")
 
     if run["escalated"] == 0:
-        print("\n  WARNING: the model layer never fired (every sample fell back to the "
+        safe_print("\n  WARNING: the model layer never fired (every sample fell back to the "
               "deterministic\n  base). Is the inference sidecar running and the backend "
               "endpoint_url reachable?\n  This scorecard reflects DETERMINISTIC behaviour, "
               "not the pinned model.")
@@ -355,7 +356,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             threshold = threshold if threshold is not None else b.get("threshold")
 
     samples = _load_dataset(args.dataset, args.default_language)
-    print(f"Evaluating '{args.detector}' (model {model_version}) on {len(samples)} samples "
+    safe_print(f"Evaluating '{args.detector}' (model {model_version}) on {len(samples)} samples "
           f"[stage={args.stage}] ...")
     eval_policy = _build_eval_policy(base, args.detector, entry)
     run = asyncio.run(_run(samples, args.detector, args.stage, eval_policy))
@@ -370,7 +371,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             {"detector": args.detector, "scorecard": scorecard,
              "advisory": advisory.to_dict(), "enforcement": enforcement.to_dict()}, indent=2),
             encoding="utf-8")
-        print(f"\nWrote scorecard JSON → {args.out}")
+        safe_print(f"\nWrote scorecard JSON → {args.out}")
 
     if args.stamp:
         # Refuse to write a stamp for a run the MODEL sat out. An unreachable endpoint (wrong
@@ -390,7 +391,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 f"layer, not {model_version}. Check that the sidecar is running and that "
                 f"backends.local_ml.endpoint_url is reachable, then re-run.")
         if run["escalated"] < run["n"]:
-            print(f"\n  NOTE: the model layer fired on {run['escalated']}/{run['n']} samples; "
+            safe_print(f"\n  NOTE: the model layer fired on {run['escalated']}/{run['n']} samples; "
                   "the rest fell back to the deterministic layer and are scored as such.")
 
         ref = _stamp_ref(raw, args.detector, args.scope)
@@ -417,9 +418,9 @@ def run_benchmark(args: argparse.Namespace) -> int:
         with open(args.bundle, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False, default_flow_style=False)
         state = "ENFORCING" if enforcement.passed else "advisory (WARN) — enforcement gate not met"
-        print(f"\nStamped _scorecard_gate into {args.bundle}: '{args.detector}' is now {state}.")
+        safe_print(f"\nStamped _scorecard_gate into {args.bundle}: '{args.detector}' is now {state}.")
         if not enforcement.passed:
-            print("  (BLOCK/REDACT stays pinned to WARN until the enforcement gate passes.)")
+            safe_print("  (BLOCK/REDACT stays pinned to WARN until the enforcement gate passes.)")
 
     # Exit non-zero if enforcement was requested-but-not-met, so CI can gate on it.
     return 0 if (enforcement.passed or not args.stamp) else 3

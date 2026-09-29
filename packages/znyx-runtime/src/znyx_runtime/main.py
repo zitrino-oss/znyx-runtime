@@ -25,6 +25,7 @@ from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from znyx_runtime.console import SafeStreamHandler, safe_print
 from znyx_runtime.config import RuntimeConfig
 from znyx_runtime.bundle_manager import BundleManager
 from znyx_runtime.telemetry import TelemetryEmitter
@@ -35,7 +36,8 @@ from znyx_runtime.api.stream_routes import router as stream_router
 from znyx_core.engine.evaluator import GuardrailsEvaluator
 from znyx_core.detectors.plugin import plugin_registry, init_plugins
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(message)s",
+                    handlers=[SafeStreamHandler()])
 logger = logging.getLogger(__name__)
 
 VERSION = "1.0.0"
@@ -199,7 +201,7 @@ async def lifespan(app: FastAPI):
     # First-run welcome banner: shown exactly once per install (local mode).
     # Also fires a one-shot first_run telemetry ping (best-effort).
     if config.mode == "local" and run_count == 1:
-        print(_WELCOME_BANNER)
+        safe_print(_WELCOME_BANNER)
         if config.heartbeat_enabled:
             try:
                 await heartbeat.send_first_run_ping(run_count=run_count)
