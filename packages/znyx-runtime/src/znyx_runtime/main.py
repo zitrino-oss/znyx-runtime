@@ -28,6 +28,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from znyx_runtime import __version__
 from znyx_runtime.console import SafeStreamHandler, safe_print
 from znyx_runtime.sdk_registry import get_sdk_registry
+from znyx_runtime.console import SafeStreamHandler, safe_print
 from znyx_runtime.config import RuntimeConfig
 from znyx_runtime.bundle_manager import BundleManager
 from znyx_runtime.telemetry import TelemetryEmitter
