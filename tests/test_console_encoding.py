@@ -23,6 +23,9 @@ BOX = "║"      # in neither cp1252 nor cp437
 ARROW = "→"    # in neither
 EM_DASH = "—"  # in cp1252, NOT in cp437
 
+# Only ever passed to the banner builder; never substring-matched.
+CONSOLE_URL = "https://console.example"
+
 
 def console(encoding: str) -> io.TextIOWrapper:
     """A stdout that encodes exactly like a legacy Windows console."""
@@ -35,15 +38,17 @@ def read_back(stream: io.TextIOWrapper, encoding: str = "cp1252") -> str:
 
 
 # cp437 (the old DOS codepage) carries box-drawing natively, so only cp1252 and
-# ascii actually force the fallback - all three must simply not raise.
+# ascii actually force the fallback; all three must print the banner in full.
 @pytest.mark.parametrize("encoding", ["cp1252", "cp437", "ascii"])
 def test_banner_survives_a_legacy_console(encoding):
+    banner = _build_welcome_banner("1.2.3", CONSOLE_URL)
     stream = console(encoding)
-    safe_print(_build_welcome_banner("1.2.3", "https://console.example"), file=stream)
+    safe_print(banner, file=stream)
 
-    out = read_back(stream, encoding)
-    assert "Welcome to ZNYX AI Runtime v1.2.3" in out
-    assert "https://console.example" in out
+    # Verbatim where the stream can carry it, the ASCII rendering where it cannot -
+    # either way every line of the banner arrives, nothing is dropped or mangled.
+    expected = banner if stream_supports(banner, console(encoding)) else to_ascii(banner)
+    assert read_back(stream, encoding) == expected + "\n"
 
 
 def test_degraded_banner_keeps_its_box_aligned():
