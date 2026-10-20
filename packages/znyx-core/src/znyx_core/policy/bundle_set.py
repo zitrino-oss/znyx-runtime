@@ -75,6 +75,12 @@ class BundleSet:
     # The key serves several environments (signed): the runtime then never answers a
     # call that names none of its members, even when only one member is left.
     serves_several: bool = False
+    # Controls the control plane decides at serve time (signed), not part of any policy:
+    # ``spend_blocked`` lists budgets that are spent and set to block, each with its
+    # ``scope`` (org | project | environment | app | key) and the ids that scope needs
+    # (``project_id``, ``environment_id``, ``app_id``, ``key_id``). The gateway refuses
+    # calls inside a blocked scope until the budget's period ends or it is raised.
+    controls: Dict[str, Any] = field(default_factory=dict)
     # Read from a control plane that serves only single bundles: one member, unsigned
     # set. Only ever set by ``single()``, never read from a response or a cache file.
     legacy: bool = False
@@ -91,6 +97,7 @@ class BundleSet:
             "format": self.format, "version": self.version, "org_id": self.org_id or "",
             "set_id": self.set_id or "", "generated_at": self.generated_at or "",
             "serves_several": bool(self.serves_several),
+            "controls": self.controls or {},
             "members": [{"environment_id": m.environment_id, "project_id": m.project_id,
                          "project_slug": m.project_slug, "environment": m.environment,
                          "bundle_id": m.bundle.bundle_id or "", "policy_hash": m.bundle.policy_hash or ""}
@@ -108,16 +115,17 @@ class BundleSet:
         missing."""
         payload = json.dumps({
             "serves_several": bool(self.serves_several),
+            "controls": self.controls or {},
             "members": sorted([m.key, m.project_id, m.project_slug, m.environment,
                                m.bundle.bundle_id or "", m.bundle.policy_hash or ""] for m in self.members),
             "missing": sorted(json.dumps(e, sort_keys=True) for e in self.missing),
-        }, separators=(",", ":"))
+        }, separators=(",", ":"), sort_keys=True)
         return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
         return {"format": self.format, "version": self.version, "org_id": self.org_id,
                 "set_id": self.set_id, "generated_at": self.generated_at,
-                "serves_several": bool(self.serves_several),
+                "serves_several": bool(self.serves_several), "controls": self.controls or {},
                 "members": [m.to_dict() for m in self.members], "missing": list(self.missing),
                 "content_hash": self.content_hash(), "signature": self.signature}
 
@@ -135,7 +143,8 @@ class BundleSet:
                    missing=[{str(k): str(v) for k, v in e.items()} for e in missing if isinstance(e, dict)],
                    signature=data.get("signature"), format=str(data.get("format")),
                    version=int(data.get("version") or 0),
-                   serves_several=data.get("serves_several") is True)
+                   serves_several=data.get("serves_several") is True,
+                   controls=data.get("controls") if isinstance(data.get("controls"), dict) else {})
 
 
 def _load_key(pem: str, private: bool):

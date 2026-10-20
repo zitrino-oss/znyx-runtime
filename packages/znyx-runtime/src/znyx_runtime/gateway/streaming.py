@@ -157,13 +157,12 @@ async def stream_call(gw, request: Request, api: str, fmt, provider, url: str, h
         record.status, record.outcome, record.reason = upstream.status_code, "error", "provider_error"
         gw._record(record)
         returned = gw.upstream.returned_headers(upstream)
-        returned["x-znyx-request-id"] = record.request_id
+        returned.update(gw.trace_headers(record))
         return Response(content=content, status_code=upstream.status_code,
                         media_type=upstream.headers.get("content-type", "application/json"),
                         headers=returned)
     returned = gw.upstream.returned_headers(upstream)
-    returned.update({"x-znyx-request-id": record.request_id, "cache-control": "no-cache",
-                     "x-accel-buffering": "no"})
+    returned.update({**gw.trace_headers(record), "cache-control": "no-cache", "x-accel-buffering": "no"})
     state = _StreamState()
     events = (_openai(gw, upstream, fmt, scope, policy, record, added_usage, t_up, context, state)
               if api in ("openai", "azure") else _anthropic(gw, upstream, scope, policy, record, t_up,

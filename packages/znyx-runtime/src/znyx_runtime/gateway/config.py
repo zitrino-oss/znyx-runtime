@@ -157,6 +157,9 @@ class GatewaySettings:
     # Anthropic's MCP connector makes the provider call MCP servers itself, outside the
     # gateway's tool policy and egress gate: refused unless allowed here.
     allow_provider_mcp: bool = False
+    # End-user ids in usage events (X-Znyx-User, OpenAI `user`, Anthropic
+    # metadata.user_id): "hash" (a pseudonym, the default), "plain", or "off".
+    user_ids: str = "hash"
     # Technique 27: add a marker unique to this deployment to every system prompt, so
     # a leaked prompt is caught in the answer and can be traced back here. Off by
     # default: it changes what the provider receives.
@@ -398,6 +401,9 @@ def _settings(raw: Any) -> GatewaySettings:
         _require(isinstance(values["body_timeout_seconds"], (int, float))
                  and values["body_timeout_seconds"] > 0, "settings",
                  "body_timeout_seconds must be > 0")
+    if "user_ids" in values:
+        _require(values["user_ids"] in ("hash", "plain", "off"), "settings",
+                 "user_ids must be hash, plain or off")
     if "uncheckable_content" in values:
         _require(values["uncheckable_content"] in UNCHECKABLE_MODES, "settings",
                  f"uncheckable_content must be one of {', '.join(UNCHECKABLE_MODES)}")
@@ -411,7 +417,8 @@ def _prices(raw: Any) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for model, entry in raw.items():
         _require(isinstance(entry, Mapping), f"prices.{model}", "expected a mapping")
-        unknown = set(entry) - {"input_per_mtok", "output_per_mtok", "cached_input_per_mtok"}
+        unknown = set(entry) - {"input_per_mtok", "output_per_mtok", "cached_input_per_mtok",
+                                "cache_write_per_mtok"}
         _require(not unknown, f"prices.{model}", f"unknown field(s) {', '.join(sorted(unknown))}")
         for name, value in entry.items():
             _require(isinstance(value, (int, float)) and value >= 0, f"prices.{model}",

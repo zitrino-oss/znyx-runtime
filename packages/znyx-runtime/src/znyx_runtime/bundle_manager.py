@@ -218,6 +218,12 @@ class BundleManager:
                                  agent_id=request.agent_id, env=request.env, member=member)
         return request, policy
 
+    @property
+    def controls(self) -> Dict[str, Any]:
+        """Serve-time controls of the signed set (spend budgets that are spent and set
+        to block); empty outside managed mode or from an older control plane."""
+        return dict(self._set.controls) if self._set is not None and not self._set.legacy else {}
+
     def gateway_documents(self) -> List[Tuple[str, Optional[Dict[str, Any]]]]:
         """Each member's gateway section, with the member it belongs to."""
         return [(m.key, (m.bundle.policies or {}).get("gateway")) for m in self.members]

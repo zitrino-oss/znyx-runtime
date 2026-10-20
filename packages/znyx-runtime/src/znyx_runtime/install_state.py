@@ -15,6 +15,7 @@ Opt-out: telemetry reads are gated by the caller; this module only persists stat
 """
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,3 +101,38 @@ def get_install_id() -> str:
 def get_run_count() -> int:
     """Return the current run count without modifying state."""
     return load_state().get("run_count", 0)
+
+
+_user_id_key: Optional[bytes] = None
+
+
+def user_id_key() -> bytes:
+    """The key end-user pseudonyms are made with (HMAC), held on this side only: the
+    console sees pseudonyms and can never recompute one from a guessed email. From
+    ``ZNYX_USER_ID_KEY`` (set the same value on every replica so a user has one pseudonym
+    across them), else generated once per install in ``~/.znyx/user-id.key`` (0600)."""
+    global _user_id_key
+    configured = (os.getenv("ZNYX_USER_ID_KEY") or "").strip()
+    if configured:
+        return configured.encode()
+    if _user_id_key is not None:
+        return _user_id_key
+    import secrets
+    path = STATE_DIR / "user-id.key"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            value = path.read_bytes().strip()
+        else:
+            value = secrets.token_hex(32).encode()
+            with os.fdopen(fd, "wb") as f:
+                f.write(value)
+        if len(value) < 32:
+            raise OSError("user-id key file is too short")
+    except OSError as exc:
+        logger.warning("Cannot keep a user-id key (%s); pseudonyms change on restart", exc)
+        value = secrets.token_hex(32).encode()
+    _user_id_key = value
+    return value

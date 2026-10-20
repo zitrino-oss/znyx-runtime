@@ -264,7 +264,8 @@ def runtime(tmp_path_factory, keys):
            "RUNTIME_API_KEY": INSTANCE_KEY, "RUNTIME_REQUIRE_AUTH": "true", "ZNYX_TELEMETRY": "false",
            "ZNYX_TELEMETRY_ENABLED": "false", "ZNYX_AUDIT_SPOOL_PATH": str(tmp / "egress.spool"),
            "ZNYX_JUDGE_AUDIT_SPOOL_PATH": str(tmp / "judge.spool"),
-           "ZNYX_SECRET_ALPHA": "sk-alpha-upstream", "ZNYX_SECRET_BETA": "sk-beta-upstream"}
+           "ZNYX_SECRET_ALPHA": "sk-alpha-upstream", "ZNYX_SECRET_BETA": "sk-beta-upstream",
+           "ZNYX_USAGE_SPOOL_PATH": str(tmp / "llm-calls.spool")}
     saved = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
     import znyx_runtime.install_state as install_state
@@ -298,6 +299,7 @@ def runtime(tmp_path_factory, keys):
         from znyx_runtime.main import app
         with TestClient(app) as c:
             c.reports = reports
+            c.usage_spool = tmp / "llm-calls.spool"
             yield c
     finally:
         Upstream.client, BundleManager._transport, RuntimeReporter.report, SpoolShipper.start = originals

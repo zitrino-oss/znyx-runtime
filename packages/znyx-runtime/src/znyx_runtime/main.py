@@ -107,6 +107,7 @@ runtime_judge = None  # RuntimeJudgeAudit — durable judge audit + cached budge
 # The last decisions this worker made (metadata only), for the local dashboard.
 recent_decisions = RecentDecisions()
 worker_reporter: Optional[WorkerReporter] = None
+otlp_exporter = None          # znyx_runtime.otel.OtlpExporter, when OTLP is configured
 
 
 def _on_evaluation(event: dict) -> None:
@@ -118,11 +119,14 @@ def _on_evaluation(event: dict) -> None:
         pass
     if telemetry is not None:
         telemetry.emit(event)
+    if otlp_exporter is not None:
+        otlp_exporter.export_evaluation(event)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global config, bundle_manager, telemetry, heartbeat, evaluator, runtime_judge, worker_reporter
+    global otlp_exporter
 
     # With several worker processes (znyx serve), only worker 0 runs the jobs that
     # must happen once per instance: delivering spools, the heartbeat, the benchmark
@@ -232,8 +236,23 @@ async def lifespan(app: FastAPI):
                                                      shared=bundle_manager.serves_several)
     else:
         initial = gateway_config.load()
+    # Usage and traces (Phase 3): each gateway call's usage event goes to a spool the
+    # leader ships to the control plane (managed mode), and every call and check to the
+    # customer's OTLP collector when one is configured. Metadata only.
+    from znyx_runtime.otel import OtlpExporter
+    from znyx_runtime.usage_sink import DEFAULT_USAGE_SPOOL, UsageSink
+    otlp_exporter = OtlpExporter.from_env()
+    if otlp_exporter is not None:
+        otlp_exporter.start()
+        logger.info("Traces exported over OTLP to %s", otlp_exporter.status()["endpoint_host"])
+    app.state.otlp_exporter = otlp_exporter
+    usage_spool = None
+    if config.mode == "managed" and config.control_plane_url and config.runtime_token:
+        usage_spool = os.getenv("ZNYX_USAGE_SPOOL_PATH") or str(DEFAULT_USAGE_SPOOL)
+    app.state.usage_spool = usage_spool
     app.state.gateway = Gateway(initial, evaluator=evaluator, bundle_manager=bundle_manager,
-                                egress_sink=egress_sink)
+                                egress_sink=egress_sink,
+                                on_call=UsageSink(bundle_manager, usage_spool, otlp_exporter))
     if config.mode == "managed":
         gateway_state = {"doc": json.dumps([bundle_manager.serves_several, bundle_manager.gateway_documents()],
                                            sort_keys=True, default=str)}
@@ -282,6 +301,9 @@ async def lifespan(app: FastAPI):
         if judge_spool is not None and getattr(judge_spool, "path", None) is not None:
             audit_shippers.append(SpoolShipper(str(judge_spool.path), f"{cp}/v1/runtime/audit/judge",
                                                sender, name="judge-audit"))
+        if app.state.usage_spool:
+            audit_shippers.append(SpoolShipper(app.state.usage_spool, f"{cp}/v1/runtime/llm-calls",
+                                               sender, name="llm-calls"))
         for shipper in audit_shippers:
             shipper.start()
     app.state.audit_shippers = audit_shippers
@@ -345,6 +367,8 @@ async def lifespan(app: FastAPI):
         await benchmark_worker.stop()
     await heartbeat.stop()
     await telemetry.stop()
+    if otlp_exporter is not None:
+        await otlp_exporter.close()
     for shipper in getattr(app.state, "audit_shippers", []):
         await shipper.stop(final_attempt=True)
     await bundle_manager.stop()
@@ -473,6 +497,10 @@ app.add_middleware(MetricsMiddleware, collector=MetricsCollector())
 # Bodies are read before a route's authentication runs: capped in size and time.
 from znyx_runtime.request_limits import BodyLimitMiddleware
 app.add_middleware(BodyLimitMiddleware)
+
+# The caller's trace context (traceparent), for the spans of evaluate-API checks.
+from znyx_runtime.otel import TraceContextMiddleware
+app.add_middleware(TraceContextMiddleware)
 
 
 @app.get("/metrics", include_in_schema=False)

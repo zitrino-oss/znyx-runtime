@@ -59,12 +59,13 @@ class Part:
 
 @dataclass
 class Usage:
-    input_tokens: Optional[int] = None
+    input_tokens: Optional[int] = None           # all input, cache reads and writes included
     output_tokens: Optional[int] = None
-    cached_input_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None    # read from a prompt cache
+    cache_write_tokens: Optional[int] = None     # written to a prompt cache (Anthropic)
 
     def add(self, other: "Usage") -> None:
-        for name in ("input_tokens", "output_tokens", "cached_input_tokens"):
+        for name in ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens"):
             value = getattr(other, name)
             if value is not None:
                 setattr(self, name, value)
@@ -586,10 +587,10 @@ class AnthropicMessages:
         if not isinstance(u, dict):
             return Usage()
         cached = u.get("cache_read_input_tokens")
-        created = u.get("cache_creation_input_tokens") or 0
+        created = u.get("cache_creation_input_tokens")
         base = u.get("input_tokens")
-        total_in = None if base is None else base + (cached or 0) + created
-        return Usage(total_in, u.get("output_tokens"), cached)
+        total_in = None if base is None else base + (cached or 0) + (created or 0)
+        return Usage(total_in, u.get("output_tokens"), cached, created)
 
 
 FORMATS = {"openai": OpenAIChat, "azure": OpenAIChat, "anthropic": AnthropicMessages}

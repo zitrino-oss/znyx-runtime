@@ -254,6 +254,41 @@ the one model server (the first wins when two pin the same task differently).
 `/v1/bundle/status` shows the environments only to the instance's own key. A control
 plane without bundle sets is read as before, one bundle per runtime.
 
+### Usage, spend and traces
+
+Every gateway call becomes a usage event: who called (key, app, agent, and the end user as
+a pseudonym), provider and model, tokens as the provider reported them (estimates are
+flagged), cost from the price table (prompt-cache reads and writes priced as such),
+latency, time to first token, guard time and what the guardrails decided. Never prompt or
+answer text. In managed mode the events are spooled on disk and delivered to the console,
+which turns them into spend by project, app, agent, key, model and user, budgets and
+alerts, forecasts and chargeback exports. A budget set to block reaches the gateway in the
+signed bundle set, and calls in its scope are refused until its period ends or it is
+raised.
+
+The end user comes from `X-Znyx-User`, OpenAI's `user` or Anthropic's `metadata.user_id`;
+`settings.user_ids` is `hash` (default), `plain` or `off`. `hash` is a keyed hash whose key never
+leaves the runtime side: set `ZNYX_USER_ID_KEY` to the same value on every replica (otherwise each
+install generates its own in `~/.znyx/user-id.key` and a user's pseudonym differs between
+installs). While a blocking budget is active, models without a price are refused in its scope.
+
+Traces follow the W3C trace context: send `traceparent` (or `X-Znyx-Trace-Id`) with an
+agent's LLM calls and its `/v1/evaluate/*` checks and they form one trace; each response
+carries its own `traceparent`. Spans follow the OpenTelemetry GenAI conventions
+(`chat {model}`, `gen_ai.*`) with each guardrail check as a child span, and are exported
+over OTLP/HTTP to your own collector, Datadog, Splunk, Langfuse or SIEM tool with the
+standard variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.internal:4318
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20..."
+export OTEL_SERVICE_NAME=payments-gateway
+```
+
+Air-gapped, an endpoint outside the network is refused. Prometheus labels on gateway
+metrics stay bounded: models the provider reported serving, configured provider names, and
+the apps of configured keys (others count as `other`).
+
 ## Secure by default
 
 - **Auth on by default.** The evaluate endpoints require an API key. In

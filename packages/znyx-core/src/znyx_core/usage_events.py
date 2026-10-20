@@ -1,0 +1,199 @@
+"""The usage event of one gateway call: what the runtime ships to the control plane for
+observability and FinOps.
+
+Metadata only, never text: who called (key, app, agent, end user as a pseudonym), which
+provider and model, tokens as the provider reported them (or an estimate, flagged),
+cost from the price table, timings, what the guardrails decided, which techniques ran,
+and where the call sits in a trace. One flat record with scalar fields (plus two small
+lists and one small map), so it fits a row store with rollups now and a columnar store
+later without reshaping.
+
+The runtime builds events with ``build``; the control plane accepts them with
+``validate``, which never trusts the sender: it keeps only known fields, coerces types,
+bounds every string and list, and refuses events it cannot attribute.
+"""
+from __future__ import annotations
+
+import math
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+SCHEMA_VERSION = 1
+
+# field -> kind. str fields are bounded to MAX_STR characters.
+FIELDS: Dict[str, str] = {
+    "schema": "int",
+    "event_id": "str",              # unique per call: the control plane drops repeats
+    "occurred_at": "time",          # when the call started (UTC)
+    "request_id": "str",
+    "trace_id": "hex32",            # W3C trace id of the call's trace
+    "span_id": "hex16",             # the call's own span
+    "parent_span_id": "hex16",      # the caller's span, when it sent traceparent
+    "environment_id": "str",        # the bundle-set member (an environment id) when known
+    "project_id": "str",
+    "tenant_id": "str",
+    "app_id": "str",
+    "agent_id": "str",
+    "key_id": "str",                # the gateway key's id (never the key)
+    "user": "str",                  # the end user, pseudonymised by default
+    "api": "str",                   # openai | azure | anthropic
+    "provider": "str",              # the provider's configured name
+    "provider_format": "str",       # openai | azure_openai | anthropic
+    "model": "str",                 # as requested
+    "response_model": "str",        # as the provider reported serving
+    "stream": "bool",
+    "status": "int",
+    "outcome": "str",               # ok | blocked_input | blocked_output | denied | error
+    "reason": "str",
+    "input_decision": "str",
+    "output_decision": "str",
+    "rule_ids": "strlist",
+    "input_tokens": "int",
+    "output_tokens": "int",
+    "cached_input_tokens": "int",
+    "cache_write_tokens": "int",
+    "usage_estimated": "bool",      # tokens estimated: the provider's count never arrived
+    "cost_usd": "float",
+    "price_known": "bool",
+    "latency_ms": "int",
+    "upstream_ms": "int",
+    "ttft_ms": "int",
+    "guard_ms": "int",
+    "techniques": "countmap",       # technique -> how many times it acted
+}
+
+MAX_STR = 200
+MAX_LIST = 50
+MAX_MAP = 30
+# Per-event ceilings: far above any real call, low enough that sums over millions of
+# events never overflow a rollup column.
+_CAPS = {"input_tokens": 10_000_000, "output_tokens": 10_000_000, "cached_input_tokens": 10_000_000,
+         "cache_write_tokens": 10_000_000, "latency_ms": 86_400_000, "upstream_ms": 86_400_000,
+         "ttft_ms": 86_400_000, "guard_ms": 86_400_000, "status": 999}
+MAX_COST_USD = 100_000.0
+MAX_COUNT = 1_000_000
+# Characters a database text column refuses (NUL) or that cannot be encoded (lone surrogates).
+_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
+OUTCOMES = ("ok", "blocked_input", "blocked_output", "denied", "error")
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+_HEX16 = re.compile(r"^[0-9a-f]{16}$")
+
+
+def new_trace_id() -> str:
+    return uuid.uuid4().hex
+
+
+def new_span_id() -> str:
+    return uuid.uuid4().hex[:16]
+
+
+def parse_traceparent(value: Optional[str]):
+    """``(trace_id, parent_span_id)`` from a W3C ``traceparent`` header, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    parts = value.strip().lower().split("-")
+    if len(parts) < 4 or parts[0] == "ff" or len(parts[0]) != 2:
+        return None
+    trace_id, span_id = parts[1], parts[2]
+    if not _HEX32.match(trace_id) or not _HEX16.match(span_id):
+        return None
+    if trace_id == "0" * 32 or span_id == "0" * 16:
+        return None
+    return trace_id, span_id
+
+
+def traceparent(trace_id: str, span_id: str, sampled: bool = True) -> str:
+    return f"00-{trace_id}-{span_id}-{'01' if sampled else '00'}"
+
+
+def build(**fields: Any) -> Dict[str, Any]:
+    """An event from the runtime's call record (unknown fields dropped)."""
+    event = {name: (clean_str(value) if FIELDS[name] == "str" and isinstance(value, str) else value)
+             for name, value in ((n, fields.get(n)) for n in FIELDS) if value is not None}
+    event["schema"] = SCHEMA_VERSION
+    event.setdefault("event_id", uuid.uuid4().hex)
+    event.setdefault("occurred_at", datetime.now(timezone.utc).isoformat())
+    return event
+
+
+def clean_str(value: Any) -> str:
+    """A string any store accepts: NUL and lone surrogates removed, bounded."""
+    return _UNSTORABLE.sub("", str(value))[:MAX_STR]
+
+
+def _coerce(kind: str, value: Any, cap: int = 2 ** 53):
+    if value is None:
+        return None
+    if kind == "str":
+        return clean_str(value)
+    if kind == "hex32":
+        value = str(value).lower()
+        return value if _HEX32.match(value) else None
+    if kind == "hex16":
+        value = str(value).lower()
+        return value if _HEX16.match(value) else None
+    if kind == "int":
+        if isinstance(value, bool):
+            return int(value)
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return max(0, min(number, cap))
+    if kind == "float":
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) and 0 <= number <= MAX_COST_USD else None
+    if kind == "bool":
+        return value is True
+    if kind == "time":
+        try:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    if kind == "strlist":
+        if not isinstance(value, list):
+            return None
+        return [clean_str(v) for v in value[:MAX_LIST]]
+    if kind == "countmap":
+        if not isinstance(value, dict):
+            return None
+        out = {}
+        for k, v in list(value.items())[:MAX_MAP]:
+            number = _coerce("int", v, MAX_COUNT)
+            if number is not None:
+                out[clean_str(k)] = number
+        return out
+    return None
+
+
+def validate(event: Any) -> Optional[Dict[str, Any]]:
+    """The event as the control plane may store it, or None when it is unusable (not a
+    mapping, an unknown schema, no id or time). Strings bounded, numbers clamped,
+    unknown fields dropped, ``occurred_at`` a timezone-aware datetime."""
+    if not isinstance(event, dict) or event.get("schema") != SCHEMA_VERSION:
+        return None
+    out: Dict[str, Any] = {}
+    for name, kind in FIELDS.items():
+        value = _coerce(kind, event.get(name), _CAPS.get(name, 2 ** 53))
+        if value is not None:
+            out[name] = value
+    if not out.get("event_id") or not out.get("occurred_at"):
+        return None
+    if out.get("outcome") not in OUTCOMES:
+        out["outcome"] = "error" if out.get("status", 0) >= 400 else "ok"
+    return out
+
+
+def total_tokens(event: Dict[str, Any]) -> int:
+    return int(event.get("input_tokens") or 0) + int(event.get("output_tokens") or 0)
+
+
+def columns() -> List[str]:
+    """The field names, in schema order (a columnar store's column list)."""
+    return list(FIELDS)

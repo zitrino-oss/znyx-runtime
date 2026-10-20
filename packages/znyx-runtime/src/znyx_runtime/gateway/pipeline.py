@@ -31,6 +31,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Request
@@ -129,13 +130,24 @@ class CallRecord:
     started: float = field(default_factory=time.perf_counter)
     estimated_input_tokens: int = 0        # used only when the provider's count is missing
     member: str = ""                       # the environment (bundle set member) of the key
+    # Phase 3: what the usage event and the trace span carry.
+    occurred_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    started_ns: int = field(default_factory=time.time_ns)
+    trace_id: str = ""
+    span_id: str = ""
+    parent_span_id: Optional[str] = None
+    user: Optional[str] = None             # the end user, pseudonymised (settings.user_ids)
+    provider_format: Optional[str] = None
+    cache_write_tokens: Optional[int] = None
+    usage_estimated: bool = False
+    price_known: bool = False
 
     def note(self, technique: str, count: int = 1) -> None:
         self.techniques[technique] = self.techniques.get(technique, 0) + count
 
     def to_event(self) -> Dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items()
-                if k not in ("started", "estimated_input_tokens", "member")}
+                if k not in ("started", "estimated_input_tokens", "member", "started_ns")}
         data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return data
 
@@ -245,6 +257,13 @@ class Gateway:
         self._instance_key = instance_key(config.settings)
         self._slots = asyncio.Semaphore(config.settings.max_concurrent)
         self._slots_size = config.settings.max_concurrent
+        self._known_apps = self._app_labels(config)
+
+    @staticmethod
+    def _app_labels(config: GatewayConfig) -> set:
+        """The apps a metric may name: those of configured keys (bounded), so a label's
+        values come from the configuration, never from callers."""
+        return set(sorted({k.app_id for k in config.keys_by_digest.values()})[:200])
 
     def update_config(self, config: GatewayConfig) -> None:
         """Swap in a new configuration (a new bundle). Calls in flight finish on the
@@ -256,6 +275,7 @@ class Gateway:
         self._member_prices = {m: PriceTable(p) for m, p in config.member_prices.items()}
         self.upstream = Upstream(max_connections=config.settings.max_concurrent)
         self._instance_key = instance_key(config.settings)
+        self._known_apps = self._app_labels(config)
         if config.settings.max_concurrent != self._slots_size:
             self._slots = asyncio.Semaphore(config.settings.max_concurrent)
             self._slots_size = config.settings.max_concurrent
@@ -293,6 +313,7 @@ class Gateway:
         fmt = fmts.FORMATS[api]
         record = CallRecord(request_id=request.headers.get("x-request-id") or f"gw-{uuid.uuid4().hex}",
                             key_id="", tenant_id="", app_id="", agent_id="", api=api)
+        self._trace(record, request)
         # Who is calling is settled from the headers before anything else: a caller
         # without a valid key gets no concurrency slot and no body read.
         try:
@@ -342,6 +363,52 @@ class Gateway:
             if not handed_off:
                 release()
 
+    @staticmethod
+    def _trace(record: CallRecord, request: Request) -> None:
+        """The call's place in a trace (W3C trace context): the caller's ``traceparent``
+        makes this call a child of the caller's span; ``X-Znyx-Trace-Id`` joins a trace by
+        id alone; otherwise the call starts a trace of its own."""
+        from znyx_core import usage_events
+        parent = usage_events.parse_traceparent(request.headers.get("traceparent"))
+        if parent:
+            record.trace_id, record.parent_span_id = parent
+        else:
+            given = (request.headers.get("x-znyx-trace-id") or "").strip().lower().replace("-", "")
+            record.trace_id = given if re.fullmatch(r"[0-9a-f]{32}", given or "") else usage_events.new_trace_id()
+        record.span_id = usage_events.new_span_id()
+
+    @staticmethod
+    def trace_headers(record: CallRecord) -> Dict[str, str]:
+        from znyx_core import usage_events
+        return {"x-znyx-request-id": record.request_id, "x-znyx-trace-id": record.trace_id,
+                "traceparent": usage_events.traceparent(record.trace_id, record.span_id)}
+
+    def _user_of(self, request: Request, body: Dict[str, Any]) -> Optional[str]:
+        """The end user the app called for: ``X-Znyx-User``, else the API's own field
+        (OpenAI ``user``, Anthropic ``metadata.user_id``). Pseudonymised by default
+        (``settings.user_ids``: hash | plain | off): a keyed hash whose key stays on the
+        runtime side, so the console can group spend by user without learning, or guessing,
+        who the users are."""
+        mode = self.config.settings.user_ids
+        if mode == "off":
+            return None
+        raw = request.headers.get("x-znyx-user")
+        if not raw:
+            raw = body.get("user") if isinstance(body.get("user"), str) else None
+        if not raw and isinstance(body.get("metadata"), dict):
+            value = body["metadata"].get("user_id")
+            raw = value if isinstance(value, str) else None
+        if not raw:
+            return None
+        raw = raw.strip()[:200]
+        if mode == "plain":
+            return raw
+        import hmac
+        from znyx_runtime.install_state import user_id_key
+        scope = self.bundle_manager.members[0].bundle.org_id if getattr(self.bundle_manager, "members", None) else ""
+        digest = hmac.new(user_id_key(), f"{scope}\x1f{raw}".encode("utf-8", "surrogatepass"), hashlib.sha256)
+        return "u_" + digest.hexdigest()[:16]
+
     def _finish(self, record: CallRecord, fmt, denied: Denied) -> Response:
         record.status = denied.status
         record.outcome = denied.outcome
@@ -349,7 +416,7 @@ class Gateway:
         status, body = fmt.error(denied.status, denied.message, code=denied.code,
                                  error_type=denied.error_type,
                                  extra={"request_id": record.request_id, "reason": denied.code})
-        headers = {"x-znyx-request-id": record.request_id}
+        headers = self.trace_headers(record)
         if denied.retry_after:
             headers["retry-after"] = str(denied.retry_after)
         self._record(record)
@@ -484,17 +551,18 @@ class Gateway:
             estimated = True
         if estimated:
             record.note("usage_estimated")
+            record.usage_estimated = True
+            record.price_known = self.prices_for(record.member).lookup(record.response_model or record.model) is not None
             record.cost_usd = self.prices_for(record.member).cost(
                 record.response_model or record.model,
-                fmts.Usage(record.input_tokens, record.output_tokens, record.cached_input_tokens))
+                fmts.Usage(record.input_tokens, record.output_tokens, record.cached_input_tokens,
+                           record.cache_write_tokens))
 
     async def _permit_egress(self, provider: Provider, policy: Dict[str, Any], body_bytes: int,
                              scope: Dict[str, str], record: CallRecord) -> None:
         """Data residency and the egress allowlist through the same gate model calls
         use. A boundary-crossing call is audited before it is made, and a call that
         cannot be audited is not made (fail-closed), exactly as for model backends."""
-        from datetime import datetime, timezone
-
         from znyx_core.engine.egress import EgressEvent, evaluate_egress
 
         rp = policy.get("runtime_policy") or {}
@@ -590,6 +658,52 @@ class Gateway:
         if isinstance(call, dict) and call.get("name") in removed:
             body.pop("function_call", None)
 
+    @staticmethod
+    def _in_scope(entry: Dict[str, Any], key: GatewayKey, project: str, environment: str) -> bool:
+        scope = entry.get("scope")
+        return (scope == "org"
+                or (scope == "project" and entry.get("project_id") == project)
+                or (scope == "environment" and entry.get("environment_id") == environment)
+                or (scope == "app" and entry.get("app_id") == key.app_id
+                    and entry.get("project_id") in (None, "", project))
+                or (scope == "key" and entry.get("key_id") == key.id
+                    and entry.get("project_id") in (None, "", project)
+                    and entry.get("environment_id") in (None, "", environment)))
+
+    def _check_spend_controls(self, key: GatewayKey, member, model: Optional[str] = None) -> None:
+        """Budgets the console set to block (signed in the bundle set). A spent one refuses
+        calls in its scope until its period ends or it is raised; while any is active, a
+        model without a price is refused in its scope, since such calls would cost nothing
+        against it."""
+        controls = getattr(self.bundle_manager, "controls", None) or {}
+        if not isinstance(controls, dict) or not controls:
+            return
+        project = member.project_id if member is not None else ""
+        environment = member.environment_id if member is not None else ""
+        now = datetime.now(timezone.utc)
+        for entry in controls.get("spend_blocked") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                until = datetime.fromisoformat(str(entry.get("until")).replace("Z", "+00:00"))
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=timezone.utc)
+                if until <= now:
+                    continue                     # the budget's period is over
+            except ValueError:
+                pass                             # no end given: blocked until it is lifted
+            if self._in_scope(entry, key, project, environment):
+                name = entry.get("name") or "a budget"
+                raise Denied(429, f"Spend budget {name!r} is spent; calls are refused until it resets "
+                                  "or is raised", "budget_exhausted", error_type="rate_limit_error")
+        if model is not None and self.prices_for(key.member).lookup(model) is None:
+            for entry in controls.get("priced_only") or []:
+                if isinstance(entry, dict) and self._in_scope(entry, key, project, environment):
+                    name = entry.get("name") or "a budget"
+                    raise Denied(403, f"Model {model} has no price on this gateway, and spend here is "
+                                      f"limited by budget {name!r}; add a price for it", "price_unknown",
+                                 error_type="permission_error")
+
     def _check_provider_side_calls(self, api: str, body: Dict[str, Any]) -> None:
         if api == "anthropic" and body.get("mcp_servers") and not self.config.settings.allow_provider_mcp:
             raise Denied(400, "MCP servers called by the provider bypass the gateway's tool policy and "
@@ -610,8 +724,10 @@ class Gateway:
         return EvaluationRequest(
             request_id=f"{record.request_id}-{suffix}", tenant_id=scope["tenant_id"],
             app_id=scope["app_id"], agent_id=scope["agent_id"], env=scope["env"], text=text,
-            session_id=scope["session_id"] or None, trace_id=record.request_id,
-            metadata=metadata)
+            # span_id: the span this check belongs to (the call's), so a check is a child
+            # span of the call in the trace.
+            session_id=scope["session_id"] or None, trace_id=record.trace_id or record.request_id,
+            span_id=record.span_id or None, metadata=metadata)
 
     async def _check_one(self, text: str, kind: str, role: str, tool_name: Optional[str], stage: str,
                          scope: Dict[str, str], record: CallRecord, policy: Dict[str, Any], label: str,
@@ -632,7 +748,8 @@ class Gateway:
                 app_id=scope["app_id"], agent_id=scope["agent_id"], env=scope["env"],
                 tool_name=tool_name or "tool", tool_args=args,
                 tool_result=text if kind == "tool_result" else None,
-                session_id=scope["session_id"] or None, trace_id=record.request_id,
+                session_id=scope["session_id"] or None, trace_id=record.trace_id or record.request_id,
+                span_id=record.span_id or None,
                 metadata={"source": "gateway", "api": record.api, "stage": stage})
             result = await self.evaluator.evaluate_tool(tool_req, policy=policy,
                                                         judge_ctx=runtime_judge_ctx(policy, tool_req))
@@ -812,6 +929,8 @@ class Gateway:
             raise Denied(400 if requested_provider else 403, str(exc), "provider_not_available",
                          error_type="permission_error") from None
         record.provider = provider.name
+        record.provider_format = provider.format
+        record.user = self._user_of(request, body)
         if provider.blocked:
             raise Denied(403, provider.blocked, "provider_not_allowed_here", error_type="permission_error")
         if provider.uses_client_key and not client_credential:
@@ -840,6 +959,7 @@ class Gateway:
             member = self.bundle_manager.member_by_key(key.member or None)
         except ScopeNotServed as exc:
             raise Denied(403, str(exc), "project_not_served", error_type="permission_error") from None
+        self._check_spend_controls(key, member, record.model)
         scope = self._scope(key, request, member)
         try:
             policy = self.bundle_manager.get_policy(tenant_id=scope["tenant_id"], app_id=scope["app_id"],
@@ -901,7 +1021,7 @@ class Gateway:
         response = upstream_task.result()
         record.upstream_ms = int((time.perf_counter() - t_up) * 1000)
         returned = self.upstream.returned_headers(response)
-        returned["x-znyx-request-id"] = record.request_id
+        returned.update(self.trace_headers(record))
         if response.status_code != 200:
             # The provider's own error, as the provider sent it: SDK retry and error
             # handling keep working.
@@ -944,18 +1064,21 @@ class Gateway:
         record.input_tokens = usage.input_tokens
         record.output_tokens = usage.output_tokens
         record.cached_input_tokens = usage.cached_input_tokens
-        record.cost_usd = self.prices_for(record.member).cost(record.response_model or record.model, usage)
+        record.cache_write_tokens = usage.cache_write_tokens
+        prices = self.prices_for(record.member)
+        record.price_known = prices.lookup(record.response_model or record.model) is not None
+        record.cost_usd = prices.cost(record.response_model or record.model, usage)
 
     def _record(self, record: CallRecord) -> None:
         record.latency_ms = int((time.perf_counter() - record.started) * 1000)
         record.rule_ids = sorted(set(record.rule_ids))
         try:
             from znyx_runtime.gateway.usage import record_call
-            record_call(record)
+            record_call(record, app_label=record.app_id if record.app_id in self._known_apps else "other")
         except Exception:  # noqa: BLE001 - recording must never fail a call
             logger.debug("gateway: recording failed", exc_info=True)
         if self.on_call is not None:
             try:
-                self.on_call(record.to_event())
+                self.on_call(record)
             except Exception:  # noqa: BLE001
                 logger.debug("gateway: on_call failed", exc_info=True)

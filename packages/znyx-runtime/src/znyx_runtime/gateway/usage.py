@@ -38,18 +38,34 @@ def _collector():
     return collector
 
 
+_MODEL_LABELS: set = set()
+MAX_MODEL_LABELS = 50
+
+
 def _model_label(record) -> str:
     """The model a provider reported serving. A requested name is the caller's free
-    text (unbounded, and on a denied call never served), so it is not a label."""
+    text (unbounded, and on a denied call never served), so it is not a label; and a
+    provider that echoes the request could make the served name free text too, so only
+    the first ``MAX_MODEL_LABELS`` distinct names become labels, the rest "other"."""
     model = record.response_model
     if not isinstance(model, str) or not model:
         return "other"
-    return model[:100]
+    model = model[:100]
+    with _LOCK:
+        if model in _MODEL_LABELS:
+            return model
+        if len(_MODEL_LABELS) < MAX_MODEL_LABELS:
+            _MODEL_LABELS.add(model)
+            return model
+    return "other"
 
 
-def record_call(record) -> None:
+def record_call(record, app_label: str = "other") -> None:
+    """``app_label``: the call's app when it is one of the configured keys' apps, else
+    "other" (labels stay bounded by configuration)."""
     collector = _collector()
-    labels = {"provider": record.provider or "none", "model": _model_label(record)}
+    labels = {"provider": record.provider or "none", "model": _model_label(record),
+              "app": str(app_label)[:100]}
     collector.counter_inc("znyx_gateway_requests_total",
                           labels={**labels, "outcome": record.outcome, "status": str(record.status)})
     if record.input_tokens:

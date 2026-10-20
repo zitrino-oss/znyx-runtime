@@ -10,9 +10,10 @@ Matching: the exact model id, then the id without a date or version suffix
 (``gpt-4o-2024-08-06`` -> ``gpt-4o``, ``claude-3-5-haiku-20241022`` ->
 ``claude-3-5-haiku``), then the longest table entry the id starts with.
 
-Cached input is priced at ``cached_input_per_mtok`` where the table has it.
-Anthropic cache writes are counted as ordinary input (they cost 25% more), so cost
-for prompts that write the cache is slightly understated.
+Cached input (cache reads) is priced at ``cached_input_per_mtok`` and input written to
+a prompt cache at ``cache_write_per_mtok`` (Anthropic's five-minute cache: 1.25 times
+input) where the table has them, otherwise at the input price. Reasoning tokens are part
+of the output tokens a provider reports and are priced as output.
 """
 from __future__ import annotations
 
@@ -37,15 +38,15 @@ DEFAULT_PRICES: Dict[str, Dict[str, float]] = {
     "o4-mini": {"input_per_mtok": 1.10, "cached_input_per_mtok": 0.275, "output_per_mtok": 4.40},
     "o3-mini": {"input_per_mtok": 1.10, "cached_input_per_mtok": 0.55, "output_per_mtok": 4.40},
     # Anthropic
-    "claude-opus-4-5": {"input_per_mtok": 5.00, "cached_input_per_mtok": 0.50, "output_per_mtok": 25.00},
-    "claude-opus-4-1": {"input_per_mtok": 15.00, "cached_input_per_mtok": 1.50, "output_per_mtok": 75.00},
-    "claude-opus-4": {"input_per_mtok": 15.00, "cached_input_per_mtok": 1.50, "output_per_mtok": 75.00},
-    "claude-sonnet-4-5": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "output_per_mtok": 15.00},
-    "claude-sonnet-4": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "output_per_mtok": 15.00},
-    "claude-3-7-sonnet": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "output_per_mtok": 15.00},
-    "claude-3-5-sonnet": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "output_per_mtok": 15.00},
-    "claude-haiku-4-5": {"input_per_mtok": 1.00, "cached_input_per_mtok": 0.10, "output_per_mtok": 5.00},
-    "claude-3-5-haiku": {"input_per_mtok": 0.80, "cached_input_per_mtok": 0.08, "output_per_mtok": 4.00},
+    "claude-opus-4-5": {"input_per_mtok": 5.00, "cached_input_per_mtok": 0.50, "cache_write_per_mtok": 6.25, "output_per_mtok": 25.00},
+    "claude-opus-4-1": {"input_per_mtok": 15.00, "cached_input_per_mtok": 1.50, "cache_write_per_mtok": 18.75, "output_per_mtok": 75.00},
+    "claude-opus-4": {"input_per_mtok": 15.00, "cached_input_per_mtok": 1.50, "cache_write_per_mtok": 18.75, "output_per_mtok": 75.00},
+    "claude-sonnet-4-5": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "cache_write_per_mtok": 3.75, "output_per_mtok": 15.00},
+    "claude-sonnet-4": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "cache_write_per_mtok": 3.75, "output_per_mtok": 15.00},
+    "claude-3-7-sonnet": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "cache_write_per_mtok": 3.75, "output_per_mtok": 15.00},
+    "claude-3-5-sonnet": {"input_per_mtok": 3.00, "cached_input_per_mtok": 0.30, "cache_write_per_mtok": 3.75, "output_per_mtok": 15.00},
+    "claude-haiku-4-5": {"input_per_mtok": 1.00, "cached_input_per_mtok": 0.10, "cache_write_per_mtok": 1.25, "output_per_mtok": 5.00},
+    "claude-3-5-haiku": {"input_per_mtok": 0.80, "cached_input_per_mtok": 0.08, "cache_write_per_mtok": 1.00, "output_per_mtok": 4.00},
 }
 
 _SUFFIX = re.compile(r"(-\d{4}-\d{2}-\d{2}|-\d{8}|-latest|@[\w.-]+)$")
@@ -81,8 +82,10 @@ class PriceTable:
         if price is None or usage.input_tokens is None and usage.output_tokens is None:
             return None
         cached = usage.cached_input_tokens or 0
-        fresh = max(0, (usage.input_tokens or 0) - cached)
+        written = usage.cache_write_tokens or 0
+        fresh = max(0, (usage.input_tokens or 0) - cached - written)
         cached_rate = price.get("cached_input_per_mtok", price["input_per_mtok"])
-        total = (fresh * price["input_per_mtok"] + cached * cached_rate
+        write_rate = price.get("cache_write_per_mtok", price["input_per_mtok"])
+        total = (fresh * price["input_per_mtok"] + cached * cached_rate + written * write_rate
                  + (usage.output_tokens or 0) * price["output_per_mtok"]) / 1_000_000
         return round(total, 8)
