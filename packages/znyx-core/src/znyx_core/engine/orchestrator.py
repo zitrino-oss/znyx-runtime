@@ -32,6 +32,10 @@ class OrchestrationResult:
     current_text: str = ""
     early_block: bool = False
     detector_timings: List[DetectorTimingResult] = field(default_factory=list)
+    # One (text_before, text_after, redaction_spans, text_edits) entry per detector that rewrote
+    # current_text, in order. The strings are references, not copies. Streaming
+    # evaluation uses it to locate each edit exactly (engine/streaming.py).
+    edit_steps: List[tuple] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +62,9 @@ _DETECTOR_PIPELINE: List[tuple] = [
     # (retrieval + N agent-steps + memory-write would otherwise burn many request tokens).
     ("abuse",             True,  ("input", "output"), False),
     # 1. Secrets (hard block)
-    ("secrets",           True,  None,     False),
+    # can_transform: a REDACT-action secrets result must feed the chained text, or a
+    # later rewrite (pii) replaces current_text and the redacted secret is returned raw.
+    ("secrets",           True,  None,     True),
     # 2. Exfiltration
     ("exfiltration",      True,  None,     False),
     # 2a. Gibberish
@@ -118,7 +124,7 @@ _DETECTOR_PIPELINE: List[tuple] = [
     ("reasoning_trace_disclosure", False, "output",                        False),
     # Output-side counterpart to the input normaliser: stops model output rewriting a
     # terminal, where the input path stops an attacker hiding from the detectors.
-    ("output_control_char_sanitizer", False, "output",                      False),
+    ("output_control_char_sanitizer", False, "output",                      True),
     ("multimodal_injection",      False, "input",                           False),
     # A semantic cache is consulted on the way IN and can also be reported alongside the
     # answer, so it runs in both directions; the detector no-ops without a cache block.
@@ -298,14 +304,19 @@ class DetectorOrchestrator:
                 # Continue running remaining detectors for full observability.
                 # The final decision will still be BLOCK (aggregator picks worst),
                 # but all detector results will be reported to the caller.
-            elif (can_transform and context in ("input", "output")
+            elif (can_transform and context in ("input", "output", "tool")
                   and result.decision in (Decision.REDACT, Decision.TRANSFORM)
                   and result.sanitized_text):
-                # Only rewrite text on the input/output stages. On the new stages
+                # Rewrite text on the input/output stages and for a tool result (text
+                # about to be sent to the model, so a REDACT means "send it redacted";
+                # evaluate_tool returns the redacted result). On the other stages
                 # (retrieval / agent_plan / agent_loop / memory_write) a legacy
                 # transform-capable detector (e.g. pii REDACT) must NOT silently mutate
                 # the retrieved chunk / plan / memory value — it still flags (WARN/BLOCK),
                 # but the content the agent sees is left intact for the caller to handle.
+                orch.edit_steps.append(
+                    (orch.current_text, result.sanitized_text, result.redaction_spans or None,
+                     result.text_edits))
                 orch.current_text = result.sanitized_text
                 transformed = True
 
@@ -337,7 +348,7 @@ class DetectorOrchestrator:
         # key was silently ignored by the fixed pipeline.
         _pipeline_keys = {k for k, *_ in _DETECTOR_PIPELINE}
         _reserved = {"runtime_policy", "custom_detectors", "output_contract", "quality_scoring",
-                     "_multilingual", "_scorecard_gate"}
+                     "_multilingual", "_scorecard_gate", "gateway"}
         for std_key, std_config in list(effective_policy.items()):
             if (std_key in _pipeline_keys or std_key in _POLICY_KEY_ALIASES or std_key in _reserved
                     or not isinstance(std_config, dict) or not std_config.get("enabled")):
@@ -389,12 +400,17 @@ class DetectorOrchestrator:
         request: "EvaluationRequest", context: str,
     ) -> DetectorResult:
         """Call the detector's ``detect`` method with the right signature."""
+        # Stateful detectors keep counters and histories per tenant and app. The
+        # environment is part of that identity: one runtime can serve several
+        # environments of a project, and development traffic must never throttle,
+        # escalate or spend the budget of production users.
+        state_app = f"{request.app_id}@{request.env}" if getattr(request, "env", None) else request.app_id
         if policy_key == "abuse":
             user_id = request.metadata.get('user_id') if request.metadata else None
             return detector.detect(
                 text,
                 tenant_id=request.tenant_id,
-                app_id=request.app_id,
+                app_id=state_app,
                 user_id=user_id,
                 context=context,
             )
@@ -403,7 +419,7 @@ class DetectorOrchestrator:
             # the same conversation id never share escalation state.
             conversation_id = request.metadata.get('conversation_id') if request.metadata else None
             return detector.detect(text, conversation_id=conversation_id,
-                                   tenant_id=request.tenant_id, app_id=request.app_id)
+                                   tenant_id=request.tenant_id, app_id=state_app)
         if policy_key == "unbounded_consumption":
             # Stateful (LLM06): needs scope + a per-identity key (session > user) for
             # per-session budget accounting and the budget signals in metadata
@@ -417,7 +433,7 @@ class DetectorOrchestrator:
             return detector.detect(
                 text,
                 tenant_id=request.tenant_id,
-                app_id=request.app_id,
+                app_id=state_app,
                 session_id=session_id,
                 context=context,
                 metadata=request.metadata,
@@ -451,12 +467,17 @@ class DetectorOrchestrator:
             import json as _json
             try:
                 tool_data = _json.loads(text)
-                tool_name = tool_data.get("tool_name", "")
-                tool_args = tool_data.get("arguments", tool_data.get("args", {}))
-            except (ValueError, TypeError, AttributeError):
-                tool_name = text
-                tool_args = {}
-            return detector.detect(tool_name, tool_args)
+            except (ValueError, TypeError):
+                tool_data = None
+            if not (isinstance(tool_data, dict) and isinstance(tool_data.get("tool_name"), str)
+                    and tool_data["tool_name"]):
+                # Free text, not a tool invocation (JSON that names no tool included):
+                # only a denied tool mentioned by name counts. The allowlist cannot apply
+                # ("hello" or a pasted {"a": 1} is not a tool missing from it), and
+                # applying it blocked every such message.
+                return detector.detect(text, {}, free_text=True)
+            tool_args = tool_data.get("arguments", tool_data.get("args", {}))
+            return detector.detect(tool_data["tool_name"], tool_args if isinstance(tool_args, dict) else {})
         return detector.detect(text)
 
     def _verify_and_apply_scorecard_gate(self, detector_id: str, config: Dict[str, Any],

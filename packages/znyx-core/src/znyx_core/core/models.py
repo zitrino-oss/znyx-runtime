@@ -432,6 +432,15 @@ class DetectorResult(BaseModel):
         default_factory=list,
         description="(start, end, label) character ranges this layer would redact",
     )
+    # Exact rewrite this result applied: (start, end, replacement) against the text the
+    # detector evaluated, sorted and disjoint (start == end is an insertion). Optional and
+    # informational: consumers must verify that applying it reproduces sanitized_text, and
+    # fall back to comparing the two strings when it does not. Streaming evaluation uses it
+    # to know exactly which characters each edit replaced (engine/streaming.py).
+    text_edits: Optional[List[Tuple[int, int, str]]] = Field(
+        default=None,
+        description="(start, end, replacement) edits that turn the evaluated text into sanitized_text",
+    )
 
     @field_validator("label_scores")
     @classmethod

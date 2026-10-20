@@ -699,6 +699,7 @@ _KNOWN_EXTRA_POLICY_KEYS = frozenset({
     "schema_enforcement",   # alias for the structure / output-contract detector
     "tool_governance",      # alias for the tools detector
     "_multilingual",        # multilingual overlay metadata
+    "gateway",              # AI gateway providers and keys (read by the runtime, not a detector)
     "metadata", "description", "name", "version",
 })
 

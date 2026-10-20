@@ -1,0 +1,337 @@
+# Default values for the Znyx chart.
+#
+# One container runs everything: every API on port 8080, worker processes sized to the
+# CPU limit, the local dashboard at /dashboard, and (with ml.enabled) the ML model
+# server on loopback inside the same pod. There is no sidecar container.
+#
+# Install:  helm install znyx ./deploy/helm/znyx
+# Check the rendered output:  helm template znyx ./deploy/helm/znyx
+
+# -- Name overrides ---------------------------------------------------------------------
+# nameOverride changes the app.kubernetes.io/name label and the name part of the
+# resource names. fullnameOverride replaces the whole resource name (default is the
+# release name, or "<release>-znyx" when the release name does not contain "znyx").
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Image ------------------------------------------------------------------------------
+image:
+  # Registry host (and optional port or path) prepended to the repository. Leave empty for
+  # Docker Hub, or set your private mirror for an air-gapped cluster, for example
+  # "registry.internal.example.com:5000". The mirror must hold the same repository path
+  # (<registry>/<repository>:<tag>), or put the whole path in `repository` instead.
+  registry: ""
+  # Repository path. With a mirror, either keep this and set `registry`, or set the full
+  # path here, for example "registry.internal.example.com/znyx/znyx", and leave `registry` empty.
+  repository: znyx/znyx
+  # Image tag. Empty: the chart's appVersion. When ml.enabled is true the tag gets an
+  # "-ml" suffix (for example 1.0.0-ml) unless it already ends with "-ml".
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Secrets used to pull the image from a private registry: a list of {name: <secret>}.
+imagePullSecrets: []
+
+# -- Replicas, scaling and availability ---------------------------------------------------
+# Number of pods. Ignored when autoscaling.enabled is true (the HPA owns the count).
+# More than one replica: configure Redis (see secrets.redisUrl) or each replica enforces
+# its own rate limits and budgets.
+replicaCount: 2
+
+# Rolling update behaviour.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# Horizontal Pod Autoscaler (autoscaling/v2) on CPU utilisation, measured against the
+# CPU request.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+# PodDisruptionBudget. Created only when the effective replica count is above 1 (so a
+# single-replica install can still be drained for node maintenance).
+podDisruptionBudget:
+  enabled: true
+  # Keep at least this many pods up during voluntary disruptions.
+  minAvailable: 1
+  # Set to use maxUnavailable instead of minAvailable (for example "25%").
+  maxUnavailable: ""
+
+# Soft spread of the pods across nodes (ScheduleAnyway: a scheduling preference, never
+# a reason for a pod to stay Pending). Set enabled: false to remove it.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+  whenUnsatisfiable: ScheduleAnyway
+
+# Seconds Kubernetes waits after SIGTERM before killing the pod. Znyx drains in-flight
+# requests for up to 30 seconds (config server.graceful_timeout), so keep this above it.
+terminationGracePeriodSeconds: 40
+
+# -- Znyx configuration (znyx.yaml) -----------------------------------------------------
+# Rendered with toYaml into the ConfigMap key znyx.yaml and passed to `znyx serve --config`.
+# Any znyx.yaml key is valid here (run `znyx config` in a container to list them all with
+# their defaults). Helm merges your values over these defaults, so you only write what you
+# change; set a key to null to drop a default.
+#
+# Precedence inside the container is: command-line flags, then environment variables, then
+# this file, then the image's own defaults (listen on 0.0.0.0, the built-in policy). The
+# chart sets a few environment variables that therefore win over the file: ZNYX_POLICY_PATH
+# (when `policy` is set), ZNYX_ML (ml.enabled), ZNYX_AIRGAPPED (airgapped) and
+# ZNYX_STATE_BACKEND (redis). Use the top-level chart values for those, not the file.
+#
+# Never put secrets here. Use `secrets` / `existingSecret` below; references such as
+# ${NAME} are expanded from the container environment if you need them in the file.
+config:
+  version: 1
+  server:
+    host: 0.0.0.0        # listen on every interface so the Service can reach the pod
+    port: 8080           # the one port for every API; the container port follows it
+    workers: auto        # worker processes: a number, or auto (one per CPU limit, up to 4)
+  mode: local            # local: policies from `policy`. managed: signed bundles from the console.
+  dashboard:
+    enabled: true        # the local dashboard at /dashboard
+  # Managed mode (mode: managed) also needs the console URL here; the token goes in
+  # secrets.runtimeToken (or existingSecret):
+  # control_plane:
+  #   url: https://console.example.com
+  #   require_signed_bundles: true
+  #   bundle_public_key: "<public key>"
+  # fail_mode: closed    # with no policy available, block rather than allow (open | closed)
+  # log_level: info      # critical | error | warning | info | debug
+  # state:
+  #   fail_mode: local   # when Redis is unreachable: local (per-replica limits) | closed
+
+# Policy file for local mode, as a string rendered into the ConfigMap key policies.yaml and
+# mounted at /etc/znyx/policies.yaml (ZNYX_POLICY_PATH is set to it). Empty: the image's
+# built-in /app/config/policies.yaml (a starter policy) is used. Use
+# `--set-file policy=./policies.yaml` to load it from a file. Ignored in managed mode.
+policy: ""
+
+# -- Credentials ------------------------------------------------------------------------
+# Name of a Secret you manage yourself (External Secrets, Sealed Secrets, Vault, ...).
+# When set, the chart creates no Secret and ignores `secrets` below. The Secret may hold
+# these keys: RUNTIME_API_KEY (required), ZNYX_RUNTIME_TOKEN (managed mode), ZNYX_REDIS_URL
+# (shared limits across replicas; also set state.redis.enabled: true).
+existingSecret: ""
+
+# Values for the chart-created Secret "<release>-secrets". Only non-empty keys are written.
+secrets:
+  # Client API key (RUNTIME_API_KEY). Empty and no existingSecret: the chart generates a
+  # random key on first install and keeps it across upgrades (it looks up the existing
+  # Secret). Read it with the kubectl command printed in the install notes. Note that
+  # `helm template` and GitOps tools that render offline (for example Argo CD without
+  # lookup support) cannot see the existing Secret and would generate a new key on every
+  # render: in that case set this value or use existingSecret.
+  apiKey: ""
+  # Runtime token from the console (ZNYX_RUNTIME_TOKEN). Required for config.mode: managed.
+  runtimeToken: ""
+  # Redis connection URL (ZNYX_REDIS_URL), for example redis://redis.default.svc:6379/0 or
+  # rediss://:password@host:6380/0. Setting it switches the state backend to redis so that
+  # all replicas share rate limits and budgets.
+  redisUrl: ""
+
+# Shared state across replicas.
+state:
+  redis:
+    # Use Redis for shared limits and budgets when the Secret comes from existingSecret
+    # (the chart cannot see inside it). Set true if that Secret holds ZNYX_REDIS_URL. With
+    # the chart-created Secret this is implied by secrets.redisUrl.
+    enabled: false
+
+# -- Modes ------------------------------------------------------------------------------
+# Air-gapped install: no outbound calls at all (no external model or judge calls, no
+# heartbeat, no model downloads). Sets ZNYX_AIRGAPPED=true and forces the NetworkPolicy on
+# with egress limited to DNS plus networkPolicy.egressTo / extraEgress. Pair it with
+# pre-fetched models on a volume (ml.models.existingClaim) and a private registry mirror.
+airgapped: false
+
+# ML model server. true: use the "-ml" image and start the model server inside the same
+# container on loopback (127.0.0.1:9000), never exposed and holding no credential, so the
+# pod needs no egress or Service for it. Weights are never baked into the image: they are
+# fetched and sha256-verified into /models, or provided from a volume.
+ml:
+  enabled: false
+  models:
+    # Existing PersistentVolumeClaim mounted at /models (pre-fetched, sha256-pinned weights,
+    # see packages/znyx-inference/MODELS.md). Use it for air-gapped installs and to avoid a
+    # re-download per pod. With several replicas the claim must be ReadOnlyMany or
+    # ReadWriteMany; one shared claim with concurrent writers is not safe, so for online
+    # installs leave this empty and each pod keeps its own copy.
+    existingClaim: ""
+    # Mount the claim read-only (recommended for pre-fetched, air-gapped weights).
+    readOnly: false
+    # Size limit of the per-pod emptyDir used when no claim is given. Budget about 1 GB per
+    # classifier or NER task and about 2.5 GB for a guard LLM; exceeding it evicts the pod.
+    sizeLimit: 25Gi
+
+# -- Persistence of /data -----------------------------------------------------------------
+# /data holds the generated API key (when none is provided), shared worker state and the
+# audit spools. The default is an emptyDir (lost when the pod is replaced), which is right
+# when the API key comes from a Secret and the audit data is shipped to a control plane.
+persistence:
+  enabled: false
+  # Use a claim you created. Empty: the chart creates "<release>-data" from the settings below.
+  existingClaim: ""
+  storageClass: ""
+  # ReadWriteOnce fits one replica only (replicaCount 1, no autoscaling). Use
+  # ReadWriteMany for several replicas, or leave persistence off.
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  annotations: {}
+
+# -- Metrics ----------------------------------------------------------------------------
+metrics:
+  # Require the API key on /metrics (ZNYX_METRICS_REQUIRE_KEY=true). The ServiceMonitor
+  # below then sends it as a Bearer token from the chart's Secret.
+  requireKey: false
+
+# -- Resources --------------------------------------------------------------------------
+# Empty: the chart picks defaults from the mode.
+#   rules only: requests cpu 1 / memory 512Mi, limits cpu 2 / memory 1Gi
+#   ml.enabled: requests cpu 2 / memory 2Gi,   limits cpu 4 / memory 4Gi
+# Worker processes are sized from the CPU limit (workers: auto is one per CPU, up to 4),
+# at about 140 MB each, so raise the memory limit together with the CPU limit.
+resources: {}
+
+# Probe timings. The paths are fixed: startup and liveness use /healthz (always 200),
+# readiness uses /readyz (503 until a policy is loaded).
+startupProbe:
+  failureThreshold: 30
+  periodSeconds: 2
+readinessProbe:
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+livenessProbe:
+  periodSeconds: 20
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# -- Pod security -------------------------------------------------------------------------
+# The image runs as uid 1000 and writes only to /data and /tmp, so the root filesystem is
+# read-only and every capability is dropped.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# Znyx does not call the Kubernetes API, so no service account token is mounted.
+automountServiceAccountToken: false
+
+# -- Scheduling and pod metadata ------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+podAnnotations: {}
+podLabels: {}
+
+# -- Extras -----------------------------------------------------------------------------------
+# Extra environment variables for the container (a list of standard EnvVar objects).
+extraEnv: []
+#  - name: ZNYX_LOG_LEVEL
+#    value: debug
+
+# Extra volumes and mounts (for example a CA bundle for an internal control plane).
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- Service ------------------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Service port; it forwards to the container port named "http" (8080).
+  port: 80
+  annotations: {}
+
+# -- Ingress (optional) ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: znyx.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # TLS: a list of {secretName, hosts}.
+  tls: []
+  #  - secretName: znyx-tls
+  #    hosts:
+  #      - znyx.example.com
+
+# -- Prometheus Operator ServiceMonitor (optional) ---------------------------------------------------
+# Scrapes /metrics on the Service port "http". Needs the monitoring.coreos.com CRDs.
+serviceMonitor:
+  enabled: false
+  # Namespace for the ServiceMonitor. Empty: the release namespace.
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels, for example the "release: <prometheus>" label your Prometheus selects on.
+  labels: {}
+
+# -- NetworkPolicy ------------------------------------------------------------------------------------
+# Off by default; always on when airgapped is true.
+#
+# Ingress: only to the container port "http", only from `ingressFrom`.
+# Egress: DNS (kube-dns on UDP/TCP 53) is always allowed. Beyond that:
+#   - not airgapped: TCP 443 to anywhere (managed-mode control plane, model downloads,
+#     external judges), or only to `egressTo` when you set it;
+#   - airgapped: nothing but DNS, `egressTo` on `egressPorts`, and `extraEgress`.
+# The ML model server runs inside the pod on loopback, so it needs no egress rule and no
+# ingress rule: nothing here exists for it.
+networkPolicy:
+  enabled: false
+  # Who may call Znyx: a list of NetworkPolicyPeer. Empty: every pod in the same namespace.
+  # Example: allow your gateway namespace and Prometheus:
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: apps
+  ingressFrom: []
+  # Where Znyx may connect (a list of NetworkPolicyPeer), for example an in-cluster
+  # control plane. Empty and not airgapped: anywhere on `egressPorts`.
+  egressTo: []
+  # Ports used for the egressTo rule (and for "anywhere" when egressTo is empty).
+  egressPorts:
+    - port: 443
+      protocol: TCP
+  # Extra raw egress rules (NetworkPolicyEgressRule objects), always appended. Use these for
+  # Redis, for example:
+  #   - to:
+  #       - podSelector:
+  #           matchLabels:
+  #             app: redis
+  #     ports:
+  #       - port: 6379
+  #         protocol: TCP
+  extraEgress: []
+
+# -- helm test ------------------------------------------------------------------------------------------
+# `helm test <release>` runs a pod that curls the Service's /healthz. Pin or mirror the image.
+test:
+  image:
+    repository: curlimages/curl
+    tag: "8.11.1"
+    pullPolicy: IfNotPresent

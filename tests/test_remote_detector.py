@@ -192,3 +192,80 @@ class TestSSRFGuard:
         result = detector.detect("hello")
         assert result.decision == Decision.BLOCK
         assert transport.calls == []
+
+
+class TestSharedCircuitBreaker:
+    """Escalation and the remote plugin build a new RemoteDetector for every call.
+    The breaker must belong to the endpoint, not the instance, or it never trips."""
+
+    def test_breaker_survives_across_detector_instances(self, transport):
+        def boom(req):
+            raise httpx.ConnectError("down")
+        transport.handler = boom
+        _detector(fail_open=False, circuit_failure_threshold=2, circuit_cooldown=60.0).detect("a")
+        _detector(fail_open=False, circuit_failure_threshold=2, circuit_cooldown=60.0).detect("b")
+        # A third, fresh instance for the same endpoint short-circuits without a call.
+        result = _detector(fail_open=False, circuit_failure_threshold=2,
+                           circuit_cooldown=60.0).detect("c")
+        assert "Circuit breaker open" in result.developer_message
+        assert len(transport.calls) == 2
+
+    def test_endpoints_have_independent_breakers(self, transport):
+        def boom(req):
+            raise httpx.ConnectError("down")
+        transport.handler = boom
+        for _ in range(2):
+            _detector(fail_open=False, circuit_failure_threshold=1, circuit_cooldown=60.0).detect("x")
+        other = _detector(endpoint_url="http://10.0.0.6:9000/classify", fail_open=False,
+                          circuit_failure_threshold=1, circuit_cooldown=60.0)
+        assert other.circuit_state == "closed"
+
+    def test_half_open_admits_one_probe_at_a_time(self):
+        from znyx_core.detectors.remote import CircuitBreaker
+        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=0.0)
+        breaker.record_failure()
+        assert breaker.allow_request()        # the probe
+        assert breaker.state.value == "half_open"
+        assert not breaker.allow_request()    # a second caller waits for the probe
+        breaker.record_failure()              # the probe failed: open again
+        assert breaker.state.value == "open"
+
+    def test_abandoned_probe_is_replaced_after_cooldown(self, monkeypatch):
+        import znyx_core.detectors.remote as remote
+        now = [1000.0]
+        monkeypatch.setattr(remote.time, "time", lambda: now[0])
+        breaker = remote.CircuitBreaker(failure_threshold=1, cooldown_seconds=5.0)
+        breaker.record_failure()
+        now[0] += 5.0
+        assert breaker.allow_request()        # probe starts, never reports back
+        assert not breaker.allow_request()
+        now[0] += 5.0
+        assert breaker.allow_request()        # abandoned probe replaced
+
+    def test_breaker_is_thread_safe_under_concurrent_failures(self):
+        import threading
+        from znyx_core.detectors.remote import CircuitBreaker
+        breaker = CircuitBreaker(failure_threshold=1000, cooldown_seconds=60.0)
+        threads = [threading.Thread(target=lambda: [breaker.record_failure() for _ in range(250)])
+                   for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert breaker.failure_count == 2000
+        assert breaker.state.value == "open"
+
+    def test_escalation_path_trips_the_breaker(self, transport):
+        """The real path that rebuilt the detector per call: _call_backend."""
+        from znyx_core.engine.backends import DetectorBackend
+        from znyx_core.engine.escalation import BackendUnavailable, _call_backend
+        def boom(req):
+            raise httpx.ConnectError("down")
+        transport.handler = boom
+        backend = DetectorBackend(mode="local_ml", endpoint_url=ENDPOINT, task="toxicity")
+        for _ in range(4):
+            with pytest.raises(BackendUnavailable):
+                _call_backend(backend, "text", timeout_ms=1000)
+        # Default threshold 5 with 3 attempts per call: the circuit opens during the
+        # second call, and the third and fourth calls never reach the endpoint.
+        assert len(transport.calls) == 5

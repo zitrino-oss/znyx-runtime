@@ -28,8 +28,16 @@ UNICODE_HOMOGLYPHS: Dict[str, str] = {
     "ｙ": "y", "ｚ": "z",
 }
 
-# Zero-width / invisible code points injected to split keywords.
-_ZERO_WIDTH_RE = re.compile("[​‌‍⁠﻿­]")
+# Invisible code points injected to split keywords: every Unicode default-ignorable
+# code point (zero-width characters, joiners, bidirectional controls, variation
+# selectors, invisible operators, the tag block, ...). Removed only for matching.
+_ZERO_WIDTH_RE = re.compile(
+    "[­͏؜឴឵᠋-᠏​-‏‪-‮⁠-⁯"
+    "︀-️﻿￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    "\U000e0000-\U000e0fff]")
+# Characters that render as blank and are used in place of a space (Hangul fillers,
+# the braille blank): read as a space for matching.
+_BLANK_RE = re.compile("[ᅟᅠㅤﾠ⠀]")
 
 # Conservative leetspeak substitutions (only unambiguous ones).
 _LEETSPEAK_MAP = {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t",
@@ -44,7 +52,7 @@ def normalize_unicode(text: str) -> str:
 
 
 def strip_zero_width(text: str) -> str:
-    return _ZERO_WIDTH_RE.sub("", text)
+    return _BLANK_RE.sub(" ", _ZERO_WIDTH_RE.sub("", text))
 
 
 def collapse_leetspeak(text: str) -> str:

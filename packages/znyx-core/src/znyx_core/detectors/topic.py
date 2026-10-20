@@ -1,6 +1,7 @@
 import re
 from typing import List, Dict, Any, Set
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
+from znyx_core.core import regex_prefilter as _prefilter
 from znyx_core.core.risk import calculate_risk_score
 
 
@@ -1495,6 +1496,7 @@ class TopicDetector:
     def _detect_whitelist(self, text: str) -> DetectorResult:
         """Whitelist mode: block text that is NOT about any allowed topic."""
         text_lower = text.lower()
+        prepared = _prefilter.Text(text)
 
         for topic in self.allowed_topics:
             keywords = self.allowed_topic_keywords.get(topic, [topic])
@@ -1503,8 +1505,7 @@ class TopicDetector:
                     if keyword in text_lower:
                         return DetectorResult(decision=Decision.ALLOW, risk_score=0)
                 else:
-                    regex = re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
-                    if regex.search(text):
+                    if _prefilter.search(_prefilter.word_pattern(keyword), prepared):
                         return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
         return DetectorResult(
@@ -1543,6 +1544,7 @@ class TopicDetector:
 
         rule_hits: List[RuleHit] = []
         text_lower = text.lower()
+        prepared = _prefilter.Text(text)
         found_topics: Set[str] = set()
 
         # Check for each blocked topic - phrases first, then broad terms
@@ -1560,8 +1562,7 @@ class TopicDetector:
                         matched_pattern = pattern
                         break
                 else:
-                    regex = re.compile(r'\b' + re.escape(pattern) + r'\b', re.IGNORECASE)
-                    if regex.search(text):
+                    if _prefilter.search(_prefilter.word_pattern(pattern), prepared):
                         matched_pattern = pattern
                         break
 
@@ -1574,8 +1575,7 @@ class TopicDetector:
                             is_broad = True
                             break
                     else:
-                        regex = re.compile(r'\b' + re.escape(pattern) + r'\b', re.IGNORECASE)
-                        if regex.search(text):
+                        if _prefilter.search(_prefilter.word_pattern(pattern), prepared):
                             matched_pattern = pattern
                             is_broad = True
                             break

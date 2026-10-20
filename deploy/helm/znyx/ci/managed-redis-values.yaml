@@ -1,0 +1,52 @@
+# Managed mode, Redis, HPA, ServiceMonitor, Ingress, persistence, protected metrics.
+config:
+  mode: managed
+  control_plane:
+    url: https://console.example.com
+    require_signed_bundles: true
+  log_level: debug
+secrets:
+  apiKey: zx_example_not_a_real_key
+  runtimeToken: rt_example_not_a_real_token
+  redisUrl: rediss://:example@redis.example.com:6380/0
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+metrics:
+  requireKey: true
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 4m
+  hosts:
+    - host: znyx.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: znyx-tls
+      hosts:
+        - znyx.example.com
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+persistence:
+  enabled: true
+  accessModes:
+    - ReadWriteMany
+  size: 2Gi
+extraEnv:
+  - name: ZNYX_LOG_LEVEL
+    value: debug

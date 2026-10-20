@@ -52,4 +52,5 @@ Issues = "https://github.com/zitrino-oss/znyx-runtime/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-znyx_runtime = ["**/*.yaml", "**/*.yml", "**/*.json"]
+znyx_runtime = ["**/*.yaml", "**/*.yml", "**/*.json", "dashboard/*.html", "dashboard/*.js",
+                "dashboard/*.css"]

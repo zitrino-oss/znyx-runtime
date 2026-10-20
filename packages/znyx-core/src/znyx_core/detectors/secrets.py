@@ -12,7 +12,7 @@ This detector takes precedence over all others - detected secrets always result 
 """
 import re
 import base64
-from typing import List, Dict, Any
+from typing import Tuple, List, Dict, Any
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
 
 
@@ -120,7 +120,11 @@ class SecretsDetector:
         # accordingly.
         'jwt': re.compile(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_+/=-]+'),
         # Generic PEM private key (all algorithms)
-        'private_key': re.compile(r'-----BEGIN[A-Z\s]+PRIVATE KEY-----'),
+        # At most 100 characters between BEGIN and PRIVATE (real headers name a key
+        # type: RSA, EC, DSA, ENCRYPTED, OPENSSH). Unbounded, arbitrarily long padding
+        # matched here but no streaming window could see it whole; at this bound the
+        # whole header (126 characters at most) fits inside the 160-character hold-back.
+        'private_key': re.compile(r'-----BEGIN[A-Z\s]{0,100}PRIVATE KEY-----'),
         # SSH key formats (OpenSSH + RSA-specific public-block leading text)
         'ssh_openssh_private': re.compile(r'-----BEGIN OPENSSH PRIVATE KEY-----'),
         'ssh_pkcs8_private': re.compile(r'-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----'),
@@ -282,14 +286,26 @@ class SecretsDetector:
 
         return findings
 
+    @staticmethod
+    def _redaction_edits(secrets: List[Dict[str, Any]]) -> List[Tuple[int, int, str]]:
+        """The (start, end, '[REDACTED]') edits for the detected secrets, ascending and
+        disjoint. Overlapping matches (a generic and a specific pattern on the same
+        secret) are merged first: replacing overlapping spans one by one, from the end,
+        with offsets taken from the original text splices fragments of the live secret
+        back into the output (the same bug the PII redactor guards against)."""
+        spans = sorted((s['start'], s['end']) for s in secrets if s['end'] > s['start'])
+        merged: List[List[int]] = []
+        for start, end in spans:
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return [(start, end, '[REDACTED]') for start, end in merged]
+
     def _redact_text(self, text: str, secrets: List[Dict[str, Any]]) -> str:
         """Replace each detected secret in text with a [REDACTED] placeholder."""
-        # Sort by position descending so replacements don't shift offsets
-        sorted_secrets = sorted(secrets, key=lambda s: s['start'], reverse=True)
-        result = text
-        for secret in sorted_secrets:
-            result = result[:secret['start']] + '[REDACTED]' + result[secret['end']:]
-        return result
+        from znyx_core.core.text_edits import apply_edits
+        return apply_edits(text, self._redaction_edits(secrets))
 
     def detect(self, text: str) -> DetectorResult:
         """
@@ -379,6 +395,7 @@ class SecretsDetector:
                 risk_score=100,
                 rule_hits=rule_hits,
                 sanitized_text=sanitized,
+                text_edits=self._redaction_edits(secret_spans),
                 user_message="Sensitive credentials were detected and redacted from your request.",
                 developer_message=f"CRITICAL: {len(rule_hits)} secret(s) detected - redacted"
             )

@@ -1,0 +1,5 @@
+# Chart defaults, plus a policy so the policies.yaml ConfigMap key and the
+# ZNYX_POLICY_PATH env are rendered.
+policy: |
+  version: 1
+  policies: []

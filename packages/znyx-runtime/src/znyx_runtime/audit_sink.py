@@ -32,11 +32,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
+
+from znyx_core.utils.spool import append_lines
 
 logger = logging.getLogger(__name__)
 
@@ -114,12 +115,9 @@ class SpoolAuditSink(AuditSink):
         self._lock = asyncio.Lock()
 
     def _append_sync(self, line: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Append + flush + fsync so the record is durable before we return.
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        # Append + flush + fsync so the record is durable before we return, under the
+        # spool's lock: several worker processes share this spool and one rotates it.
+        append_lines(self.path, [line], fsync=True)
 
     async def record(self, event: EgressAuditEvent) -> None:
         line = json.dumps(event.to_dict(), separators=(",", ":"), sort_keys=True)

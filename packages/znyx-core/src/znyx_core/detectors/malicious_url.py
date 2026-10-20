@@ -376,6 +376,15 @@ class MaliciousURLDetector:
             risk_score=risk_score,
             rule_hits=all_hits,
             sanitized_text=sanitized if self.action == "REDACT" else None,
+            text_edits=(_url_edits(text, urls) if self.action == "REDACT" else None),
             user_message="The response contains potentially suspicious links.",
             developer_message=f"malicious_url: {len(all_hits)} suspicious URL patterns in {len(urls)} URLs",
         )
+
+
+def _url_edits(text, urls):
+    """Edits for the str.replace-based URL redaction above (literal, no boundaries)."""
+    from znyx_core.core.text_edits import edits_for_patterns, literal_pattern
+    return edits_for_patterns(
+        text, [(literal_pattern(u, word_boundary=False, ignore_case=False), "[URL REDACTED]")
+               for u in dict.fromkeys(urls)])

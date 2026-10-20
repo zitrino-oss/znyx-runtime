@@ -1,125 +1,225 @@
-# Znyx runtime, with the optional ML sidecar as a same-pod container.
+# Znyx, one container. These manifests are the Helm chart's defaults rendered for a release
+# named "znyx" (ConfigMap, Deployment, Service, PodDisruptionBudget).
 #
-# The sidecar is co-located deliberately: the runtime then reaches it on
-# http://localhost:9000 with nothing configured, and because that address is genuinely
-# loopback the ML layer is correctly treated as in-boundary (the egress gate does not
-# apply to a call that never leaves the pod). No address is stored in the control plane and
-# none is shipped in the policy bundle.
+# Recommended paths, in order:
+#   1. Helm chart:  helm install znyx deploy/helm/znyx      (every option, values schema, NOTES)
+#   2. Operator:    deploy/operator                          (a ZnyxGateway resource per install)
+#   3. These files: kubectl apply -f deploy/k8s/            (no tooling, edit by hand)
 #
-# To enable ML: uncomment the `inference` container and the `volumes` block at the bottom.
-# The sidecar needs no secret of its own (see the notes on the container below).
+# Before applying, create the API key Secret the Deployment reads (any random string works):
 #
-# Note the trade-off of same-pod co-location: each replica provisions and holds its own copy
-# of the weights in a pod-local emptyDir, so a replaced pod re-downloads them. That is the
-# deliberate default — no shared volume means no concurrent writers to one artifact tree and
-# no cache that can outlive a pod in a broken state. If cold-start time matters more, move the
-# sidecar into a StatefulSet with a volumeClaimTemplate so each replica gets its own
-# persistent volume; do not point every replica at one shared ReadWriteMany claim. For a large
-# estate, running the sidecar as its own Deployment and setting ZNYX_INFERENCE_URL on the
-# runtime is still supported — but then the address is off-box, the egress gate applies, and
-# you are back to managing an address.
+#   kubectl create secret generic znyx-secrets \
+#     --from-literal=RUNTIME_API_KEY="zx_$(openssl rand -hex 24)"
+#
+# Optional keys in the same Secret: ZNYX_RUNTIME_TOKEN (managed mode) and ZNYX_REDIS_URL
+# (shared limits across replicas, see the notes on replicas below).
+#
+# One container runs everything: every API and the dashboard on port 8080, worker processes
+# sized to the CPU limit, and (with the -ml image) the ML model server on loopback inside the
+# same container. There is no sidecar: nothing else needs a port, a credential or egress, and
+# because the model server is genuinely loopback the egress gate treats it as in-boundary.
+#
+# To enable ML: use the "-ml" image tag (znyx/znyx:1.0.0-ml), add the ZNYX_ML env var and the
+# /models volume shown in the commented blocks below, and raise the resources. Weights are
+# never baked into the image: they are fetched and sha256-verified into /models, or mounted
+# there from a pre-populated PersistentVolumeClaim for an air-gapped cluster.
+#
+# Replicas: with replicas > 1 and no Redis, each pod enforces its own rate limits and budgets,
+# so the effective limit is replicas times what you set. Add ZNYX_REDIS_URL to the Secret and
+# uncomment ZNYX_STATE_BACKEND below to share them.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: znyx-config
+  labels:
+    app.kubernetes.io/name: znyx
+    app.kubernetes.io/instance: znyx
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/managed-by: Helm
+data:
+  # Every znyx.yaml key is optional; run `znyx config` in the container to list them all.
+  # Secrets never go here: they come from the Secret as environment variables.
+  znyx.yaml: |
+    dashboard:
+      enabled: true
+    mode: local
+    server:
+      host: 0.0.0.0
+      port: 8080
+      workers: auto
+    version: 1
+  # Your policy (local mode). Without it the image's built-in starter policy is used. To use
+  # it, uncomment this key, the ZNYX_POLICY_PATH env var below, and add your policy text.
+  # policies.yaml: |
+  #   ...
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: znyx-runtime
+  name: znyx
   labels:
-    app: znyx-runtime
+    app.kubernetes.io/name: znyx
+    app.kubernetes.io/instance: znyx
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
-      app: znyx-runtime
+      app.kubernetes.io/name: znyx
+      app.kubernetes.io/instance: znyx
   template:
     metadata:
+      # The Helm chart adds a checksum/config annotation here so a config change rolls the
+      # pods. With plain manifests, run `kubectl rollout restart deployment/znyx` after
+      # editing the ConfigMap.
       labels:
-        app: znyx-runtime
+        app.kubernetes.io/name: znyx
+        app.kubernetes.io/instance: znyx
+        app.kubernetes.io/version: "1.0.0"
+        app.kubernetes.io/component: gateway
+        app.kubernetes.io/managed-by: Helm
     spec:
+      # Znyx does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      # Znyx drains in-flight requests for up to 30 s on SIGTERM; keep this above that.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - name: runtime
-          # Replace with your published image tag.
-          image: IMAGE_PLACEHOLDER
+        - name: znyx
+          # Replace with your published (or mirrored) image. ML: znyx/znyx:1.0.0-ml.
+          image: znyx/znyx:1.0.0
+          imagePullPolicy: IfNotPresent
+          # The image has no ENTRYPOINT, so args is the whole command.
+          args: ["znyx", "serve", "--config", "/etc/znyx/znyx.yaml"]
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
+              protocol: TCP
           env:
-            - name: ZNYX_MODE
-              value: "local"
-            - name: ZNYX_POLICY_PATH
-              value: "./config/policies.yaml"
-            # Secure-by-default: require auth outside local dev.
-            - name: RUNTIME_REQUIRE_AUTH
-              value: "true"
+            # znyx.yaml above is authoritative; the image's defaults sit below it.
+            # - name: ZNYX_POLICY_PATH
+            #   value: /etc/znyx/policies.yaml
             - name: RUNTIME_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: znyx-runtime-secrets
+                  name: znyx-secrets
                   key: RUNTIME_API_KEY
-            # ZNYX_INFERENCE_URL is intentionally NOT set. With the sidecar in this pod the
-            # runtime's default (http://localhost:9000) is already correct, and leaving it
-            # unset is what keeps the call loopback/in-boundary.
-          readinessProbe:
+            - name: ZNYX_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: znyx-secrets
+                  key: ZNYX_RUNTIME_TOKEN
+                  optional: true
+            - name: ZNYX_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: znyx-secrets
+                  key: ZNYX_REDIS_URL
+                  optional: true
+            # - name: ZNYX_STATE_BACKEND      # with ZNYX_REDIS_URL set in the Secret
+            #   value: redis
+            # - name: ZNYX_ML                 # with the -ml image
+            #   value: "true"
+            # - name: ZNYX_AIRGAPPED          # no outbound calls at all
+            #   value: "true"
+          # Startup and liveness use /healthz (always 200); readiness uses /readyz, which
+          # is 503 until a policy is loaded, so a pod only receives traffic once it can
+          # evaluate.
+          startupProbe:
             httpGet:
               path: /healthz
-              port: 8080
-            initialDelaySeconds: 5
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 30
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Worker processes are sized from the CPU limit (auto: one per CPU, up to 4, about
+          # 140 MB each), so raise memory with CPU. With the -ml image use requests
+          # cpu 2 / memory 2Gi and limits cpu 4 / memory 4Gi.
           resources:
             requests:
-              cpu: "100m"
-              memory: "256Mi"
+              cpu: "1"
+              memory: 512Mi
             limits:
-              cpu: "500m"
-              memory: "512Mi"
-
-        # ── Optional ML sidecar ──────────────────────────────────────────────────────────
-        # Provisioned BY THE RUNTIME container above, over pod-local loopback. The runtime
-        # fetches the policy bundle, reads the model pins it declares, and pushes them here
-        # every cycle; this container then downloads and sha256-verifies the weights into
-        # /models and hot-loads them. Until a model is loaded, ML tasks return 503 and the
-        # runtime falls back to deterministic rules — an unreachable control plane is never
-        # an outage.
-        #
-        # Note what is NOT here: no ZNYX_CONTROL_PLANE_URL, no API key, no secretKeyRef.
-        # This container never calls the control plane, so it needs no credential and can be
-        # denied egress entirely apart from fetching model weights.
-        #
-        # - name: inference
-        #   image: znyx/inference:latest
-        #   ports:
-        #     - containerPort: 9000
-        #   env:
-        #     - name: ZNYX_INFERENCE_ARTIFACTS_DIR
-        #       value: "/models"
-        #   volumeMounts:
-        #     - name: models
-        #       mountPath: /models
-        #   readinessProbe:
-        #     httpGet:
-        #       path: /healthz
-        #       port: 9000
-        #     initialDelaySeconds: 10
-        #     periodSeconds: 10
-        #   resources:
-        #     requests:
-        #       cpu: "500m"
-        #       memory: "2Gi"
-        #     limits:
-        #       cpu: "2"
-        #       memory: "4Gi"
-
-      # Uncomment alongside the inference container above. Pod-scoped on purpose: the sidecar
-      # re-provisions the weights whenever a pod is replaced, and an interrupted download
-      # leaves nothing behind to be mistaken for a complete artifact on the next start.
-      #
-      # sizeLimit keeps a multi-gigabyte download off the node's ephemeral storage budget —
-      # budget ~1GB per classifier/NER task and ~2.5GB for a guard LLM. Exceeding it evicts the
-      # pod, so raise it if you pin more than the defaults.
-      # volumes:
-      #   - name: models
-      #     emptyDir:
-      #       sizeLimit: 25Gi
+              cpu: "2"
+              memory: 1Gi
+          # The image writes only to /data and /tmp, so the root filesystem is read-only.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: config
+              mountPath: /etc/znyx
+              readOnly: true
+            # /data holds the generated API key (unused when the Secret provides one), shared
+            # worker state and the audit spools. An emptyDir is right unless you need the
+            # spools to survive a pod replacement; then use a PVC (one replica, or RWX).
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            # - name: models                  # with the -ml image
+            #   mountPath: /models
+      # Soft spread across nodes: a preference, never a reason to stay Pending.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: znyx
+              app.kubernetes.io/instance: znyx
+      volumes:
+        - name: config
+          configMap:
+            name: znyx-config
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        # Pod-local model weights. Each replica fetches and holds its own copy (no shared
+        # writers, nothing that outlives a pod in a broken state). For an air-gapped
+        # cluster, or to avoid the re-download, replace the emptyDir with a ReadOnlyMany or
+        # ReadWriteMany claim holding pre-fetched weights (packages/znyx-inference/MODELS.md).
+        # sizeLimit: budget ~1 GB per classifier or NER task and ~2.5 GB for a guard LLM;
+        # exceeding it evicts the pod.
+        # - name: models
+        #   emptyDir:
+        #     sizeLimit: 25Gi
+        #   # persistentVolumeClaim:
+        #   #   claimName: znyx-models
+        #   #   readOnly: true

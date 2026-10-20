@@ -1,0 +1,79 @@
+# The operator itself. Apply crd.yaml and rbac.yaml first.
+# One replica only: the operator runs in kopf's standalone mode (no leader election).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: znyx-operator
+  namespace: znyx-system
+  labels:
+    app.kubernetes.io/name: znyx-operator
+    app.kubernetes.io/component: operator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: znyx-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: znyx-operator
+        app.kubernetes.io/component: operator
+    spec:
+      serviceAccountName: znyx-operator
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          # Build with: docker build -t znyx/znyx-operator:0.1.0 deploy/operator
+          image: znyx/znyx-operator:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            # Comma-separated namespaces to watch. Empty watches every namespace.
+            - name: ZNYX_OPERATOR_NAMESPACES
+              value: ""
+            - name: ZNYX_OPERATOR_LOG_LEVEL
+              value: INFO
+          ports:
+            - name: health
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

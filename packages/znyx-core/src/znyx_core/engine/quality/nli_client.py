@@ -30,6 +30,7 @@ import httpx
 
 from znyx_core.engine.egress import prepare_and_audit_egress, redact_for_egress
 from znyx_core.net_guard import assert_safe_egress_url
+from znyx_core.secret_refs import maybe_resolve
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ def nli_scorer_from_config(
         task=nli.get("task", "nli"),
         auth_type=nli.get("auth_type", "none"),
         auth_header=nli.get("auth_header", "X-API-Key"),
-        auth_value=nli.get("auth_value", ""),
+        auth_value=maybe_resolve(nli.get("auth_value", ""), what="nli auth_value"),
         model_id=model_id,
         revision=revision,
         timeout_seconds=timeout_seconds,

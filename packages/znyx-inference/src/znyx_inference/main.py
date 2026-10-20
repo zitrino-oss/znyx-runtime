@@ -79,6 +79,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ZNYX Inference Service", version=__version__, lifespan=lifespan)
 
+# This service has no authentication by design and must only be reachable from the
+# runtime beside it. When ZNYX_INFERENCE_TRUSTED_HOSTS is set (znyx serve sets it to
+# "127.0.0.1,localhost"), any other Host header is refused: that is what a page using
+# DNS rebinding in a browser on the same machine would send. Unset, as in the separate
+# sidecar layout where the runtime calls it by service name, nothing changes.
+_TRUSTED_HOSTS = [h.strip() for h in os.getenv("ZNYX_INFERENCE_TRUSTED_HOSTS", "").split(",") if h.strip()]
+if _TRUSTED_HOSTS:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_TRUSTED_HOSTS)
+
 
 def _result(out, model_version: str) -> InferResult:
     return InferResult(
@@ -243,8 +253,11 @@ class ReloadRequest(BaseModel):
 async def install_model(req: InstallRequest, request: Request):
     """Start a background model install job. Returns 202 with the job_id."""
     manager: InstallManager = request.app.state.install_manager
+    from znyx_inference.runners._fetch import ModelDownloadDisabled
     try:
         job = manager.start_install(req.task, model_id=req.model_id, revision=req.revision)
+    except ModelDownloadDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:

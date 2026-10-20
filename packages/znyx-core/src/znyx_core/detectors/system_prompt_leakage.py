@@ -29,6 +29,7 @@ No raw prompt text is ever held by the detector. Embedding-similarity escalation
 from typing import Any, Dict, List
 
 import json
+import os
 from typing import Optional
 
 from znyx_core.core.fingerprint import (
@@ -56,6 +57,11 @@ class SystemPromptLeakageDetector:
             self._key = bytes.fromhex(key_hex) if key_hex else None
         except (ValueError, TypeError):
             self._key = None
+        # Live context (this request's own tool schemas and system prompt) is hashed
+        # and compared within one call, so it needs no shared key: without a configured
+        # one, a per-process random key keeps live checks working. Registered
+        # fingerprints still need the configured key they were made with.
+        self._live_key = self._key or os.urandom(32)
 
         # Live tool schemas are fingerprinted per request, so this can be turned off for a
         # deployment that sends very large tool lists and would rather pay nothing for it.
@@ -101,16 +107,40 @@ class SystemPromptLeakageDetector:
                 continue
         return out
 
+    @staticmethod
+    def _hidden_context_texts(metadata: Optional[Dict[str, Any]]) -> List[str]:
+        """Hidden context the caller supplied for this request (the AI gateway passes
+        the system prompt it forwarded): compared live, like tool schemas."""
+        if not isinstance(metadata, dict):
+            return []
+        raw = metadata.get("hidden_context")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [t[:65536] for t in raw[:16] if isinstance(t, str) and t.strip()]
+
     def detect(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> DetectorResult:
-        if not self.enabled or not text or not self._key:
+        if not self.enabled or not text:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
         live_schemas = self._tool_schema_texts(metadata) if self.check_tool_schemas else []
-        if not self._fingerprints and not live_schemas:
+        live_context = self._hidden_context_texts(metadata)
+        fingerprints = self._fingerprints if self._key else []
+        if not fingerprints and not live_schemas and not live_context:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
         rule_hits: List[RuleHit] = []
-        for idx, fp in enumerate(self._fingerprints):
+        for idx, context in enumerate(live_context):
+            hashes = shingle_hashes(context, self._live_key, DEFAULT_MIN_SHINGLE_TOKENS)
+            if hashes and overlap_count(text, self._live_key, DEFAULT_MIN_SHINGLE_TOKENS,
+                                        hashes) >= self.match_threshold:
+                rule_hits.append(RuleHit(
+                    rule_id=f"system_prompt_leakage.system_prompt_live_{idx}",
+                    severity=Severity.HIGH,
+                    message="Output reproduces the system prompt of this request",
+                ))
+        for idx, fp in enumerate(fingerprints):
             if overlap_count(text, self._key, fp["n"], fp["hashes"]) >= self.match_threshold:
                 kind = fp["kind"]
                 rule_hits.append(RuleHit(
@@ -122,10 +152,10 @@ class SystemPromptLeakageDetector:
         # Tool schemas the request itself supplied: fingerprint now, compare now. Same key
         # and shingle size as registered context, so the match semantics are identical.
         for idx, schema in enumerate(live_schemas):
-            hashes = shingle_hashes(schema, self._key, DEFAULT_MIN_SHINGLE_TOKENS)
+            hashes = shingle_hashes(schema, self._live_key, DEFAULT_MIN_SHINGLE_TOKENS)
             if not hashes:
                 continue          # schema shorter than one shingle: nothing to match on
-            if overlap_count(text, self._key, DEFAULT_MIN_SHINGLE_TOKENS, hashes) >= self.match_threshold:
+            if overlap_count(text, self._live_key, DEFAULT_MIN_SHINGLE_TOKENS, hashes) >= self.match_threshold:
                 rule_hits.append(RuleHit(
                     rule_id=f"system_prompt_leakage.tool_schema_live_{idx}",
                     severity=Severity.HIGH,

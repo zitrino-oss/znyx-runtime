@@ -21,6 +21,7 @@ import httpx
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.net_guard import resolve_egress_target, UnsafeEgressURL
+from znyx_core.secret_refs import maybe_resolve
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,14 @@ class CircuitState(str, Enum):
 
 
 class CircuitBreaker:
-    """Simple circuit breaker with configurable thresholds."""
+    """Circuit breaker with configurable thresholds.
+
+    Thread-safe: detector work runs on a pool of worker threads, and one breaker
+    is shared by every RemoteDetector calling the same endpoint (see
+    ``shared_circuit_breaker``). In HALF_OPEN it admits a single probe at a time;
+    a probe that never reports back is abandoned after one cooldown period (at
+    least a second) so the breaker cannot stick half-open.
+    """
 
     def __init__(self, failure_threshold: int = 5, cooldown_seconds: float = 30.0):
         self.failure_threshold = failure_threshold
@@ -151,29 +159,73 @@ class CircuitBreaker:
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self.last_failure_time: float = 0.0
+        self._probe_started: Optional[float] = None
+        self._lock = threading.Lock()
 
     def record_success(self):
-        self.failure_count = 0
-        self.state = CircuitState.CLOSED
+        with self._lock:
+            self.failure_count = 0
+            self.state = CircuitState.CLOSED
+            self._probe_started = None
 
     def record_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            self._probe_started = None
+            # A failed half-open probe re-opens at once; otherwise open at the threshold.
+            if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
+                if self.state != CircuitState.OPEN:
+                    logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+                self.state = CircuitState.OPEN
 
     def allow_request(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            elapsed = time.time() - self.last_failure_time
-            if elapsed >= self.cooldown_seconds:
-                self.state = CircuitState.HALF_OPEN
+        with self._lock:
+            now = time.time()
+            if self.state == CircuitState.CLOSED:
+                return True
+            if self.state == CircuitState.OPEN:
+                if now - self.last_failure_time >= self.cooldown_seconds:
+                    self.state = CircuitState.HALF_OPEN
+                    self._probe_started = now
+                    return True
+                return False
+            # HALF_OPEN: one probe at a time.
+            if (self._probe_started is None
+                    or now - self._probe_started >= max(self.cooldown_seconds, 1.0)):
+                self._probe_started = now
                 return True
             return False
-        # HALF_OPEN: allow one request to test
-        return True
+
+
+# One breaker per (endpoint, thresholds), shared across RemoteDetector instances.
+# Escalation and the remote plugin build a fresh RemoteDetector on every call, so a
+# breaker owned by the instance never saw more than one call and could not trip.
+# Bounded and LRU-evicted so arbitrary endpoints in configs cannot grow it forever.
+_BREAKERS: "Dict[Tuple[str, int, float], CircuitBreaker]" = {}
+_BREAKERS_LOCK = threading.Lock()
+_BREAKERS_MAX = 1024
+
+
+def shared_circuit_breaker(endpoint_url: str, failure_threshold: int = 5,
+                           cooldown_seconds: float = 30.0) -> CircuitBreaker:
+    """The process-wide breaker for an endpoint and threshold pair."""
+    key = (endpoint_url, int(failure_threshold), float(cooldown_seconds))
+    with _BREAKERS_LOCK:
+        breaker = _BREAKERS.pop(key, None)
+        if breaker is None:
+            breaker = CircuitBreaker(failure_threshold=failure_threshold,
+                                     cooldown_seconds=cooldown_seconds)
+        _BREAKERS[key] = breaker  # re-insert: most recently used last
+        while len(_BREAKERS) > _BREAKERS_MAX:
+            _BREAKERS.pop(next(iter(_BREAKERS)))
+        return breaker
+
+
+def reset_circuit_breakers() -> None:
+    """Forget every shared breaker (tests, or after a configuration reload)."""
+    with _BREAKERS_LOCK:
+        _BREAKERS.clear()
 
 
 class MalformedRemoteResponse(ValueError):
@@ -220,7 +272,7 @@ class RemoteDetector:
         self.endpoint_url = config.get("endpoint_url", "")
         self.auth_type = config.get("auth_type", "none")
         self.auth_header = config.get("auth_header", "X-API-Key")
-        self.auth_value = config.get("auth_value", "")
+        self.auth_value = maybe_resolve(config.get("auth_value", ""), what="remote detector auth_value")
         self.input_field = config.get("input_field", "text")
         self.output_decision_field = config.get("output_decision_field", "decision")
         self.output_score_field = config.get("output_score_field", "risk_score")
@@ -241,9 +293,13 @@ class RemoteDetector:
         self.retry_backoff = config.get("retry_backoff", 0.5)
         self.fail_open = config.get("fail_open", True)
 
-        self._circuit = CircuitBreaker(
-            failure_threshold=config.get("circuit_failure_threshold", 5),
-            cooldown_seconds=config.get("circuit_cooldown", 30.0),
+        threshold = config.get("circuit_failure_threshold", 5)
+        cooldown = config.get("circuit_cooldown", 30.0)
+        # Shared per endpoint so the breaker survives across calls (see _BREAKERS).
+        self._circuit = (
+            shared_circuit_breaker(self.endpoint_url, threshold, cooldown)
+            if self.endpoint_url else
+            CircuitBreaker(failure_threshold=threshold, cooldown_seconds=cooldown)
         )
         self._health_url = config.get("health_url")
         # Per-request runner params (e.g. allowed_languages for language detection).
@@ -366,6 +422,10 @@ class RemoteDetector:
             except Exception as e:
                 last_error = e
                 self._circuit.record_failure()
+                if self._circuit.state == CircuitState.OPEN:
+                    # The endpoint is now considered down (or a half-open probe just
+                    # failed): stop retrying instead of hammering it.
+                    break
                 if attempt < self.max_retries:
                     wait = self.retry_backoff * (2 ** attempt)
                     # Don't sleep past the total deadline.

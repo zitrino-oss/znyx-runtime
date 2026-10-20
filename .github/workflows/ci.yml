@@ -38,16 +38,21 @@ jobs:
         # Lean install: no [onnx]/[export]/[torch] extras. tests/ was written
         # to run on this dependency-free path (the inference tests exercise
         # the stub runner), which is also what a plain `pip install` gets.
-        run: pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference
+        run: pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference ./packages/znyx
 
       - name: Byte-compile
         run: python -m compileall -q packages
 
       - name: Import check
-        run: python -c "import znyx_core, znyx_runtime, znyx_inference"
+        run: python -c "import znyx, znyx_core, znyx_runtime, znyx_inference"
+
+      - name: Versions in lockstep
+        run: python scripts/set_version.py --check
 
       - name: Install test dependencies
-        run: pip install pytest
+        # openai and anthropic: the gateway's compatibility tests drive it with the
+        # official SDKs (tests/test_gateway_sdk_compat.py).
+        run: pip install pytest openai anthropic
 
       - name: Run tests
         run: python -m pytest tests/ -q
@@ -69,27 +74,60 @@ jobs:
       - name: Build wheels
         run: |
           set -eu
-          for pkg in znyx-core znyx-runtime znyx-inference; do
+          for pkg in znyx-core znyx-runtime znyx-inference znyx; do
             python -m build --wheel --outdir dist "packages/$pkg"
           done
 
       - name: Install each wheel into a fresh venv and import it
-        # --find-links lets pip resolve the intra-repo znyx-core dependency
-        # from the wheel just built instead of reaching out to PyPI, while
-        # the packages' third-party deps (fastapi, pydantic, ...) still
-        # resolve normally.
+        # The wheels just built are installed BY FILE, with the intra-repo ones each
+        # package needs. Installing by name with --find-links would let pip prefer a
+        # newer release of the same name from PyPI (znyx-runtime and znyx-core are
+        # published there), so the job would test that instead of this commit. The
+        # packages' third-party deps (fastapi, pydantic, ...) still resolve normally.
         run: |
           set -eu
-          for pkg in znyx-core znyx-runtime znyx-inference; do
+          declare -A needs=(
+            [znyx-core]="znyx_core"
+            [znyx-runtime]="znyx_core znyx_runtime"
+            [znyx-inference]="znyx_core znyx_inference"
+            [znyx]="znyx_core znyx_runtime znyx_inference znyx"
+          )
+          for pkg in znyx-core znyx-runtime znyx-inference znyx; do
             mod="${pkg//-/_}"
             echo "::group::$pkg"
             venv=".smoke-venv-$pkg"
             python -m venv "$venv"
-            "$venv/bin/pip" install --quiet --find-links dist "$pkg"
+            wheels=""
+            for w in ${needs[$pkg]}; do wheels="$wheels $(ls dist/${w}-*.whl)"; done
+            # shellcheck disable=SC2086
+            "$venv/bin/pip" install --quiet $wheels
             "$venv/bin/python" -c "import importlib; m = importlib.import_module('$mod'); v = getattr(m, '__version__', None); print(f'$pkg: import ok, __version__={v!r}' if v is not None else f'$pkg: import ok, no __version__ attribute')"
             rm -rf "$venv"
             echo "::endgroup::"
           done
+
+      - name: One command from nothing to evaluating requests
+        # The Phase 1 promise, checked on every PR: install the one package into a
+        # clean venv, run `znyx serve` from an empty directory with two workers, and
+        # evaluate a request with the key it generates.
+        run: |
+          set -eu
+          python -m venv .smoke-znyx
+          .smoke-znyx/bin/pip install --quiet dist/znyx_core-*.whl dist/znyx_runtime-*.whl \
+            dist/znyx_inference-*.whl dist/znyx-*.whl
+          mkdir -p "$RUNNER_TEMP/empty" && cd "$RUNNER_TEMP/empty"
+          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
+          "$GITHUB_WORKSPACE/.smoke-znyx/bin/znyx" version
+          "$GITHUB_WORKSPACE/.smoke-znyx/bin/znyx" serve --port 8199 --workers 2 &
+          SERVER=$!
+          curl -sf --retry 30 --retry-delay 1 --retry-connrefused --retry-all-errors \
+            http://127.0.0.1:8199/healthz
+          curl -sf http://127.0.0.1:8199/v1/evaluate/input -H "X-API-Key: $(cat "$HOME/.znyx/api-key")" \
+            -H 'Content-Type: application/json' \
+            -d '{"request_id":"smoke","tenant_id":"ci","app_id":"ci","text":"card 4111 1111 1111 1111"}' \
+            | python -c "import json, sys; d = json.load(sys.stdin); assert d['decision'] == 'REDACT', d; print(d['decision'])"
+          kill -TERM "$SERVER"
+          wait "$SERVER"
 
   pip-audit:
     name: pip-audit (installed environment)
@@ -103,7 +141,7 @@ jobs:
           cache: pip
 
       - name: Install packages
-        run: pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference
+        run: pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference ./packages/znyx
 
       - name: Install pip-audit
         run: pip install pip-audit

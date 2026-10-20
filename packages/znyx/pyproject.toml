@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "znyx"
+version = "1.0.0"
+description = "Znyx: one install for AI guardrails. One command, one port and one config file run the guardrails runtime, its worker processes and the optional ML model server."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Zitrino" }]
+keywords = ["llm", "guardrails", "ai-gateway", "safety", "ai-security", "pii", "prompt-injection"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# One product, one version: the services are pinned to exactly this release, so a
+# customer never mixes versions (tests/test_znyx_packaging.py keeps them in step).
+dependencies = [
+  "znyx-core==1.0.0",
+  "znyx-runtime==1.0.0",
+  "znyx-inference==1.0.0",
+  "uvicorn[standard]>=0.27.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# The ML model server's CPU runtime (ONNX, no torch). `znyx serve --ml` needs it to
+# serve real weights; without it the model server boots on its stub runner.
+ml = ["znyx-inference[onnx]==1.0.0"]
+# Offline model export (operators and CI only; pulls torch).
+export = ["znyx-inference[export]==1.0.0"]
+# The generative guard runner (eager PyTorch).
+torch = ["znyx-inference[torch]==1.0.0"]
+# Shared limits and budgets across replicas.
+redis = ["redis>=5.0"]
+
+[project.scripts]
+znyx = "znyx.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zitrino-oss/znyx-runtime"
+Source = "https://github.com/zitrino-oss/znyx-runtime"
+Issues = "https://github.com/zitrino-oss/znyx-runtime/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+znyx = ["templates/*.yaml"]

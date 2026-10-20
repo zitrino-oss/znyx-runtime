@@ -339,11 +339,14 @@ class CompetitorDetector:
                 pattern = re.compile(r'\b' + re.escape(competitor) + r'\b', re.IGNORECASE)
                 sanitized_text = pattern.sub('[COMPETITOR]', sanitized_text)
 
+            from znyx_core.core.text_edits import edits_for_patterns, literal_pattern
             return DetectorResult(
                 decision=Decision.TRANSFORM,
                 risk_score=risk_score,
                 rule_hits=rule_hits,
                 sanitized_text=sanitized_text,
+                text_edits=edits_for_patterns(
+                    text, [(literal_pattern(c), "[COMPETITOR]") for c in found_competitors]),
                 developer_message=f"Competitor mentions transformed: {', '.join(found_competitors)}"
             )
 

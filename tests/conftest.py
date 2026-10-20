@@ -13,6 +13,27 @@ os.environ.setdefault("ZNYX_ENVIRONMENT", "development")
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _fresh_circuit_breakers():
+    """Remote-detector circuit breakers are shared per endpoint for the life of
+    the process; start every test with none, so one test's open circuit cannot
+    leak into the next."""
+    from znyx_core.detectors.remote import reset_circuit_breakers
+    reset_circuit_breakers()
+    yield
+    reset_circuit_breakers()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state_store():
+    """Rate limits, budgets and history live in a process-wide state store
+    (znyx_core.state_store); give every test an empty one."""
+    from znyx_core.state_store import MemoryStateStore, set_state_store
+    set_state_store(MemoryStateStore())
+    yield
+    set_state_store(None)
+
 MINIMAL_POLICY_YAML = """\
 default:
   secrets:

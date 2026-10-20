@@ -26,6 +26,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from znyx_runtime.sdk_registry import get_sdk_registry
+from znyx_runtime.workers import instance_sdk_clients, worker_count
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,10 @@ class RuntimeReporter:
             "models": sidecar_models or [],
             "sidecar_version": sidecar_version,
             "runtime_version": _runtime_version(),
+            # The one version customers see (`znyx version`); the components above are
+            # released at the same version. None when started without `znyx serve`.
+            "platform_version": os.getenv("ZNYX_PLATFORM_VERSION") or None,
+            "worker_count": worker_count(),
             "mode": self.mode,
             "reporter": "runtime",
             "bundle_id": bundle_info.get("bundle_id"),
@@ -74,12 +79,16 @@ class RuntimeReporter:
             # the sidecar-shaped payload; it carries the same value as policy_hash.
             "bundle_etag": bundle_info.get("policy_hash"),
         }
+        # A runtime serving several environments reports each one, naming it.
+        if bundle_info.get("environment_id"):
+            payload["environment_id"] = bundle_info["environment_id"]
 
         # Which SDKs have called this runtime. Absent on a runtime nothing has
         # called yet, and omitted entirely rather than sent as [] so an older
         # control plane's stored value is not blanked by a fresh process that
         # has simply not been called since it started.
-        sdks = get_sdk_registry().snapshot()
+        # Worker 0 reports for the whole instance: every worker's SDK callers.
+        sdks = instance_sdk_clients(get_sdk_registry().snapshot())
         if sdks:
             payload["sdk_versions"] = sdks
         # A project-scoped token serves several environments, so name which one this is.

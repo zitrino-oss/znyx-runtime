@@ -24,16 +24,17 @@ Signals:
 * **Untrusted source into a trusted corpus** — a provenance failure the text itself
   cannot show, read from metadata.
 * **Ingest burst** — many writes from one source in a window, the low-volume backdoor
-  case. Stateful per source, mirroring how ``abuse`` and ``unbounded_consumption`` hold
-  per-tenant state.
+  case. Stateful per source: the write count lives in the shared state store
+  (``znyx_core.state_store``), so replicas share one count and a restart does not reset
+  it. If a ``closed``-mode store is unreachable the burst check fails closed.
 """
+import hashlib
 import re
-import threading
-import time
 from typing import Any, Dict, List, Optional
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.core.risk import calculate_risk_score
+from znyx_core.state_store import StateUnavailable, get_state_store
 
 # Claiming to be the authoritative answer, or discrediting the rest of the corpus.
 _AUTHORITY_PATTERNS = [
@@ -80,20 +81,6 @@ class CorpusPoisoningMonitorDetector:
         # Ingest burst: writes from one source within the window.
         self.max_writes_per_window = max(0, int(self.config.get("max_writes_per_window", 250)))
         self.window_seconds = max(1, int(self.config.get("window_seconds", 3600)))
-        self._writes: Dict[str, Dict[str, Any]] = {}
-        self._last_cleanup = time.time()
-        # Guards _writes; the text analysis above runs outside it.
-        self._lock = threading.Lock()
-
-    def _cleanup(self, now: float) -> None:
-        with self._lock:
-            if now - self._last_cleanup < 300:
-                return
-            stale = [k for k, v in self._writes.items()
-                     if now - v.get("first_ts", now) > self.window_seconds]
-            for k in stale:
-                del self._writes[k]
-            self._last_cleanup = now
 
     @staticmethod
     def _lower_values(metadata: Dict[str, Any], keys) -> List[str]:
@@ -159,23 +146,31 @@ class CorpusPoisoningMonitorDetector:
         # masked by, or mask, another.
         source = meta.get("source_id") or meta.get("source") or meta.get("author")
         if self.max_writes_per_window and isinstance(source, str) and source.strip():
-            now = time.time()
-            self._cleanup(now)
-            key = f"{tenant_id}:{source.strip()}"
-            with self._lock:
-                state = self._writes.get(key)
-                if state is None or (now - state["first_ts"]) > self.window_seconds:
-                    state = {"count": 0, "first_ts": now}
-                    self._writes[key] = state
-                state["count"] += 1
-                count = state["count"]
-            if count > self.max_writes_per_window:
+            # The source is hashed: it is caller-chosen (an author name, a URL) and need
+            # not be stored or bounded in a key. The window is in the key so differently
+            # configured windows never share a counter.
+            digest = hashlib.sha256(source.strip().encode("utf-8", "ignore")).hexdigest()[:16]
+            try:
+                count = int(get_state_store().incr(
+                    f"budget:corpus:{self.window_seconds}:{tenant_id}:{digest}",
+                    {"count": 1}, ttl_seconds=self.window_seconds).get("count", 0))
+            except StateUnavailable as exc:
+                # Cannot count the source's writes, so do not let an outage switch the
+                # burst check off.
                 rule_hits.append(RuleHit(
-                    rule_id="corpus_poisoning_monitor.ingest_burst",
+                    rule_id="corpus_poisoning_monitor.state_unavailable",
                     severity=Severity.MEDIUM,
-                    message=(f"Source '{source}' has written {count} documents in "
-                             f"this window; a few hundred is enough to plant a backdoor"),
+                    message=("Ingest volume for this source cannot be verified: the shared "
+                             f"state store is unavailable, failing closed ({exc})"),
                 ))
+            else:
+                if count > self.max_writes_per_window:
+                    rule_hits.append(RuleHit(
+                        rule_id="corpus_poisoning_monitor.ingest_burst",
+                        severity=Severity.MEDIUM,
+                        message=(f"Source '{source}' has written {count} documents in "
+                                 f"this window; a few hundred is enough to plant a backdoor"),
+                    ))
 
         if not rule_hits:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)

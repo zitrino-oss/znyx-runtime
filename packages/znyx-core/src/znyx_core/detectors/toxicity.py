@@ -2,6 +2,7 @@ import re
 import unicodedata
 from typing import List, Dict, Any, Set
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
+from znyx_core.core import regex_prefilter as _prefilter
 from znyx_core.core.risk import calculate_risk_score
 
 # Unicode homoglyph map: visually similar characters → ASCII equivalents
@@ -1205,6 +1206,21 @@ class ToxicityDetector:
                     self.toxic_terms[term.lower()] = sev
                     self.term_to_category[term.lower()] = cat_name
 
+    def _term_info(self, term: str):
+        """``(is_phrase, pattern, normalized variants, variant patterns)`` for a term,
+        built once: none of it depends on the text being checked."""
+        cache = self.__dict__.setdefault("_term_cache", {})
+        info = cache.get(term)
+        if info is None:
+            variants = self._normalize_for_evasion(term) if self.detect_evasion else [term]
+            if ' ' in term:
+                info = (True, None, variants, [])
+            else:
+                info = (False, re.compile(r'\b' + re.escape(term) + r'\b', re.IGNORECASE), variants,
+                        [re.compile(r'\b' + re.escape(v) + r'\b', re.IGNORECASE) for v in variants])
+            cache[term] = info
+        return info
+
     def _normalize_for_evasion(self, text: str) -> list:
         """
         Normalize text to detect leetspeak and spacing obfuscation.
@@ -1582,43 +1598,33 @@ class ToxicityDetector:
         unicode_normalized = _normalize_unicode(text)
         normalized_texts = self._normalize_for_evasion(unicode_normalized) if self.detect_evasion else [text_lower]
 
-        # Check for toxic terms in both original and normalized text
+        # Check for toxic terms in both original and normalized text. Each term's
+        # variants and patterns are built once (_term_info), and a pattern whose word
+        # is absent from the text is skipped without scanning (core/regex_prefilter).
         found_terms: Set[str] = set()
+        prepared_text = _prefilter.Text(text)
+        prepared_normalized = [_prefilter.Text(nt) for nt in normalized_texts]
         for term, severity in self.toxic_terms.items():
             found_in_original = False
             found_in_normalized = False
-
-            # Normalize the term for comparison
-            normalized_term_variants = self._normalize_for_evasion(term) if self.detect_evasion else [term]
+            is_phrase, pattern, normalized_term_variants, variant_patterns = self._term_info(term)
 
             # Use word boundary matching for single words, substring for phrases
-            if ' ' in term:
+            if is_phrase:
                 # Phrase - use substring match
                 if term in text_lower:
                     found_in_original = True
                 if self.detect_evasion and not found_in_original:
-                    for nt in normalized_texts:
-                        for nterm in normalized_term_variants:
-                            if nterm in nt:
-                                found_in_normalized = True
-                                break
-                        if found_in_normalized:
-                            break
+                    found_in_normalized = any(nterm in nt for nt in normalized_texts
+                                              for nterm in normalized_term_variants)
             else:
                 # Single word - use word boundary
-                pattern = re.compile(r'\b' + re.escape(term) + r'\b', re.IGNORECASE)
-                if pattern.search(text):
+                if _prefilter.search(pattern, prepared_text):
                     found_in_original = True
                 # Check normalized text with normalized term
                 if self.detect_evasion and not found_in_original:
-                    for nt in normalized_texts:
-                        for nterm in normalized_term_variants:
-                            np = re.compile(r'\b' + re.escape(nterm) + r'\b', re.IGNORECASE)
-                            if np.search(nt):
-                                found_in_normalized = True
-                                break
-                        if found_in_normalized:
-                            break
+                    found_in_normalized = any(_prefilter.search(np, pt) for pt in prepared_normalized
+                                              for np in variant_patterns)
 
             if (found_in_original or found_in_normalized) and term not in found_terms:
                 # Safe-context bypass runs before force-block check (applies to all categories)

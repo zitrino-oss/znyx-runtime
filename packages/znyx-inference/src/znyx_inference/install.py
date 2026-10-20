@@ -54,8 +54,9 @@ class InstallManager:
 
     def start_install(self, task: str, model_id: Optional[str] = None,
                       revision: Optional[str] = None) -> InstallJob:
-        from znyx_inference.runners._fetch import resolve_fetch_target
+        from znyx_inference.runners._fetch import ensure_downloads_allowed, resolve_fetch_target
 
+        ensure_downloads_allowed()   # refuse up front rather than queue a job that will fail
         with self._lock:
             active = self._active_job()
             if active is not None:

@@ -1,0 +1,189 @@
+{{- $secretName := include "znyx.secretName" . -}}
+{{- $port := include "znyx.port" . | int -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "znyx.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "znyx.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.updateStrategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "znyx.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # A change to znyx.yaml or policies.yaml changes this hash and rolls the pods.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "znyx.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: znyx
+          image: {{ include "znyx.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No ENTRYPOINT in the image: args is the whole command.
+          args:
+            - znyx
+            - serve
+            - --config
+            - /etc/znyx/znyx.yaml
+          ports:
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            # znyx.yaml (the ConfigMap) is authoritative: the image's own defaults sit below
+            # it (ZNYX_DEFAULTS), so only the switches the chart owns are variables here.
+            {{- if .Values.policy }}
+            - name: ZNYX_POLICY_PATH
+              value: /etc/znyx/policies.yaml
+            {{- end }}
+            - name: RUNTIME_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: RUNTIME_API_KEY
+            - name: ZNYX_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: ZNYX_RUNTIME_TOKEN
+                  optional: true
+            - name: ZNYX_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: ZNYX_REDIS_URL
+                  optional: true
+            {{- if .Values.ml.enabled }}
+            - name: ZNYX_ML
+              value: "true"
+            {{- end }}
+            {{- if .Values.airgapped }}
+            - name: ZNYX_AIRGAPPED
+              value: "true"
+            {{- end }}
+            {{- if include "znyx.redisConfigured" . }}
+            - name: ZNYX_STATE_BACKEND
+              value: redis
+            {{- end }}
+            {{- if .Values.metrics.requireKey }}
+            - name: ZNYX_METRICS_REQUIRE_KEY
+              value: "true"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          resources:
+            {{- include "znyx.resources" . | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/znyx
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.ml.enabled }}
+            - name: models
+              mountPath: /models
+              {{- if and .Values.ml.models.existingClaim .Values.ml.models.readOnly }}
+              readOnly: true
+              {{- end }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.topologySpread.topologyKey }}
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "znyx.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "znyx.configMapName" . }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "znyx.fullname" .)) .Values.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.ml.enabled }}
+        - name: models
+          {{- if .Values.ml.models.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.ml.models.existingClaim }}
+            {{- if .Values.ml.models.readOnly }}
+            readOnly: true
+            {{- end }}
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.ml.models.sizeLimit }}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

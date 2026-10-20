@@ -8,8 +8,9 @@ module is the dependency-free seam between them:
 * ``JudgeExecutionContext`` — the per-request bundle a composition root injects into
   ``GuardrailsEvaluator.evaluate(..., judge_ctx=...)``. Every callable is **synchronous**
   (the judge bridge runs on a worker thread), so the audit sink *collects* events that the
-  composition root drains afterwards, and the budget check reads a *snapshot* the root
-  precomputed — neither touches a DB on the hot path.
+  composition root drains afterwards, and the budget check reads either a *snapshot* the
+  root precomputed (control plane) or the shared state store's current totals (runtime) —
+  neither touches a DB on the hot path.
 * ``budget_allows`` — the pure deny-of-wallet decision over a budget snapshot. The control
   plane builds the snapshot from ``judge_budgets`` rows; the runtime builds it from a
   bundle-delivered snapshot. Same logic, same answer.
@@ -27,6 +28,9 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
+
+from znyx_core.secret_refs import maybe_resolve
+from znyx_core.state_store import StateUnavailable, get_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +116,87 @@ def make_snapshot_budget_check(snapshot: List[Dict[str, Any]], env: str) -> Call
 
 
 # ---------------------------------------------------------------------------
+# Shared-store spend: windowed, cross-replica, read at call time.
+# ---------------------------------------------------------------------------
+# The stateless runtime has no DB, so its spend tally lives in the shared state store
+# (``znyx_core.state_store``). One counter per budget row per window, so replicas pointed
+# at the same Redis enforce ONE budget, the window is honoured (a fixed window from the
+# first spend), and the check reads the CURRENT totals on every call rather than a
+# snapshot frozen at the start of the request.
+#
+# Key: ``judge:spend:<org>:<cap_env>:<cap_detector_key>:<window_seconds>``; fields
+# ``cost_usd`` and ``calls``. An event is added to every cap that covers it (wildcards),
+# so a ``(*, *)`` budget and an ``(env, det)`` budget each keep their own total.
+
+DEFAULT_BUDGET_WINDOW_SECONDS = 86400
+
+
+def _cap_window(cap: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(cap.get("window_seconds") or DEFAULT_BUDGET_WINDOW_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_BUDGET_WINDOW_SECONDS
+
+
+def judge_spend_key(org_scope: Optional[str], cap_env: str, cap_detector_key: str,
+                    window_seconds: int) -> str:
+    """State-store key of one budget row's spend counter for its window."""
+    return f"judge:spend:{org_scope or '-'}:{cap_env}:{cap_detector_key}:{int(window_seconds)}"
+
+
+def _covers(cap: Dict[str, Any], env: str, detector_key: str) -> bool:
+    return (cap.get("env", "*") in ("*", env)
+            and cap.get("detector_key", "*") in ("*", detector_key))
+
+
+def record_judge_spend(caps: List[Dict[str, Any]], env: str, detector_key: str,
+                       cost_usd: float, org_scope: Optional[str] = None) -> None:
+    """Add one judge call (``cost_usd``) to the spend counter of every cap that covers
+    ``(env, detector_key)``. Call right after the judge call, with its actual cost.
+
+    Raises ``StateUnavailable`` when the store is in fail-closed mode and unreachable;
+    the caller decides (post-call recording logs and carries on)."""
+    store = get_state_store()
+    for cap in caps or []:
+        if not _covers(cap, env, detector_key):
+            continue
+        window = _cap_window(cap)
+        store.incr(judge_spend_key(org_scope, cap.get("env", "*"), cap.get("detector_key", "*"), window),
+                   {"cost_usd": float(cost_usd or 0.0), "calls": 1}, ttl_seconds=window)
+
+
+def make_store_budget_check(caps: List[Dict[str, Any]], env: str,
+                            org_scope: Optional[str] = None) -> Callable[[str], bool]:
+    """Bind bundle-delivered budget caps + request env into the sync
+    ``(detector_key) -> allowed`` gate, deciding by ``budget_allows`` over the store's
+    current totals at each call. A store failure DENIES the call (fail closed for spend:
+    judges are optional and the detector falls back without one)."""
+    def _check(detector_key: str) -> bool:
+        covering = [c for c in (caps or []) if _covers(c, env, detector_key)]
+        if not covering:
+            return True
+        try:
+            store = get_state_store()
+            snapshot = []
+            for c in covering:
+                cenv, cdet = c.get("env", "*"), c.get("detector_key", "*")
+                window = _cap_window(c)
+                totals = store.get(judge_spend_key(org_scope, cenv, cdet, window))
+                snapshot.append({
+                    "env": cenv, "detector_key": cdet,
+                    "max_cost_usd": c.get("max_cost_usd"), "max_calls": c.get("max_calls"),
+                    "window_seconds": window,
+                    "spend_usd": float(totals.get("cost_usd", 0.0)),
+                    "spend_calls": int(totals.get("calls", 0)),
+                })
+        except StateUnavailable:
+            logger.warning("judge spend store unavailable; denying judge call for %s", detector_key)
+            return False
+        return budget_allows(snapshot, env, detector_key)
+    return _check
+
+
+# ---------------------------------------------------------------------------
 # Judge-usage predicate — keep judge setup off the non-judge hot path.
 # ---------------------------------------------------------------------------
 
@@ -175,7 +260,7 @@ def judge_params_from_config(policy_key: str, config: Dict[str, Any]) -> Optiona
         if not rubric:
             return None
         provider = block.get("provider") or "openai"
-        api_key = (block.get("auth_value") or block.get("api_key")
+        api_key = (maybe_resolve(block.get("auth_value") or block.get("api_key"), what="judge auth_value")
                    or os.getenv(_PROVIDER_KEY_ENVS.get(provider, ""), ""))
         return {
             "mode": mode,

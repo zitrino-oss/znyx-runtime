@@ -1,0 +1,166 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: znyxinstances.znyx.ai
+spec:
+  group: znyx.ai
+  scope: Namespaced
+  names:
+    kind: ZnyxInstance
+    listKind: ZnyxInstanceList
+    plural: znyxinstances
+    singular: znyxinstance
+    shortNames:
+      - znyx
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Ready
+          type: boolean
+          jsonPath: .status.ready
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Version
+          type: string
+          jsonPath: .status.version
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "A Znyx gateway: one Deployment of the single-container install and its companions."
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              properties:
+                version:
+                  type: string
+                  default: "1.0.0"
+                  description: "Image tag. The ml image is this tag with an -ml suffix."
+                image:
+                  type: object
+                  default: {}
+                  properties:
+                    repository:
+                      type: string
+                      default: znyx/znyx
+                    pullPolicy:
+                      type: string
+                      default: IfNotPresent
+                      enum: [Always, IfNotPresent, Never]
+                    pullSecrets:
+                      type: array
+                      description: "Names of image pull Secrets in the same namespace."
+                      items:
+                        type: string
+                replicas:
+                  type: integer
+                  default: 2
+                  minimum: 1
+                ml:
+                  type: object
+                  description: "Serve ML detectors from the same container (the -ml image)."
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    modelsClaim:
+                      type: string
+                      description: "Existing PersistentVolumeClaim holding model weights, mounted at /models. Empty uses an emptyDir."
+                    modelsSizeLimit:
+                      type: string
+                      description: "Size limit of the /models emptyDir (for example 5Gi). Ignored when modelsClaim is set."
+                airgapped:
+                  type: boolean
+                  default: false
+                  description: "No outbound calls. Forces a NetworkPolicy without port 443 egress."
+                config:
+                  type: object
+                  description: "The znyx.yaml content, merged over the operator defaults."
+                  x-kubernetes-preserve-unknown-fields: true
+                policy:
+                  type: string
+                  description: "The policies.yaml content. Omit to use the image's built-in policy."
+                secretRef:
+                  type: string
+                  description: "Name of a Secret with RUNTIME_API_KEY and optionally ZNYX_RUNTIME_TOKEN and ZNYX_REDIS_URL. Omit to have the operator create <name>-secrets with a generated API key."
+                state:
+                  type: object
+                  properties:
+                    redis:
+                      type: boolean
+                      default: false
+                      description: "Share limits and budgets across replicas in Redis. Needs secretRef with a ZNYX_REDIS_URL key."
+                resources:
+                  type: object
+                  description: "Container resources. Omit for the defaults (ml image gets larger ones)."
+                  x-kubernetes-preserve-unknown-fields: true
+                networkPolicy:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    ingressFrom:
+                      type: array
+                      description: "NetworkPolicyPeers allowed to reach the gateway. Default is the instance's own namespace."
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    egressTo:
+                      type: array
+                      description: "Extra NetworkPolicyPeers the gateway may reach on any port (for example an in-cluster Redis)."
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                persistence:
+                  type: object
+                  description: "Keep /data (API key, spools, caches) on a volume. Needs replicas 1."
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    size:
+                      type: string
+                      default: 1Gi
+                    storageClassName:
+                      type: string
+            status:
+              type: object
+              properties:
+                ready:
+                  type: boolean
+                replicas:
+                  type: integer
+                readyReplicas:
+                  type: integer
+                observedGeneration:
+                  type: integer
+                  format: int64
+                version:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

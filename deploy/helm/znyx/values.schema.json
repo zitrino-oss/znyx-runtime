@@ -1,0 +1,313 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Znyx chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "quantity": {
+      "oneOf": [{ "type": "string" }, { "type": "number" }]
+    },
+    "probe": {
+      "type": "object",
+      "properties": {
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "objectList": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  },
+  "properties": {
+    "global": { "type": "object" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string", "maxLength": 63 },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registry": { "type": "string" },
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": ["string", "number"] },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "updateStrategy": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["RollingUpdate", "Recreate"] },
+        "rollingUpdate": { "type": "object" }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "string" }] },
+        "maxUnavailable": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "string" }] }
+      }
+    },
+    "topologySpread": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maxSkew": { "type": "integer", "minimum": 1 },
+        "topologyKey": { "type": "string", "minLength": 1 },
+        "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "config": {
+      "type": "object",
+      "description": "Contents of znyx.yaml. Unknown keys pass through; the runtime rejects the ones it does not know at start-up.",
+      "properties": {
+        "version": { "const": 1 },
+        "server": {
+          "type": ["object", "null"],
+          "properties": {
+            "host": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "workers": {
+              "oneOf": [
+                { "type": "string", "enum": ["auto"] },
+                { "type": "integer", "minimum": 1 }
+              ]
+            },
+            "graceful_timeout": { "type": "integer", "minimum": 0 },
+            "worker_timeout": { "type": "integer", "minimum": 0 },
+            "run_dir": { "type": "string" },
+            "allowed_origins": { "type": "string" }
+          }
+        },
+        "mode": { "type": "string", "enum": ["local", "managed"] },
+        "policy": { "type": "string" },
+        "fail_mode": { "type": "string", "enum": ["open", "closed"] },
+        "control_plane": { "type": ["object", "null"] },
+        "auth": { "type": ["object", "null"] },
+        "ml": { "type": ["object", "null"] },
+        "state": {
+          "type": ["object", "null"],
+          "properties": {
+            "backend": { "type": "string", "enum": ["auto", "memory", "sqlite", "redis"] },
+            "fail_mode": { "type": "string", "enum": ["local", "closed"] }
+          }
+        },
+        "telemetry": { "type": ["object", "null"] },
+        "dashboard": {
+          "type": ["object", "null"],
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "airgapped": { "type": "boolean" },
+        "airgapped_allow": {
+          "type": "string",
+          "description": "Air-gapped: in-network hosts model and judge calls may still reach (comma-separated), beyond loopback, private addresses and cluster-internal names."
+        },
+        "log_level": {
+          "type": "string",
+          "enum": ["critical", "error", "warning", "info", "debug"]
+        }
+      }
+    },
+    "policy": { "type": "string" },
+    "existingSecret": { "type": "string" },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiKey": { "type": "string" },
+        "runtimeToken": { "type": "string" },
+        "redisUrl": { "type": "string", "pattern": "^(|rediss?://.+)$" }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "redis": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        }
+      }
+    },
+    "airgapped": { "type": "boolean" },
+    "ml": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "models": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingClaim": { "type": "string" },
+            "readOnly": { "type": "boolean" },
+            "sizeLimit": { "type": "string" }
+          }
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "existingClaim": { "type": "string" },
+        "storageClass": { "type": "string" },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
+          }
+        },
+        "size": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "requireKey": { "type": "boolean" } }
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "requests": { "type": "object", "additionalProperties": { "$ref": "#/definitions/quantity" } },
+        "limits": { "type": "object", "additionalProperties": { "$ref": "#/definitions/quantity" } }
+      }
+    },
+    "startupProbe": { "$ref": "#/definitions/probe" },
+    "readinessProbe": { "$ref": "#/definitions/probe" },
+    "livenessProbe": { "$ref": "#/definitions/probe" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "automountServiceAccountToken": { "type": "boolean" },
+    "nodeSelector": { "$ref": "#/definitions/stringMap" },
+    "tolerations": { "$ref": "#/definitions/objectList" },
+    "affinity": { "type": "object" },
+    "priorityClassName": { "type": "string" },
+    "podAnnotations": { "$ref": "#/definitions/stringMap" },
+    "podLabels": { "$ref": "#/definitions/stringMap" },
+    "extraEnv": { "$ref": "#/definitions/objectList" },
+    "extraVolumes": { "$ref": "#/definitions/objectList" },
+    "extraVolumeMounts": { "$ref": "#/definitions/objectList" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["host"],
+            "properties": {
+              "host": { "type": "string", "minLength": 1 },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["path"],
+                  "properties": {
+                    "path": { "type": "string" },
+                    "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": { "$ref": "#/definitions/objectList" }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "namespace": { "type": "string" },
+        "interval": { "type": "string" },
+        "scrapeTimeout": { "type": "string" },
+        "labels": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingressFrom": { "$ref": "#/definitions/objectList" },
+        "egressTo": { "$ref": "#/definitions/objectList" },
+        "egressPorts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["port"],
+            "properties": {
+              "port": { "oneOf": [{ "type": "integer", "minimum": 1, "maximum": 65535 }, { "type": "string" }] },
+              "protocol": { "type": "string", "enum": ["TCP", "UDP", "SCTP"] }
+            }
+          }
+        },
+        "extraEgress": { "$ref": "#/definitions/objectList" }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": ["string", "number"] },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        }
+      }
+    }
+  }
+}

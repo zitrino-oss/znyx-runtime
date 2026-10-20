@@ -3,55 +3,20 @@ Abuse Controls Detector
 
 Implements:
 - Payload size limits
-- Rate limiting (in-memory token bucket for R2)
-- Prompt flood detection (repeat detection)
+- Rate limiting (token bucket in the shared state store)
+- Prompt flood detection (repeat detection in the shared state store)
+
+Rate and flood state lives in ``znyx_core.state_store`` so replicas pointed at
+the same Redis enforce one limit between them and a restart does not reset it.
+With the default in-process store the behaviour is per process, as before.
 """
-import time
 import hashlib
-import threading
+import logging
 from typing import List, Dict, Any, Optional
-from collections import defaultdict, deque
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
+from znyx_core.state_store import StateUnavailable, get_state_store
 
-
-class TokenBucket:
-    """Simple in-memory token bucket for rate limiting"""
-
-    def __init__(self, rate: int, capacity: int):
-        """
-        Initialize token bucket.
-
-        Args:
-            rate: Tokens per second
-            capacity: Maximum tokens
-        """
-        self.rate = rate
-        self.capacity = capacity
-        self.tokens = capacity
-        self.last_update = time.time()
-
-    def consume(self, tokens: int = 1) -> bool:
-        """
-        Try to consume tokens.
-
-        Args:
-            tokens: Number of tokens to consume
-
-        Returns:
-            True if tokens consumed, False if insufficient
-        """
-        now = time.time()
-        elapsed = now - self.last_update
-
-        # Refill tokens based on elapsed time (round to avoid float drift)
-        self.tokens = min(self.capacity, round(self.tokens + elapsed * self.rate, 6))
-        self.last_update = now
-
-        # Try to consume
-        if self.tokens >= tokens:
-            self.tokens = round(self.tokens - tokens, 6)
-            return True
-        return False
+logger = logging.getLogger(__name__)
 
 
 class AbuseDetector:
@@ -81,47 +46,11 @@ class AbuseDetector:
         self.prompt_flood_window = config.get('prompt_flood_window', 60)
         self.repetitive_content_threshold = config.get('repetitive_content_threshold', 10)
 
-        # In-memory storage (resets on restart; use Redis for multi-instance deployments)
-        # key -> TokenBucket
-        self.rate_limiters: Dict[str, TokenBucket] = {}
-
-        # key -> deque of (hash, timestamp)
-        self.prompt_hashes: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
-
-        # Cleanup tracking
-        self.last_cleanup = time.time()
-
-        # Guards the shared rate/flood state above. The pure checks
-        # (payload size, repetitive content) stay lock-free.
-        self._lock = threading.Lock()
-
     def _make_key(self, tenant_id: str, app_id: str, user_id: Optional[str] = None) -> str:
         """Create rate limit key from identifiers"""
         if user_id:
             return f"{tenant_id}:{app_id}:{user_id}"
         return f"{tenant_id}:{app_id}"
-
-    def _cleanup_old_entries(self):
-        """Periodically cleanup old entries (simple memory management)"""
-        with self._lock:
-            now = time.time()
-
-            # Cleanup every 5 minutes
-            if now - self.last_cleanup < 300:
-                return
-
-            # Remove old prompt hashes
-            for key in list(self.prompt_hashes.keys()):
-                hashes = self.prompt_hashes[key]
-                # Remove entries older than window
-                while hashes and (now - hashes[0][1]) > self.prompt_flood_window:
-                    hashes.popleft()
-
-                # Remove key if empty
-                if not hashes:
-                    del self.prompt_hashes[key]
-
-            self.last_cleanup = now
 
     def check_payload_size(self, text: str, context: str = "input") -> Optional[RuleHit]:
         """
@@ -170,27 +99,32 @@ class AbuseDetector:
         Returns:
             RuleHit if rate limited, None if OK
         """
-        key = self._make_key(tenant_id, app_id, user_id)
+        identity = self._make_key(tenant_id, app_id, user_id)
+        # The limit is part of the key: a bucket's rate and capacity are fixed when
+        # it is created, so two policies with different limits must not share one.
+        key = f"abuse:rl:{self.rate_limit_per_minute}:{identity}"
 
-        with self._lock:
-            # Get or create token bucket
-            if key not in self.rate_limiters:
-                # Convert per-minute to per-second rate
-                rate_per_second = self.rate_limit_per_minute / 60.0
-                self.rate_limiters[key] = TokenBucket(
-                    rate=rate_per_second,
-                    capacity=self.rate_limit_per_minute
-                )
+        try:
+            allowed = get_state_store().consume_token(
+                key,
+                rate_per_second=self.rate_limit_per_minute / 60.0,
+                capacity=self.rate_limit_per_minute,
+            )
+        except StateUnavailable as exc:
+            # Shared store down with ZNYX_STATE_FAIL_MODE=closed: fail closed.
+            logger.warning("Abuse rate limit failing closed, shared state unavailable: %s", exc)
+            return RuleHit(
+                rule_id="abuse.rate_limited",
+                severity=Severity.MEDIUM,
+                message="Rate limit could not be verified (shared state store unavailable); request denied"
+            )
 
-            bucket = self.rate_limiters[key]
-
-            # Try to consume 1 token
-            if not bucket.consume(1):
-                return RuleHit(
-                    rule_id="abuse.rate_limited",
-                    severity=Severity.MEDIUM,
-                    message=f"Rate limit exceeded: {self.rate_limit_per_minute} requests per minute"
-                )
+        if not allowed:
+            return RuleHit(
+                rule_id="abuse.rate_limited",
+                severity=Severity.MEDIUM,
+                message=f"Rate limit exceeded: {self.rate_limit_per_minute} requests per minute"
+            )
 
         return None
 
@@ -213,25 +147,29 @@ class AbuseDetector:
         Returns:
             RuleHit if flood detected, None if OK
         """
-        key = self._make_key(tenant_id, app_id, user_id)
+        identity = self._make_key(tenant_id, app_id, user_id)
 
-        # Hash the text
+        # Only a hash of the text goes into the key, never the text itself.
         text_hash = hashlib.sha256(text.encode()).hexdigest()
-        now = time.time()
+        # Window and threshold are part of the key so policies that differ in
+        # either never share a counter.
+        key = (f"abuse:flood:{self.prompt_flood_window}:{self.prompt_flood_threshold}:"
+               f"{identity}:{text_hash}")
 
-        with self._lock:
-            # Get hash history for this key
-            hashes = self.prompt_hashes[key]
+        # Fixed-window approximation of "same hash N times within W seconds": the
+        # counter starts on the first sighting and resets W seconds later, rather
+        # than sliding with each request.
+        try:
+            total = get_state_store().incr(key, {"n": 1}, ttl_seconds=self.prompt_flood_window)
+        except StateUnavailable as exc:
+            # detect() always runs check_rate_limit first, which fails closed on
+            # the same outage, so the request is already denied there. Do not add
+            # a second, misleading flood hit.
+            logger.warning("Prompt flood check skipped, shared state unavailable: %s", exc)
+            return None
 
-            # Remove old entries
-            while hashes and (now - hashes[0][1]) > self.prompt_flood_window:
-                hashes.popleft()
-
-            # Count occurrences of this hash
-            count = sum(1 for h, _ in hashes if h == text_hash)
-
-            # Add current hash
-            hashes.append((text_hash, now))
+        # Occurrences before this request (incr already counted it).
+        count = int(total.get("n", 1)) - 1
 
         # Check if threshold exceeded
         if count >= self.prompt_flood_threshold:
@@ -297,9 +235,6 @@ class AbuseDetector:
         """
         if not self.enabled:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
-
-        # Periodic cleanup
-        self._cleanup_old_entries()
 
         rule_hits: List[RuleHit] = []
 

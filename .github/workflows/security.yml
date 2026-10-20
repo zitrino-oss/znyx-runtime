@@ -63,11 +63,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: docker build -f Dockerfile.runtime -t znyx-runtime:ci .
+      # The image customers run now (Dockerfile, target znyx). The ML image adds the
+      # model runtime and torch; scan it too once its unfixed upstream CVEs are triaged.
+      - run: docker build --target znyx -t znyx:ci .
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
-          image-ref: znyx-runtime:ci
+          image-ref: znyx:ci
           scanners: vuln
           severity: HIGH,CRITICAL
           # Don't fail on base-image CVEs that have no upstream fix yet;

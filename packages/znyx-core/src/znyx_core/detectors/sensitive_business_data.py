@@ -118,9 +118,12 @@ class SensitiveBusinessDataDetector:
             for phrase in set(matched_spans):
                 sanitized = re.sub(r"\b" + re.escape(phrase) + r"\b", "[REDACTED]",
                                    sanitized, flags=re.IGNORECASE)
+            from znyx_core.core.text_edits import edits_for_patterns, literal_pattern
             return DetectorResult(
                 decision=Decision.REDACT, risk_score=risk_score, rule_hits=rule_hits,
                 sanitized_text=sanitized, developer_message=dev_msg,
+                text_edits=edits_for_patterns(
+                    text, [(literal_pattern(p), "[REDACTED]") for p in set(matched_spans)]),
                 user_message="Redacted confidential business information.",
             )
 

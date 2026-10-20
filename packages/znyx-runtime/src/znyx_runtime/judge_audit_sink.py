@@ -9,10 +9,13 @@ built on the SAME durable-spool + CP-drain transport used for egress audit:
   ``runtime.audit_sink.SpoolAuditSink`` but carrying judge-call event dicts. The control
   plane drains it into ``judge_audit_events`` rows (``judge_eval_bridge.drain_judge_spool``).
 * ``RuntimeJudgeAudit`` — wires that spool as the per-request judge ``audit_sink`` AND keeps
-  a process-local spend counter that backs a *cached* deny-of-wallet check: budget CAPS are
-  delivered in the bundle (``policy.runtime_policy.judge_budgets``) and the running spend is
-  the runtime's own since-start tally. This is eventually-consistent with the CP (the drain
-  reconciles it) — the documented trade-off of judging on the stateless path.
+  the running spend in the shared state store (``znyx_core.state_store``) that backs the
+  deny-of-wallet check: budget CAPS are delivered in the bundle
+  (``policy.runtime_policy.judge_budgets``); spend is a per-budget, per-window counter
+  shared by every replica on the same store, read at call time. It is eventually
+  consistent with the CP (the drain reconciles it) — the documented trade-off of judging
+  on the stateless path. If the store is unreachable in fail-closed mode, judge calls are
+  denied (judges are optional; the detector falls back).
 
 Audit here is POST-call (the judge already ran), so a spool write failure is logged and
 swallowed rather than denying anything — unlike the egress gate, which is pre-call.
@@ -24,11 +27,13 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from znyx_core.engine.judge_runtime import (
-    JudgeExecutionContext, make_snapshot_budget_check, policy_uses_judge,
+    JudgeExecutionContext, make_store_budget_check, policy_uses_judge, record_judge_spend,
 )
+from znyx_core.state_store import StateUnavailable
+from znyx_core.utils.spool import append_lines
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +57,8 @@ class JudgeAuditSpool:
         self._lock = threading.Lock()
 
     def _append_sync(self, line: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        # Locked append: several worker processes share this spool and one rotates it.
+        append_lines(self.path, [line], fsync=True)
 
     def record(self, event: Dict[str, Any]) -> None:
         """Durably append one judge event. Best-effort: a write failure is logged and
@@ -86,61 +88,35 @@ class JudgeAuditSpool:
 
 
 class RuntimeJudgeAudit:
-    """Process-global runtime judge audit + cached budget. One instance per runtime.
+    """Process-global runtime judge audit + shared-store deny-of-wallet. One instance
+    per runtime.
 
     ``context_for`` builds the per-request ``JudgeExecutionContext``: its audit sink spools
-    durably (and updates the local spend tally) and its budget check reads the bundle-
-    delivered caps against that tally."""
+    durably (and adds the call to the shared spend counters) and its budget check reads the
+    bundle-delivered caps against the store's current totals."""
 
     def __init__(self, spool_path: Optional[str] = None, enabled: bool = True):
         self.enabled = enabled
         self.spool = JudgeAuditSpool(spool_path)
-        self._spend: Dict[Tuple[str, str], Dict[str, float]] = {}
-        self._lock = threading.Lock()
 
-    # -- spend tally (feeds the cached deny-of-wallet) -----------------------
+    # -- spend tally (feeds the deny-of-wallet) ------------------------------
 
-    def _record(self, event: Dict[str, Any]) -> None:
+    def _record(self, event: Dict[str, Any], caps: Optional[List[Dict[str, Any]]] = None,
+                org_scope: Optional[str] = None) -> None:
         self.spool.record(event)
         # The synthesized consensus row is excluded from spend (its members already count),
         # matching JudgeAuditService.spend on the CP side.
-        if event.get("is_consensus_result"):
+        if event.get("is_consensus_result") or not caps:
             return
         cost = event.get("cost_usd")
         if cost is None:
             cost = _estimate_cost(event.get("prompt_tokens", 0), event.get("completion_tokens", 0))
-        env = event.get("env") or "*"
-        det = event.get("detector_key") or "*"
-        with self._lock:
-            slot = self._spend.setdefault((env, det), {"cost_usd": 0.0, "calls": 0})
-            slot["cost_usd"] += float(cost or 0.0)
-            slot["calls"] += 1
-
-    def _local_spend(self, cap_env: str, cap_det: str) -> Tuple[float, int]:
-        """Running spend across the tally entries a (cap_env, cap_det) budget covers."""
-        cost, calls = 0.0, 0
-        with self._lock:
-            for (env, det), v in self._spend.items():
-                if cap_env in ("*", env) and cap_det in ("*", det):
-                    cost += v["cost_usd"]
-                    calls += v["calls"]
-        return cost, calls
-
-    def _snapshot(self, caps: List[Dict[str, Any]], env: str) -> List[Dict[str, Any]]:
-        """Merge bundle-delivered caps with the local spend tally into the plain-dict
-        snapshot ``budget_allows`` consumes (same shape the CP builds from the DB)."""
-        snapshot: List[Dict[str, Any]] = []
-        for c in caps or []:
-            cenv = c.get("env", "*")
-            cdet = c.get("detector_key", "*")
-            spend_usd, spend_calls = self._local_spend(cenv, cdet)
-            snapshot.append({
-                "env": cenv, "detector_key": cdet,
-                "max_cost_usd": c.get("max_cost_usd"), "max_calls": c.get("max_calls"),
-                "window_seconds": c.get("window_seconds", 86400),
-                "spend_usd": spend_usd, "spend_calls": spend_calls,
-            })
-        return snapshot
+        try:
+            record_judge_spend(caps, event.get("env") or "*", event.get("detector_key") or "*",
+                               float(cost or 0.0), org_scope)
+        except StateUnavailable as exc:
+            # Post-call: the call already happened; the check fails closed on its own.
+            logger.warning("judge spend not recorded (state store unavailable): %s", exc)
 
     # -- per-request context -------------------------------------------------
 
@@ -148,11 +124,11 @@ class RuntimeJudgeAudit:
                     org_scope: Optional[str] = None) -> Optional[JudgeExecutionContext]:
         """Build the per-request judge context, or None when judges aren't used / audit is
         disabled. ``org_scope`` (the request tenant/org) is stamped on each spooled event so
-        the CP drain can attribute the row; ``env`` is stamped when the sink didn't carry it."""
+        the CP drain can attribute the row, and scopes the shared spend counters; ``env`` is
+        stamped when the sink didn't carry it."""
         if not self.enabled or not policy_uses_judge(policy):
             return None
         caps = (policy.get("runtime_policy") or {}).get("judge_budgets") or []
-        snapshot = self._snapshot(caps, env)
 
         def _sink(ev: Dict[str, Any]) -> None:
             e = dict(ev)
@@ -160,10 +136,10 @@ class RuntimeJudgeAudit:
                 e["org_scope"] = org_scope
             if not e.get("env"):
                 e["env"] = env
-            self._record(e)
+            self._record(e, caps, org_scope)
 
         return JudgeExecutionContext(
             audit_sink=_sink,
-            budget_check=make_snapshot_budget_check(snapshot, env),
+            budget_check=make_store_budget_check(caps, env, org_scope),
             provider_caller=None,   # local judge reached via its policy endpoint (sidecar)
         )

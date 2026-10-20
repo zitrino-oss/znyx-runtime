@@ -1,0 +1,15 @@
+{{- include "znyx.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "znyx.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "znyx.labels" . | nindent 4 }}
+data:
+  znyx.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}
+  {{- if .Values.policy }}
+  policies.yaml: |
+    {{- .Values.policy | nindent 4 }}
+  {{- end }}

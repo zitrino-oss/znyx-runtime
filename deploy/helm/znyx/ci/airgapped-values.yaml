@@ -1,0 +1,30 @@
+# Air-gapped: private registry, pre-fetched models, egress locked down to DNS, an
+# in-cluster control plane and Redis.
+airgapped: true
+ml:
+  enabled: true
+  models:
+    existingClaim: znyx-models
+    readOnly: true
+image:
+  registry: registry.internal.example.com:5000
+imagePullSecrets:
+  - name: regcred
+secrets:
+  redisUrl: redis://redis.data.svc.cluster.local:6379/0
+networkPolicy:
+  egressTo:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: znyx-console
+  extraEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data
+          podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+          protocol: TCP

@@ -191,53 +191,95 @@ class MetricsCollector:
     # Prometheus text exposition format
     # ------------------------------------------------------------------
 
-    def format_prometheus(self) -> str:
-        """Return all metrics in Prometheus text exposition format (0.0.4)."""
+    def format_prometheus(self, snapshot: Optional[dict] = None) -> str:
+        """Return all metrics in Prometheus text exposition format (0.0.4): this
+        process's, or ``snapshot`` (for example several workers' merged with
+        ``merge_snapshots``)."""
+        snap = self.snapshot() if snapshot is None else snapshot
+        help_text = {**self._help, **snap.get("help", {})}
         lines: list = []
 
-        with self._mu:
-            # Counters
-            for name, series in sorted(self._counters.items()):
-                lines.append(f"# HELP {name} {self._help.get(name, '')}")
-                lines.append(f"# TYPE {name} counter")
-                for lk, val in sorted(series.items()):
-                    lines.append(f"{name}{self._format_labels(lk)} {self._fmt_value(val)}")
+        # Counters
+        for name, series in sorted(snap["counters"].items()):
+            lines.append(f"# HELP {name} {help_text.get(name, '')}")
+            lines.append(f"# TYPE {name} counter")
+            for lk, val in sorted((_key_of(k), v) for k, v in series):
+                lines.append(f"{name}{self._format_labels(lk)} {self._fmt_value(val)}")
 
-            # Gauges
-            for name, series in sorted(self._gauges.items()):
-                lines.append(f"# HELP {name} {self._help.get(name, '')}")
-                lines.append(f"# TYPE {name} gauge")
-                for lk, val in sorted(series.items()):
-                    lines.append(f"{name}{self._format_labels(lk)} {self._fmt_value(val)}")
+        # Gauges
+        for name, series in sorted(snap["gauges"].items()):
+            lines.append(f"# HELP {name} {help_text.get(name, '')}")
+            lines.append(f"# TYPE {name} gauge")
+            for lk, val in sorted((_key_of(k), v) for k, v in series):
+                lines.append(f"{name}{self._format_labels(lk)} {self._fmt_value(val)}")
 
-            # Histograms
-            for name, series in sorted(self._histograms.items()):
-                lines.append(f"# HELP {name} {self._help.get(name, '')}")
-                lines.append(f"# TYPE {name} histogram")
-                for lk, entry in sorted(series.items()):
-                    cumulative = 0
-                    for bound in sorted(entry["buckets"].keys()):
-                        cumulative += entry["buckets"][bound]
-                        le_labels = dict(lk) if lk else {}
-                        le_labels["le"] = self._fmt_value(bound)
-                        le_key = _labels_key(le_labels)
-                        lines.append(f"{name}_bucket{self._format_labels(le_key)} {cumulative}")
-                    # +Inf bucket
-                    inf_labels = dict(lk) if lk else {}
-                    inf_labels["le"] = "+Inf"
-                    inf_key = _labels_key(inf_labels)
-                    lines.append(f"{name}_bucket{self._format_labels(inf_key)} {entry['count']}")
-                    lines.append(f"{name}_sum{self._format_labels(lk)} {self._fmt_value(entry['sum'])}")
-                    lines.append(f"{name}_count{self._format_labels(lk)} {entry['count']}")
+        # Histograms
+        for name, series in sorted(snap["histograms"].items()):
+            lines.append(f"# HELP {name} {help_text.get(name, '')}")
+            lines.append(f"# TYPE {name} histogram")
+            for lk, entry in sorted(((_key_of(k), e) for k, e in series), key=lambda x: x[0]):
+                cumulative = 0
+                for bound, count in sorted(entry["buckets"]):
+                    cumulative += count
+                    le_labels = dict(lk) if lk else {}
+                    le_labels["le"] = self._fmt_value(bound)
+                    le_key = _labels_key(le_labels)
+                    lines.append(f"{name}_bucket{self._format_labels(le_key)} {cumulative}")
+                # +Inf bucket
+                inf_labels = dict(lk) if lk else {}
+                inf_labels["le"] = "+Inf"
+                inf_key = _labels_key(inf_labels)
+                lines.append(f"{name}_bucket{self._format_labels(inf_key)} {entry['count']}")
+                lines.append(f"{name}_sum{self._format_labels(lk)} {self._fmt_value(entry['sum'])}")
+                lines.append(f"{name}_count{self._format_labels(lk)} {entry['count']}")
 
         lines.append("")  # trailing newline
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Snapshots: the worker processes of one install report as one
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """A JSON-serialisable copy of every series."""
+        with self._mu:
+            return {
+                "counters": {n: [[list(k), v] for k, v in s.items()] for n, s in self._counters.items()},
+                "gauges": {n: [[list(k), v] for k, v in s.items()] for n, s in self._gauges.items()},
+                "histograms": {
+                    n: [[list(k), {"buckets": [[b, c] for b, c in e["buckets"].items()],
+                                   "sum": e["sum"], "count": e["count"]}] for k, e in s.items()]
+                    for n, s in self._histograms.items()},
+                "help": dict(self._help),
+            }
+
+    def restore(self, snapshot: dict) -> None:
+        """Add a previous snapshot's counters and histograms to this process's, so a
+        worker that was restarted carries on from its predecessor's totals instead of
+        dropping them. Gauges describe the present and are not restored."""
+        with self._mu:
+            for name, series in snapshot.get("counters", {}).items():
+                for k, v in series:
+                    self._counters[name][_key_of(k)] += v
+            for name, series in snapshot.get("histograms", {}).items():
+                for k, e in series:
+                    key = _key_of(k)
+                    entry = self._histograms[name].setdefault(
+                        key, {"buckets": {}, "sum": 0.0, "count": 0})
+                    for bound, count in e["buckets"]:
+                        entry["buckets"][bound] = entry["buckets"].get(bound, 0) + count
+                    entry["sum"] += e["sum"]
+                    entry["count"] += e["count"]
 
     @staticmethod
     def _format_labels(labels_key: Tuple[Tuple[str, str], ...]) -> str:
         if not labels_key:
             return ""
-        inner = ",".join(f'{k}="{v}"' for k, v in labels_key)
+        # Label values can come from callers (a requested model name): escaped as the
+        # exposition format requires, so a value cannot close the label and add series.
+        inner = ",".join(
+            '{}="{}"'.format(k, str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n"))
+            for k, v in labels_key)
         return "{" + inner + "}"
 
     @staticmethod
@@ -256,6 +298,40 @@ class MetricsCollector:
             self._counters.clear()
             self._gauges.clear()
             self._histograms.clear()
+
+
+def _key_of(raw) -> Tuple[Tuple[str, str], ...]:
+    """A label key back from its JSON form (a list of [name, value] pairs)."""
+    return tuple((str(k), str(v)) for k, v in raw)
+
+
+def merge_snapshots(snapshots) -> dict:
+    """One snapshot that is the sum of several (one per worker process)."""
+    counters: Dict[str, Dict[Tuple, float]] = defaultdict(lambda: defaultdict(float))
+    gauges: Dict[str, Dict[Tuple, float]] = defaultdict(lambda: defaultdict(float))
+    histograms: Dict[str, Dict[Tuple, dict]] = defaultdict(dict)
+    help_text: Dict[str, str] = {}
+    for snap in snapshots:
+        help_text.update(snap.get("help", {}))
+        for target, part in ((counters, "counters"), (gauges, "gauges")):
+            for name, series in snap.get(part, {}).items():
+                for k, v in series:
+                    target[name][_key_of(k)] += v
+        for name, series in snap.get("histograms", {}).items():
+            for k, e in series:
+                entry = histograms[name].setdefault(_key_of(k), {"buckets": {}, "sum": 0.0, "count": 0})
+                for bound, count in e["buckets"]:
+                    entry["buckets"][bound] = entry["buckets"].get(bound, 0) + count
+                entry["sum"] += e["sum"]
+                entry["count"] += e["count"]
+    return {
+        "counters": {n: [[list(k), v] for k, v in s.items()] for n, s in counters.items()},
+        "gauges": {n: [[list(k), v] for k, v in s.items()] for n, s in gauges.items()},
+        "histograms": {n: [[list(k), {"buckets": [[b, c] for b, c in e["buckets"].items()],
+                                      "sum": e["sum"], "count": e["count"]}] for k, e in s.items()]
+                       for n, s in histograms.items()},
+        "help": help_text,
+    }
 
 
 # ------------------------------------------------------------------

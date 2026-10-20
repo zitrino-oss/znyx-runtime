@@ -37,6 +37,7 @@ from urllib.parse import quote, urlsplit
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.net_guard import assert_safe_egress_url
+from znyx_core.secret_refs import maybe_resolve
 
 PostFn = Callable[[str, Dict[str, Any], Dict[str, str], float], Dict[str, Any]]
 
@@ -145,9 +146,10 @@ class AwsBedrockGuardrailsAdapter:
         source = str(config.get("source") or "INPUT").upper()
         payload = {"source": source, "content": [{"text": {"text": text}}]}
 
-        access_key = config.get("access_key_id") or config.get("auth_value") or ""
-        secret_key = config.get("secret_access_key") or ""
-        session_token = config.get("session_token")
+        access_key = maybe_resolve(config.get("access_key_id") or config.get("auth_value") or "",
+                                   what="bedrock access_key_id")
+        secret_key = maybe_resolve(config.get("secret_access_key") or "", what="bedrock secret_access_key")
+        session_token = maybe_resolve(config.get("session_token"), what="bedrock session_token")
         headers = sigv4_headers(
             "POST", url, _body_bytes(payload),
             access_key=access_key, secret_key=secret_key, region=region,

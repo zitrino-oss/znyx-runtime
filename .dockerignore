@@ -5,32 +5,32 @@
 .gitignore
 .github
 
-# Local secrets / env
-.env
-.env.*
-!.env.example
-*.pem
-*.key
+# Local secrets / env (at any depth: a pattern without **/ matches the context root only)
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
 
 # Python caches / build artifacts
-__pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
-.tox/
-.venv/
-venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.eggs/
+**/build/
+**/dist/
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.tox/
+**/.venv/
+**/venv/
 
 # Local model weights — must be mounted at runtime, never baked into the image
-models/
-*.onnx
-*.safetensors
-*.bin
+**/models/
+**/*.onnx
+**/*.safetensors
+**/*.bin
 
 # Editor / OS cruft
 .idea/

@@ -6,7 +6,7 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 
 from znyx_core.core.models import (
     EvaluationRequest, EvaluationResponse, HealthResponse, ToolEvaluationRequest,
@@ -67,6 +67,60 @@ async def _optional_runtime_auth(
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
 
+async def _caller_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Who is calling an evaluate route: an app or agent gateway key (its scope is
+    then authoritative, see ``_apply_key_scope``), else the instance key or, with
+    auth off outside production, anyone (``None``: the body names the scope, as
+    before)."""
+    token = x_api_key
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+    gateway = getattr(request.app.state, "gateway", None)
+    if token and gateway is not None:
+        from znyx_runtime.gateway.config import key_digest
+        key = gateway.config.keys_by_digest.get(key_digest(token))
+        if key is not None:
+            if key.disabled:
+                raise HTTPException(status_code=401, detail="Invalid authentication token")
+            return key
+    await _optional_runtime_auth(x_api_key=x_api_key, authorization=authorization)
+    return None
+
+
+def _apply_key_scope(body, key):
+    """Validate the body against the key: an app or agent key evaluates only for its
+    own tenant, app and agent. A body naming another scope is refused rather than
+    silently rewritten (it would otherwise pick that scope's, possibly weaker,
+    policy); a body that leaves them at the defaults gets the key's."""
+    if key is None or key.instance_key:
+        return body
+    updates = {}
+    for field, value in (("tenant_id", key.tenant_id), ("app_id", key.app_id),
+                         ("agent_id", key.agent_id)):
+        current = getattr(body, field, None)
+        if current not in (None, "", "default", value):
+            raise HTTPException(status_code=403,
+                                detail=f"This key is scoped to {field[:-3]} {value!r}; the request "
+                                       f"names {current!r}")
+        updates[field] = value
+    if hasattr(body, "env"):
+        # The environment the gateway uses for this key: a scoped key does not get to
+        # pick another environment's (possibly weaker) policy.
+        try:
+            effective = _get_bundle_manager().effective_env
+        except Exception:  # noqa: BLE001 - no bundle manager: the key's own setting
+            effective = None
+        updates["env"] = effective or key.environment or "prod"
+    return body.model_copy(update=updates)
+
+
+from znyx_runtime.bundle_manager import ScopeNotServed  # noqa: E402
+
+
 def _get_evaluator():
     from znyx_runtime.main import evaluator
     return evaluator
@@ -105,6 +159,9 @@ verify_runtime_auth = _optional_runtime_auth
 get_evaluator = _get_evaluator
 get_bundle_manager = _get_bundle_manager
 get_heartbeat = _get_heartbeat
+runtime_judge_ctx = _runtime_judge_ctx
+caller_key = _caller_key
+apply_key_scope = _apply_key_scope
 
 
 # OpenAPI metadata (tags / operation_id / summary) on the evaluate routes.
@@ -121,23 +178,16 @@ get_heartbeat = _get_heartbeat
 @router.post(
     "/v1/evaluate/input",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateInput",
     summary="Evaluate user input before calling the LLM",
 )
-async def evaluate_input(request: EvaluationRequest) -> EvaluationResponse:
+async def evaluate_input(request: EvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate input text before sending to LLM."""
+    request = _apply_key_scope(request, key)
     try:
         bm = _get_bundle_manager()
-        if bm.effective_env:
-            request = request.model_copy(update={"env": bm.effective_env})
-        policy = bm.get_policy(
-            tenant_id=request.tenant_id,
-            app_id=request.app_id,
-            agent_id=request.agent_id,
-            env=request.env,
-        )
+        request, policy = bm.resolve(request, key)
         ev = _get_evaluator()
         result = await ev.evaluate(request, context="input", policy=policy,
                                    judge_ctx=_runtime_judge_ctx(policy, request))
@@ -148,6 +198,8 @@ async def evaluate_input(request: EvaluationRequest) -> EvaluationResponse:
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         logger.error(f"Policy unavailable: {e}")
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
@@ -159,23 +211,16 @@ async def evaluate_input(request: EvaluationRequest) -> EvaluationResponse:
 @router.post(
     "/v1/evaluate/output",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateOutput",
     summary="Evaluate an LLM response before returning it to the user",
 )
-async def evaluate_output(request: EvaluationRequest) -> EvaluationResponse:
+async def evaluate_output(request: EvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate output text from LLM before returning to user."""
+    request = _apply_key_scope(request, key)
     try:
         bm = _get_bundle_manager()
-        if bm.effective_env:
-            request = request.model_copy(update={"env": bm.effective_env})
-        policy = bm.get_policy(
-            tenant_id=request.tenant_id,
-            app_id=request.app_id,
-            agent_id=request.agent_id,
-            env=request.env,
-        )
+        request, policy = bm.resolve(request, key)
         ev = _get_evaluator()
         result = await ev.evaluate(request, context="output", policy=policy,
                                    judge_ctx=_runtime_judge_ctx(policy, request))
@@ -186,6 +231,8 @@ async def evaluate_output(request: EvaluationRequest) -> EvaluationResponse:
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         logger.error(f"Policy unavailable: {e}")
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
@@ -197,23 +244,16 @@ async def evaluate_output(request: EvaluationRequest) -> EvaluationResponse:
 @router.post(
     "/v1/evaluate/tool",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateTool",
     summary="Evaluate a tool / function invocation",
 )
-async def evaluate_tool(request: ToolEvaluationRequest) -> EvaluationResponse:
+async def evaluate_tool(request: ToolEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate tool invocation against governance policies."""
+    request = _apply_key_scope(request, key)
     try:
         bm = _get_bundle_manager()
-        if bm.effective_env:
-            request = request.model_copy(update={"env": bm.effective_env})
-        policy = bm.get_policy(
-            tenant_id=request.tenant_id,
-            app_id=request.app_id,
-            agent_id=request.agent_id,
-            env=request.env,
-        )
+        request, policy = bm.resolve(request, key)
         ev = _get_evaluator()
         result = await ev.evaluate_tool(request, policy=policy,
                                         judge_ctx=_runtime_judge_ctx(policy, request))
@@ -224,6 +264,8 @@ async def evaluate_tool(request: ToolEvaluationRequest) -> EvaluationResponse:
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         logger.error(f"Policy unavailable: {e}")
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
@@ -234,18 +276,11 @@ async def evaluate_tool(request: ToolEvaluationRequest) -> EvaluationResponse:
 
 # ── New-stage evaluate endpoints (generalized stage dispatch) ──────
 
-async def _evaluate_stage_runtime(scoped, stage: str) -> EvaluationResponse:
+async def _evaluate_stage_runtime(scoped, stage: str, key=None) -> EvaluationResponse:
     """Shared runtime handler for the per-stage endpoints: resolve the bundle
     policy for the request scope and dispatch through the generalized stage pipeline."""
     bm = _get_bundle_manager()
-    if bm.effective_env:
-        scoped = scoped.model_copy(update={"env": bm.effective_env})
-    policy = bm.get_policy(
-        tenant_id=scoped.tenant_id,
-        app_id=scoped.app_id,
-        agent_id=scoped.agent_id,
-        env=scoped.env,
-    )
+    scoped, policy = bm.resolve(scoped, key)
     ev = _get_evaluator()
     result = await ev.evaluate_stage(scoped, stage, policy=policy,
                                      judge_ctx=_runtime_judge_ctx(policy, scoped))
@@ -258,18 +293,20 @@ async def _evaluate_stage_runtime(scoped, stage: str) -> EvaluationResponse:
 @router.post(
     "/v1/evaluate/retrieval",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateRetrieval",
     summary="Evaluate retrieved RAG chunks for indirect prompt injection (LLM01)",
 )
-async def evaluate_retrieval(request: RetrievalEvaluationRequest) -> EvaluationResponse:
+async def evaluate_retrieval(request: RetrievalEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate retrieved RAG chunks for indirect prompt injection before they enter context (LLM01)."""
+    request = _apply_key_scope(request, key)
     try:
-        return await _evaluate_stage_runtime(request, "retrieval")
+        return await _evaluate_stage_runtime(request, "retrieval", key)
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -280,18 +317,20 @@ async def evaluate_retrieval(request: RetrievalEvaluationRequest) -> EvaluationR
 @router.post(
     "/v1/evaluate/agent-plan",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateAgentPlan",
     summary="Evaluate a proposed agent plan for excessive agency (LLM03)",
 )
-async def evaluate_agent_plan(request: AgentPlanEvaluationRequest) -> EvaluationResponse:
+async def evaluate_agent_plan(request: AgentPlanEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate a proposed multi-step agent plan for excessive agency (LLM03)."""
+    request = _apply_key_scope(request, key)
     try:
-        return await _evaluate_stage_runtime(request, "agent_plan")
+        return await _evaluate_stage_runtime(request, "agent_plan", key)
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -302,18 +341,20 @@ async def evaluate_agent_plan(request: AgentPlanEvaluationRequest) -> Evaluation
 @router.post(
     "/v1/evaluate/agent-step",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateAgentStep",
     summary="Evaluate a single agent-loop iteration for budget/depth caps (LLM06)",
 )
-async def evaluate_agent_step(request: AgentStepEvaluationRequest) -> EvaluationResponse:
+async def evaluate_agent_step(request: AgentStepEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate a single agent-loop iteration for budget/depth caps (LLM06)."""
+    request = _apply_key_scope(request, key)
     try:
-        return await _evaluate_stage_runtime(request, "agent_loop")
+        return await _evaluate_stage_runtime(request, "agent_loop", key)
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -324,18 +365,20 @@ async def evaluate_agent_step(request: AgentStepEvaluationRequest) -> Evaluation
 @router.post(
     "/v1/evaluate/memory-write",
     response_model=EvaluationResponse,
-    dependencies=[Depends(_optional_runtime_auth)],
     tags=["Runtime API"],
     operation_id="runtime.evaluateMemoryWrite",
     summary="Evaluate text written to agent memory for persistent injection (LLM01)",
 )
-async def evaluate_memory_write(request: MemoryWriteEvaluationRequest) -> EvaluationResponse:
+async def evaluate_memory_write(request: MemoryWriteEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate text being written to agent memory for persistent injection (LLM01)."""
+    request = _apply_key_scope(request, key)
     try:
-        return await _evaluate_stage_runtime(request, "memory_write")
+        return await _evaluate_stage_runtime(request, "memory_write", key)
     except EvaluatorOverloadedError:
         raise HTTPException(status_code=503, detail="Evaluator saturated, retry shortly",
                             headers={"Retry-After": "1"})
+    except ScopeNotServed as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Policy unavailable (fail-closed)")
     except Exception:
@@ -375,9 +418,18 @@ async def sdk_clients():
 
 
 @router.get("/v1/bundle/status")
-async def bundle_status():
-    """Return metadata about the currently loaded policy bundle."""
+async def bundle_status(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Return metadata about the currently loaded policy bundles. Readiness is public
+    (health checks); which projects and environments the runtime serves, and their
+    bundle ids, only for the instance's own key (or with auth off)."""
     bm = _get_bundle_manager()
+    try:
+        await _optional_runtime_auth(x_api_key=x_api_key, authorization=authorization)
+    except HTTPException:
+        return {"ready": bm.is_ready, "environments": len(bm.members) if bm.members else None}
     return {
         "ready": bm.is_ready,
         **bm.bundle_info,

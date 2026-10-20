@@ -332,12 +332,14 @@ class ComplianceDetector:
 
         # Determine decision and handle APPEND action
         sanitized_text = None
+        text_edits = None
         if self.action == "APPEND" and disclaimers_to_append:
             # Append disclaimers to the output
             combined_disclaimer = "\n\n---\n" + "\n\n".join(
                 f"**Disclaimer:** {d}" for d in disclaimers_to_append
             )
             sanitized_text = text + combined_disclaimer
+            text_edits = [(len(text), len(text), combined_disclaimer)]
             decision = Decision.TRANSFORM
         elif self.action == "BLOCK":
             decision = Decision.BLOCK
@@ -349,6 +351,7 @@ class ComplianceDetector:
             risk_score=risk_score,
             rule_hits=rule_hits,
             sanitized_text=sanitized_text,
+            text_edits=text_edits,
             user_message="The response requires compliance review." if decision == Decision.BLOCK else None,
             developer_message=f"compliance: {len(rule_hits)} compliance issues ({self.industry} industry)",
         )

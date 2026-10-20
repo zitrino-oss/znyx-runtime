@@ -1,12 +1,13 @@
 import re
 import base64
+import hashlib
+import json
 import logging
-import threading
-import time
-from collections import OrderedDict
 from typing import List, Dict, Any, Optional
 from znyx_core.core.models import DetectorResult, RuleHit, Severity, Decision
+from znyx_core.core import regex_prefilter as _prefilter
 from znyx_core.core.risk import calculate_risk_score
+from znyx_core.state_store import StateUnavailable, get_state_store, json_item
 
 logger = logging.getLogger(__name__)
 
@@ -948,15 +949,11 @@ class JailbreakDetector:
                 except re.error:
                     pass
 
-        # Conversation history tracking with LRU eviction via OrderedDict.
-        # Keys are moved to the end on access so oldest-accessed entries are evicted first.
-        self.conversation_history: OrderedDict[str, List[DetectorResult]] = OrderedDict()
-        self._conversation_timestamps: Dict[str, float] = {}
-        self._max_conversations = 10000  # Limit total tracked conversations
-        self._conversation_ttl = 3600  # Evict conversations older than 1 hour
-        # Guards the two history dicts only; pattern matching runs outside it
-        # so concurrent detect() calls are not re-serialized.
-        self._history_lock = threading.Lock()
+        # Multi-turn history lives in the shared state store (znyx_core.state_store), so
+        # turns of one conversation served by different replicas are combined. Only a
+        # compact per-turn summary is stored (risk score + rule ids), never raw text.
+        self._max_history_turns = 10     # turns kept per conversation
+        self._conversation_ttl = 3600    # forget a conversation idle for 1 hour
 
         # Pre-compiled patterns for encoded content detection
         self._base64_re = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
@@ -1182,10 +1179,13 @@ class JailbreakDetector:
                 # Also check decoded content
                 texts_to_check.extend(decoded_texts)
 
-        # Check each pattern against all texts (original + decoded)
+        # Check each pattern against all texts (original + decoded). A pattern whose
+        # required word is absent from the text is skipped without scanning it
+        # (core/regex_prefilter: provably the same result, a fraction of the time).
         for text_to_check in texts_to_check:
+            prepared = _prefilter.Text(text_to_check)
             for pattern, severity, message in self.compiled_patterns:
-                if pattern.search(text_to_check):
+                if _prefilter.search(pattern, prepared):
                     # Avoid duplicate rule hits
                     rule_id = f"jailbreak.{message.lower().replace(' ', '_')[:30]}"
                     if not any(hit.rule_id == rule_id for hit in rule_hits):
@@ -1255,9 +1255,12 @@ class JailbreakDetector:
             # Calculate risk score
             risk_score = self._calculate_risk_score(rule_hits)
 
-            # CRITICAL: Track conversation history for escalation
-            if self.track_conversation and conversation_id:
-                risk_score = self._apply_conversation_history(history_key, risk_score)
+            # CRITICAL: Track conversation history for escalation. This turn is
+            # recorded (once) with its pre-escalation score; escalation only ever
+            # raises a positive score, so "has jailbreak signal" is unchanged.
+            if self.track_conversation and history_key:
+                history = self._record_turn(history_key, risk_score, rule_hits)
+                risk_score = self._apply_conversation_history(history, risk_score)
 
             # Block if above threshold
             if risk_score >= self.threshold:
@@ -1277,9 +1280,9 @@ class JailbreakDetector:
                     developer_message=f"Potential jailbreak patterns detected: {len(rule_hits)} match(es)"
                 )
 
-        # Track in conversation history if enabled
-        if self.track_conversation and conversation_id:
-            self._update_conversation_history(history_key, result)
+        # A clean turn is part of the conversation too (hits were recorded above).
+        if not rule_hits and self.track_conversation and history_key:
+            self._record_turn(history_key, 0, [])
 
         return result
 
@@ -1291,36 +1294,56 @@ class JailbreakDetector:
     @staticmethod
     def _history_key(conversation_id: Optional[str], tenant_id: Optional[str],
                      app_id: Optional[str]) -> Optional[str]:
-        """Tenant/app-scoped conversation-history key. None when there is no
-        conversation id - an untracked turn must never create a shared pseudo-key."""
+        """Shared-store key for a tenant/app-scoped conversation. None when there is
+        no conversation id - an untracked turn must never create a shared pseudo-key.
+
+        The scope is hashed (JSON-encoded so ``a:b`` + ``c`` can never collide with
+        ``a`` + ``b:c``): a client-chosen conversation id never becomes a raw,
+        unbounded-length key, and two tenants reusing an id never share state."""
         if not conversation_id:
             return None
-        return f"{tenant_id or ''}:{app_id or ''}:{conversation_id}"
+        scope = json_item([tenant_id or "", app_id or "", conversation_id])
+        return "jailbreak:history:" + hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32]
 
-    def _apply_conversation_history(self, conversation_key: str, current_risk_score: int) -> int:
+    def _record_turn(self, history_key: str, risk_score: int, rule_hits: List[RuleHit]) -> List[Dict[str, Any]]:
+        """Append this turn's compact summary to the shared history and return the
+        PRIOR turns (oldest first, this turn excluded) for escalation.
+
+        Only the score and rule ids are stored, never the text. If the shared store
+        is unavailable (fail-closed mode) the turn is detected without history: the
+        detector's own matching still runs, only the multi-turn boost is lost."""
+        item = json_item({"r": int(risk_score), "rules": [h.rule_id for h in rule_hits]})
+        try:
+            raw = get_state_store().push_capped(
+                history_key, item, max_len=self._max_history_turns,
+                ttl_seconds=self._conversation_ttl)
+        except StateUnavailable as exc:
+            logger.warning("Jailbreak conversation history unavailable: %s", exc)
+            return []
+        turns: List[Dict[str, Any]] = []
+        for entry in raw[:-1]:
+            try:
+                turns.append(json.loads(entry))
+            except (TypeError, ValueError):
+                continue  # a corrupt entry must not abort detection
+        return turns
+
+    def _apply_conversation_history(self, history: List[Dict[str, Any]], current_risk_score: int) -> int:
         """
         Apply conversation history to escalate risk score for repeated attempts.
 
         Args:
-            conversation_key: Scoped conversation-history key (see _history_key)
+            history: Prior turn summaries, oldest first (see _record_turn)
             current_risk_score: Current calculated risk score
 
         Returns:
             Adjusted risk score based on history
         """
-        with self._history_lock:
-            if conversation_key not in self.conversation_history:
-                return current_risk_score
-
-            # LRU touch: move to end on access
-            self.conversation_history.move_to_end(conversation_key)
-            history = self.conversation_history[conversation_key]
-
-            # Count prior attempts that had actual jailbreak signal (risk_score > 0).
-            # These are used to escalate the score of new messages that ALSO have
-            # jailbreak signal - repeated attackers should be treated more harshly.
-            recent_attempts = history[-5:]
-            suspicious_attempts = sum(1 for result in recent_attempts if result.risk_score > 0)
+        # Count prior attempts that had actual jailbreak signal (risk_score > 0).
+        # These are used to escalate the score of new messages that ALSO have
+        # jailbreak signal - repeated attackers should be treated more harshly.
+        recent_attempts = history[-5:]
+        suspicious_attempts = sum(1 for turn in recent_attempts if _turn_risk(turn) > 0)
 
         # Only escalate if the current message already carries some jailbreak risk.
         # Applying the boost to a zero-score message (i.e. a completely clean query
@@ -1334,43 +1357,10 @@ class JailbreakDetector:
 
         return current_risk_score
 
-    def _update_conversation_history(self, conversation_key: str, result: DetectorResult) -> None:
-        """
-        Update conversation history with current detection result.
-        Uses LRU eviction: oldest-accessed conversations are evicted first
-        when the cache exceeds _max_conversations.
 
-        Args:
-            conversation_key: Scoped conversation-history key (see _history_key)
-            result: Detection result to store
-        """
-        now = time.time()
-
-        with self._history_lock:
-            # Evict stale entries (TTL-based) then LRU if still over limit
-            if len(self.conversation_history) >= self._max_conversations:
-                # First pass: remove entries older than TTL
-                stale = [
-                    cid for cid, ts in self._conversation_timestamps.items()
-                    if now - ts > self._conversation_ttl
-                ]
-                for cid in stale:
-                    self.conversation_history.pop(cid, None)
-                    self._conversation_timestamps.pop(cid, None)
-
-                # Second pass: if still at capacity, evict oldest-accessed (front of OrderedDict)
-                while len(self.conversation_history) >= self._max_conversations:
-                    evicted_cid, _ = self.conversation_history.popitem(last=False)
-                    self._conversation_timestamps.pop(evicted_cid, None)
-
-            if conversation_key not in self.conversation_history:
-                self.conversation_history[conversation_key] = []
-
-            # Store result and mark as most-recently-used
-            self.conversation_history[conversation_key].append(result)
-            self.conversation_history.move_to_end(conversation_key)
-            self._conversation_timestamps[conversation_key] = now
-
-            # Keep only last 10 messages per conversation to avoid memory bloat
-            if len(self.conversation_history[conversation_key]) > 10:
-                self.conversation_history[conversation_key] = self.conversation_history[conversation_key][-10:]
+def _turn_risk(turn: Any) -> int:
+    """The stored risk score of one history turn (0 for anything malformed)."""
+    try:
+        return int(turn.get("r", 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0

@@ -125,7 +125,13 @@ class Heartbeat:
             await self._send_ping()
 
     async def _send_ping(self, event_type: str = "heartbeat", run_count: int = 0) -> None:
-        """Send a single heartbeat ping. Fire-and-forget."""
+        """Send a single heartbeat ping. Fire-and-forget. Every path (including the
+        first-run ping) comes through here, so the opt-in and the air-gapped switch are
+        enforced once, in one place."""
+        from znyx_core.utils.env import is_airgapped
+
+        if not self.enabled or is_airgapped():
+            return
         endpoint = heartbeat_endpoint()
         if not endpoint:
             # No destination configured. Nothing to do -- see the module docstring:
@@ -140,7 +146,7 @@ class Heartbeat:
             payload = _build_payload(
                 install_id=self.install_id,
                 mode=self.mode,
-                eval_count=self.eval_count,
+                eval_count=_instance_eval_count(self.eval_count),
                 run_count=run_count or get_run_count(),
                 event_type=event_type,
             )
@@ -162,3 +168,14 @@ class Heartbeat:
     async def send_first_run_ping(self, run_count: int = 1) -> None:
         """Send a one-shot first_run ping (fired once, on an install's first startup)."""
         await self._send_ping(event_type="first_run", run_count=run_count)
+
+
+def _instance_eval_count(local: int) -> int:
+    """Evaluations across every worker of the instance (only worker 0 sends the ping)."""
+    try:
+        from znyx_runtime.workers import instance_evaluations
+        total = instance_evaluations()
+    except Exception:  # noqa: BLE001 - telemetry must never fail
+        total = None
+    return total if total is not None else local
+

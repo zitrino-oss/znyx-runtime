@@ -1,0 +1,59 @@
+Znyx {{ .Chart.AppVersion }} is installed as "{{ include "znyx.fullname" . }}" in namespace {{ .Release.Namespace }}.
+
+  mode        {{ include "znyx.mode" . }}{{ if eq (include "znyx.mode" .) "managed" }} (signed policy bundles from {{ dig "control_plane" "url" "" .Values.config }}){{ else }} ({{ if .Values.policy }}policy from values{{ else }}the image's built-in starter policy; set `policy` to use your own{{ end }}){{ end }}
+  image       {{ include "znyx.image" . }}
+  replicas    {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }} to {{ .Values.autoscaling.maxReplicas }} (autoscaled){{ else }}{{ .Values.replicaCount }}{{ end }}
+  ML          {{ if .Values.ml.enabled }}on, the model server runs inside each pod on loopback (no sidecar, no extra Service){{ else }}off (rules only){{ end }}
+  air-gapped  {{ if .Values.airgapped }}yes: no outbound calls, NetworkPolicy enforced{{ else }}no{{ end }}
+
+1. Wait for the pods to become ready (a pod is ready once a policy is loaded):
+
+     kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "znyx.fullname" . }}
+
+2. Read the API key{{ if .Values.existingSecret }} (from your Secret "{{ .Values.existingSecret }}"){{ else if .Values.secrets.apiKey }} (the one you set in secrets.apiKey){{ else }} (generated on first install and kept across upgrades){{ end }}:
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "znyx.secretName" . }} -o jsonpath='{.data.RUNTIME_API_KEY}' | base64 -d; echo
+
+3. Try it from your machine:
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "znyx.fullname" . }} 8080:{{ .Values.service.port }}
+     curl -s localhost:8080/healthz
+     open http://localhost:8080/dashboard{{ if not (dig "dashboard" "enabled" true .Values.config) }}   (the dashboard is disabled in config.dashboard.enabled){{ end }}
+
+   In-cluster address for your apps and SDKs:
+     http://{{ include "znyx.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local{{ if ne (int .Values.service.port) 80 }}:{{ .Values.service.port }}{{ end }}
+
+4. Run the chart's smoke test:  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- if and (gt (include "znyx.minReplicas" . | int) 1) (not (include "znyx.redisConfigured" .)) }}
+
+WARNING: {{ include "znyx.minReplicas" . }} replicas and no Redis configured. Each replica enforces its own
+rate limits and budgets, so the effective limit is {{ include "znyx.minReplicas" . }} times what you set. Set
+secrets.redisUrl (or existingSecret with ZNYX_REDIS_URL and state.redis.enabled=true) to share them.
+{{- end }}
+{{- if and .Values.persistence.enabled (gt (include "znyx.minReplicas" . | int) 1) (has "ReadWriteOnce" .Values.persistence.accessModes) }}
+
+WARNING: persistence uses a ReadWriteOnce claim with more than one replica. Pods on other nodes
+will not start. Use a ReadWriteMany claim, one replica, or turn persistence off.
+{{- end }}
+{{- if and (eq (include "znyx.mode" .) "local") (not .Values.policy) }}
+
+NOTE: no policy was given, so the image's built-in starter policy is in force. Install your own with
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set-file policy=./policies.yaml
+{{- end }}
+{{- if .Values.airgapped }}
+
+AIR-GAPPED: the NetworkPolicy allows DNS, networkPolicy.egressTo on the ports in networkPolicy.egressPorts, and
+networkPolicy.extraEgress, and nothing else. Add your in-cluster control plane and Redis there. The ML model
+server is inside the pod on loopback, so it needs no egress.{{ if and .Values.ml.enabled (not .Values.ml.models.existingClaim) }}
+Models are not downloaded when air-gapped: set ml.models.existingClaim to a volume holding pre-fetched weights.{{ end }}
+{{- end }}
+{{- if and (not .Values.airgapped) (not .Values.networkPolicy.enabled) }}
+
+TIP: set networkPolicy.enabled=true to restrict ingress to {{ if .Values.networkPolicy.ingressFrom }}the configured peers{{ else }}the release namespace{{ end }} and egress to DNS plus HTTPS.
+{{- end }}
+{{- if not .Values.existingSecret }}
+
+Secret changes do not roll the pods by themselves: run
+  kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "znyx.fullname" . }}
+after changing the key, token or Redis URL.
+{{- end }}

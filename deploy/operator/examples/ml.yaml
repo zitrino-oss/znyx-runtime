@@ -1,0 +1,16 @@
+# The ML image with weights on a pre-created claim, and an API key from your own Secret.
+# kubectl create secret generic znyx-ml-keys --from-literal=RUNTIME_API_KEY="$(openssl rand -hex 24)"
+apiVersion: znyx.ai/v1alpha1
+kind: ZnyxInstance
+metadata:
+  name: znyx-ml
+spec:
+  version: "1.0.0"
+  replicas: 2
+  ml:
+    enabled: true
+    modelsClaim: znyx-models
+  secretRef: znyx-ml-keys
+  policy: |
+    version: 1
+    # your policies.yaml here

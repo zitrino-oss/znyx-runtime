@@ -1,0 +1,11 @@
+# Two replicas of the rules-only image, with a generated API key in znyx-basic-secrets.
+# Read it with: kubectl get secret znyx-basic-secrets -o jsonpath='{.data.RUNTIME_API_KEY}' | base64 -d
+apiVersion: znyx.ai/v1alpha1
+kind: ZnyxInstance
+metadata:
+  name: znyx-basic
+spec:
+  version: "1.0.0"
+  replicas: 2
+  config:
+    log_level: info

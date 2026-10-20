@@ -37,3 +37,15 @@ def is_production() -> bool:
         if value in _NONPROD:
             return False
     return True
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def is_airgapped() -> bool:
+    """True when the install is air-gapped (``ZNYX_AIRGAPPED``): no call may leave the
+    deployment. The egress gate then skips every boundary-crossing backend (as the
+    per-policy ``runtime_policy.no_external_calls`` does), the install heartbeat stays
+    off and model downloads are refused; weights must already be on disk."""
+    return (os.getenv("ZNYX_AIRGAPPED") or "").strip().lower() in _TRUTHY
+

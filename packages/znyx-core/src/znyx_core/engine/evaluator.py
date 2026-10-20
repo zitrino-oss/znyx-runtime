@@ -39,6 +39,11 @@ class _DetectorDeadlineExceeded(Exception):
     """Internal sentinel: the detector pipeline missed its per-request deadline."""
 
 
+# Public name for callers of GuardrailsEvaluator.run_bounded (e.g. the streaming
+# route), which must fail closed when a unit of detector work misses the deadline.
+DetectorDeadlineExceeded = _DetectorDeadlineExceeded
+
+
 def _retrieve_late_result(fut) -> None:
     """Consume the result of a timed-out (zombie) detector future so the event
     loop never logs an unretrieved exception."""
@@ -105,19 +110,44 @@ class GuardrailsEvaluator:
         )
         self._remediation = RemediationHandler()
 
+    @property
+    def orchestrator(self) -> DetectorOrchestrator:
+        """The configured detector pipeline (egress audit sink, custom plugins).
+        Streaming evaluation reuses it so a stream is policed by the same
+        pipeline as a single request."""
+        return self._orchestrator
+
+    @property
+    def remediation(self) -> RemediationHandler:
+        """The on_fail remediation handler, shared with streaming evaluation."""
+        return self._remediation
+
+    async def _apply_remediation(self, response, policy, results, request):
+        """on_fail remediation. ask_human makes a durable, fsync'd spool write, so a
+        non-ALLOW decision is remediated off the event loop. ALLOW returns at once
+        (the handler is a no-op for it)."""
+        if response.decision == Decision.ALLOW:
+            return response
+        return await asyncio.to_thread(self._remediation.apply, response, policy, results, request)
+
     async def _run_detectors(self, *args, **kwargs):
         """Run the synchronous orchestrator off the event loop on the shared
+        detector pool (see run_bounded)."""
+        return await self.run_bounded(self._orchestrator.run_detectors, *args, **kwargs)
+
+    async def run_bounded(self, fn: Callable, /, *args, **kwargs):
+        """Run synchronous detector work off the event loop on the shared
         detector pool (see _DETECTOR_EXECUTOR). Admission is bounded: when the
         pool and its queue are saturated this raises EvaluatorOverloadedError
         immediately rather than queueing without bound. When a deadline is
-        configured, a request past it raises _DetectorDeadlineExceeded; the
+        configured, a call past it raises DetectorDeadlineExceeded; the
         future is shielded (never cancelled) so the work item always runs to
         completion and releases its admission permit. In the worker thread
         there is no running loop, so RemoteDetector/judge take their
         asyncio.run path."""
         if not _ADMISSION.acquire(blocking=False):
             raise EvaluatorOverloadedError("detector queue is full")
-        call = functools.partial(self._orchestrator.run_detectors, *args, **kwargs)
+        call = functools.partial(fn, *args, **kwargs)
 
         def _call():
             try:
@@ -252,15 +282,24 @@ class GuardrailsEvaluator:
             scorer = QualityScorer(quality_config, nli_scorer=nli_scorer,
                                    judge_evaluators=judge_evaluators)
             original_input = (request.metadata or {}).get("original_input", "")
-            response.quality = scorer.score(
-                input_text=original_input,
-                output_text=request.text,
-                metadata=request.metadata,
-            )
+            # Scoring can call the NLI sidecar and LLM judges (blocking network
+            # calls), so it runs on the shared detector pool like the detectors do,
+            # never on the event loop. It is informational and never blocks: when
+            # the pool is saturated or the deadline passes, the score is skipped.
+            try:
+                response.quality = await self.run_bounded(
+                    scorer.score,
+                    input_text=original_input,
+                    output_text=request.text,
+                    metadata=request.metadata,
+                )
+            except (EvaluatorOverloadedError, _DetectorDeadlineExceeded) as exc:
+                logger.warning("Quality scoring skipped (%s)", type(exc).__name__)
+                response.quality = None
 
         # Apply on_fail remediation if configured. `request` lets ask_human record
         # org scope + the flagged text on its durable spool (see RemediationHandler.apply).
-        response = self._remediation.apply(response, policy, orch.results, request)
+        response = await self._apply_remediation(response, policy, orch.results, request)
 
         self._log_evaluation(request, response, policy_version)
         self._emit_telemetry(request, response, latency_ms, context)
@@ -299,6 +338,7 @@ class GuardrailsEvaluator:
         policy_version = policy.get('policy_version', 'unknown')
         results = []
         detector_timings = []
+        sanitized_result: Optional[str] = None
 
         tools_config = policy.get('tools', {})
         if tools_config.get('enabled', True):
@@ -331,6 +371,10 @@ class GuardrailsEvaluator:
                                                      start_time, "tool")
             results.extend(orch.results)
             detector_timings = orch.detector_timings
+            # A redacted tool result is returned like any other redacted text, so the
+            # caller can pass on the redacted version instead of the original.
+            if orch.current_text != tool_result_text:
+                sanitized_result = orch.current_text
 
         final_result = DecisionAggregator.aggregate(results)
 
@@ -340,7 +384,7 @@ class GuardrailsEvaluator:
             risk_score=final_result.risk_score,
             policy_version=policy_version,
             rule_hits=final_result.rule_hits,
-            sanitized_text=None,
+            sanitized_text=sanitized_result,
             sanitized_tool_args=None,
             user_message=final_result.user_message,
             developer_message=final_result.developer_message
@@ -349,7 +393,7 @@ class GuardrailsEvaluator:
 
         # Apply on_fail remediation (e.g. tool_output_injection.on_fail: ask_human),
         # consistent with the input/output evaluate path.
-        response = self._remediation.apply(response, policy, results, request)
+        response = await self._apply_remediation(response, policy, results, request)
 
         latency_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
         response.latency_ms = latency_ms
@@ -550,6 +594,24 @@ class GuardrailsEvaluator:
         if self.log_redacted_text and response.sanitized_text:
             log_data["sanitized_text"] = response.sanitized_text
         logger.info(json.dumps(log_data))
+
+    def record_stream(self, request, *, decision: Decision, risk_score: int, rule_hits,
+                      latency_ms: int, context: str, policy_version: Optional[str]) -> None:
+        """Record one completed stream as a single evaluation: one telemetry event
+        and one set of metrics, the same shape a non-streaming call produces."""
+        response = EvaluationResponse(
+            request_id=request.request_id,
+            decision=decision,
+            risk_score=max(0, min(100, int(risk_score))),
+            policy_version=policy_version or "",
+            rule_hits=list(rule_hits),
+            latency_ms=latency_ms,
+            trace_id=getattr(request, "trace_id", None),
+            session_id=getattr(request, "session_id", None),
+            span_id=getattr(request, "span_id", None),
+        )
+        self._emit_telemetry(request, response, latency_ms, context=context)
+        self._record_metrics(context, response, latency_ms / 1000.0)
 
     def _emit_telemetry(self, request, response: EvaluationResponse, latency_ms: int, context: str = "input"):
         """Fire telemetry callback if configured."""

@@ -1,14 +1,42 @@
+# The Service and the PodDisruptionBudget for deployment.yaml (the Helm chart's defaults for
+# a release named "znyx"). Apps and SDKs call http://znyx.<namespace>.svc.cluster.local
+# (port 80, forwarding to the container's 8080).
 apiVersion: v1
 kind: Service
 metadata:
-  name: znyx-runtime
+  name: znyx
   labels:
-    app: znyx-runtime
+    app.kubernetes.io/name: znyx
+    app.kubernetes.io/instance: znyx
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/managed-by: Helm
 spec:
+  type: ClusterIP
   selector:
-    app: znyx-runtime
+    app.kubernetes.io/name: znyx
+    app.kubernetes.io/instance: znyx
   ports:
     - name: http
       port: 80
-      targetPort: 8080
-  type: ClusterIP
+      targetPort: http
+      protocol: TCP
+---
+# Keeps at least one pod serving during node drains and upgrades. Delete this if you run a
+# single replica (a budget of 1 on one pod would block a drain).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: znyx
+  labels:
+    app.kubernetes.io/name: znyx
+    app.kubernetes.io/instance: znyx
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/managed-by: Helm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: znyx
+      app.kubernetes.io/instance: znyx

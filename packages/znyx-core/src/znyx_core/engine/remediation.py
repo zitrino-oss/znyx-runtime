@@ -64,11 +64,9 @@ class AskHumanSpool:
         self._lock = threading.Lock()
 
     def _append_sync(self, line: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        # Locked append: several worker processes share this spool.
+        from znyx_core.utils.spool import append_lines
+        append_lines(self.path, [line], fsync=True)
 
     def record(self, event: Dict[str, Any]) -> None:
         """Durably append one ask_human event. Best-effort: a write failure is
@@ -180,9 +178,13 @@ class RemediationHandler:
                 response.sanitized_text = result.fixed_text
                 response.decision = Decision.TRANSFORM
             elif action == RemediationAction.FILTER_FIELD and result.filtered_fields:
-                response.sanitized_text = self._filter_fields(
-                    response.sanitized_text or "", result.filtered_fields,
-                )
+                # Filter the text the caller would otherwise receive: the rewritten text
+                # when a detector rewrote it, else the original. Filtering "" here used
+                # to return an empty response whenever no detector had rewritten it.
+                base = response.sanitized_text
+                if base is None:
+                    base = getattr(request, "text", None) or ""
+                response.sanitized_text = self._filter_fields(base, result.filtered_fields)
                 response.decision = Decision.TRANSFORM
             elif action == RemediationAction.REFRAIN:
                 response.sanitized_text = result.refrain_message or _DEFAULT_REFRAIN

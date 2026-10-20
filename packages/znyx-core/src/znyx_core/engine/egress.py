@@ -22,6 +22,8 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from znyx_core.utils.env import is_airgapped
+
 _REMOTE_MODES = {"remote_llm", "remote_api"}
 _LOCAL_MODEL_MODES = {"local_ml", "local_embedding", "local_llm"}
 
@@ -76,6 +78,34 @@ def _host_of(url: Optional[str]) -> Optional[str]:
         return None
 
 
+# Names that only resolve inside a network: a single label ("inference"), the
+# loopback name, and the reserved or conventional internal suffixes.
+_INTERNAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet",
+                      ".corp", ".svc", ".cluster.local")
+
+
+def in_network(host: Optional[str]) -> bool:
+    """Whether ``host`` is inside the deployment's own network: loopback, a private or
+    link-local address, an internal name, or a host the operator lists in
+    ``ZNYX_AIRGAPPED_ALLOW`` (comma-separated; ``.example.corp`` matches subdomains)."""
+    import ipaddress
+    import os
+
+    if not host:
+        return False
+    name = host.strip("[]").rstrip(".").lower()
+    try:
+        ip = ipaddress.ip_address(name)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        pass
+    allowed = [a.strip().lower() for a in (os.getenv("ZNYX_AIRGAPPED_ALLOW") or "").split(",") if a.strip()]
+    for entry in allowed:
+        if name == entry.lstrip("*.") or (entry.startswith((".", "*.")) and name.endswith(entry.lstrip("*"))):
+            return True
+    return name == "localhost" or "." not in name or name.endswith(_INTERNAL_SUFFIXES)
+
+
 def _authority_of(url: Optional[str]) -> Optional[str]:
     """host:port (lowercased, credentials stripped) — so a port-specific allowlist
     entry like ``gw.internal:8443`` can be matched exactly while a bare-host entry
@@ -116,6 +146,15 @@ def evaluate_egress(
 ) -> EgressDecision:
     """Pure gate decision for one backend call (see module docstring for the order)."""
     host = _host_of(endpoint_url)
+    # Air-gapped: decided on where the call actually goes, not on the mode label or a
+    # backend's own in_boundary claim. A model or judge call to a destination outside
+    # the network is refused whatever the policy says (the instance-wide switch cannot
+    # be weakened by a policy); one inside it (a model server on another host in the
+    # cluster) proceeds through the normal gate below.
+    if is_airgapped() and mode in (_REMOTE_MODES | _LOCAL_MODEL_MODES) and not in_network(host):
+        return EgressDecision(is_egress=True, allowed=False, reason="no_external_calls",
+                              host=host, region=region)
+
     if not is_boundary_crossing(mode, in_boundary):
         return EgressDecision(is_egress=False, allowed=True, reason=None, host=host, region=region)
 

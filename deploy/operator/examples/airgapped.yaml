@@ -1,0 +1,18 @@
+# No outbound calls: the operator renders a NetworkPolicy with DNS egress only (no 443),
+# and the pods start with ZNYX_AIRGAPPED=true. Weights come from a pre-loaded claim.
+apiVersion: znyx.ai/v1alpha1
+kind: ZnyxInstance
+metadata:
+  name: znyx-airgapped
+spec:
+  version: "1.0.0"
+  replicas: 2
+  airgapped: true
+  ml:
+    enabled: true
+    modelsClaim: znyx-models
+  networkPolicy:
+    ingressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: apps

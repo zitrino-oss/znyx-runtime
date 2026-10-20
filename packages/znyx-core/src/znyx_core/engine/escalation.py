@@ -208,6 +208,9 @@ def _additive_merge(det: DetectorResult, ml: DetectorResult,
     if spans and text is not None:
         update["sanitized_text"] = apply_redaction_spans(text, spans)
         update["redaction_spans"] = spans
+        # The deterministic layer's exact edits no longer describe this rewrite;
+        # consumers fall back to the spans, which match apply_redaction_spans.
+        update["text_edits"] = None
     return keep.model_copy(update=update)
 
 

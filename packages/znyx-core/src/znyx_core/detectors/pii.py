@@ -1268,6 +1268,7 @@ class PIIDetector:
             rule_hits=rule_hits,
             sanitized_text=self._redact_pii(text, pii_spans),
             redaction_spans=redaction_spans,
+            text_edits=self._redaction_edits(text, pii_spans),
             developer_message=f"PII redacted: {len(rule_hits)} item(s)"
         )
 
@@ -1411,8 +1412,16 @@ class PIIDetector:
         Returns:
             Text with PII redacted
         """
+        from znyx_core.core.text_edits import apply_edits
+        return apply_edits(text, self._redaction_edits(text, spans))
+
+    def _redaction_edits(self, text: str,
+                         spans: List[Tuple[int, int, str, str, str]]) -> List[Tuple[int, int, str]]:
+        """The (start, end, replacement) edits ``_redact_pii`` applies, ascending and
+        disjoint. Reported as ``DetectorResult.text_edits`` so a consumer (streaming)
+        knows exactly which characters each replacement covers."""
         if not spans:
-            return text
+            return []
 
         # Only types whose action is REDACT rewrite the text; BLOCK/WARN types are reported
         # but never replaced. Filter FIRST so they take no part in the overlap resolution
@@ -1420,7 +1429,7 @@ class PIIDetector:
         # leave that PII in the clear, which is worse than the bug being fixed here.
         redactable = [s for s in spans if self._get_type_action(s[4]) == 'REDACT']
         if not redactable:
-            return text
+            return []
 
         # Resolve OVERLAPS before replacing anything. Replacing from the end keeps earlier
         # offsets valid only while the spans are disjoint, and they are not: several patterns
@@ -1446,11 +1455,6 @@ class PIIDetector:
                 kept.append(span)
                 last_end = span[1]
 
-        # `kept` is disjoint and ascending, so replacing from the end leaves every remaining
-        # offset valid.
-        result = text
-        for start, end, pii_type, matched_text, _config_type in reversed(kept):
-            replacement = self._get_redaction_replacement(pii_type, matched_text)
-            result = result[:start] + replacement + result[end:]
-
-        return result
+        # `kept` is disjoint and ascending, so the edits apply in one pass.
+        return [(start, end, self._get_redaction_replacement(pii_type, matched_text))
+                for start, end, pii_type, matched_text, _config_type in kept]

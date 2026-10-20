@@ -1,0 +1,11 @@
+# ML image, models on an existing claim, a mirrored registry.
+ml:
+  enabled: true
+  models:
+    existingClaim: znyx-models
+    readOnly: true
+image:
+  registry: registry.internal.example.com
+  tag: "1.0.0"
+imagePullSecrets:
+  - name: regcred

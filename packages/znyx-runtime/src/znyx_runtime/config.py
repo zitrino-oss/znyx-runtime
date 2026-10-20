@@ -70,6 +70,8 @@ class RuntimeConfig:
     # on the runtime path (judges still run). empty path → ~/.znyx/judge-audit.spool.
     judge_audit_enabled: bool = True
     judge_audit_spool_path: str = ""
+    # Durable telemetry spool, delivered by a shipper (empty → ~/.znyx/telemetry.spool)
+    telemetry_spool_path: str = ""
 
     # Server
     host: str = "0.0.0.0"
@@ -131,6 +133,7 @@ class RuntimeConfig:
             judge_audit_enabled=_env("ZNYX_JUDGE_AUDIT", "GUARDRAILS_JUDGE_AUDIT", "true").lower()
                 not in ("false", "0", "no", "off"),
             judge_audit_spool_path=_env("ZNYX_JUDGE_AUDIT_SPOOL_PATH", "GUARDRAILS_JUDGE_AUDIT_SPOOL_PATH", ""),
+            telemetry_spool_path=_env("ZNYX_TELEMETRY_SPOOL_PATH", "GUARDRAILS_TELEMETRY_SPOOL_PATH", ""),
             host=os.getenv("HOST", "0.0.0.0"),
             port=int(os.getenv("PORT", "8080")),
             allowed_origins=os.getenv("ALLOWED_ORIGINS", ""),

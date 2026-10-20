@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 from znyx_core.core.models import QualityScore
 from znyx_core.engine.egress import prepare_and_audit_egress
 from znyx_core.llm.judge import JudgeRequest, run_judge
+from znyx_core.secret_refs import maybe_resolve
 
 # The ten evaluator categories. Four reuse a deterministic heuristic key (the
 # judge variant overrides it under judge_mode); six are judge-only (net-new).
@@ -215,7 +216,7 @@ def build_judge_evaluators(judge_config: Dict[str, Any], *,
         provider=provider,
         model=judge_config.get("model", ""),
         endpoint_url=effective_endpoint(provider, judge_config.get("endpoint_url")),
-        api_key=judge_config.get("api_key", ""),
+        api_key=maybe_resolve(judge_config.get("api_key", ""), what="judge api_key"),
         mode=judge_config.get("mode", "remote_llm"),
         in_boundary=judge_config.get("in_boundary"),
         # Inherit global privacy controls; the judge block may only tighten (OR for deny).

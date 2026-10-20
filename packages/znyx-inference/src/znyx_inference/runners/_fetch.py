@@ -156,6 +156,18 @@ def _default_downloader(model_id: str, revision: str, dest_dir: str,
         _snapshot_download(model_id, revision, dest_dir)
 
 
+class ModelDownloadDisabled(RuntimeError):
+    """This install is air-gapped (``ZNYX_AIRGAPPED``): weights must already be on disk."""
+
+
+def ensure_downloads_allowed() -> None:
+    from znyx_core.utils.env import is_airgapped
+    if is_airgapped():
+        raise ModelDownloadDisabled(
+            "model downloads are disabled on an air-gapped install: fetch the weights on a "
+            "connected machine (znyx models fetch) and mount them into the artifacts directory")
+
+
 def fetch_model(model_id: str, revision: str, dest_dir: str, *,
                 runner: Optional[str] = None,
                 downloader: Optional[Callable[[str, str, str], None]] = None) -> str:
@@ -167,6 +179,7 @@ def fetch_model(model_id: str, revision: str, dest_dir: str, *,
     signature; when omitted, the runner-aware default is used). Returns the digest computed
     over the resulting tree by the same ``artifact_sha256`` the runner verifies with, so the
     operator pins exactly what will be loaded."""
+    ensure_downloads_allowed()       # the one chokepoint for every download path
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     effective = downloader or (lambda m, r, d: _default_downloader(m, r, d, runner))

@@ -58,6 +58,17 @@ class ToolGovernanceDetector:
             for pattern in self.EXFIL_PATTERNS
         ]
 
+    def _denied_mention(self, text: str) -> Optional[RuleHit]:
+        """A denied tool named as a whole word in free text."""
+        for denied in self.denied_tools:
+            if re.search(r'\b' + re.escape(denied) + r'\b', text, re.IGNORECASE):
+                return RuleHit(
+                    rule_id="tools.denied",
+                    severity=Severity.HIGH,
+                    message=f"Tool '{denied}' is on the deny list"
+                )
+        return None
+
     def _check_allowlist_denylist(self, tool_name: str) -> Optional[RuleHit]:
         """
         Check if tool is in allowlist/denylist.
@@ -76,7 +87,7 @@ class ToolGovernanceDetector:
         # mentioned.
         if re.search(r'\s', tool_name):
             for denied in self.denied_tools:
-                if re.search(r'\b' + re.escape(denied) + r'\b', tool_name):
+                if re.search(r'\b' + re.escape(denied) + r'\b', tool_name, re.IGNORECASE):
                     return RuleHit(
                         rule_id="tools.denied",
                         severity=Severity.HIGH,
@@ -275,13 +286,16 @@ class ToolGovernanceDetector:
 
         return None
 
-    def detect(self, tool_name: str, tool_args: Dict[str, Any]) -> DetectorResult:
+    def detect(self, tool_name: str, tool_args: Dict[str, Any], *,
+               free_text: bool = False) -> DetectorResult:
         """
         Validate tool invocation against governance policies.
 
         Args:
-            tool_name: Name of the tool
+            tool_name: Name of the tool (or, with ``free_text``, a message to scan)
             tool_args: Tool arguments
+            free_text: The text is a message, not an invocation: only a denied tool
+                mentioned by name is a violation; the allowlist does not apply.
 
         Returns:
             DetectorResult with BLOCK if governance violated
@@ -292,7 +306,8 @@ class ToolGovernanceDetector:
         rule_hits: List[RuleHit] = []
 
         # 1. Check allowlist/denylist
-        check = self._check_allowlist_denylist(tool_name)
+        check = (self._denied_mention(tool_name) if free_text
+                 else self._check_allowlist_denylist(tool_name))
         if check:
             rule_hits.append(check)
 

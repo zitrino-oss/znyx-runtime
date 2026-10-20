@@ -1,9 +1,12 @@
 """Unbounded-consumption detector (OWASP LLM06).
 
 Caps runaway resource use: per-session cumulative token and cost budgets, agent-loop
-iteration (depth) caps, and tool-call depth caps. Stateful per (tenant, app, session) —
-mirrors the ``abuse`` detector's in-memory per-tenant state pattern (resets on restart;
-use a shared store for multi-instance deployments).
+iteration (depth) caps, and tool-call depth caps. Stateful per (tenant, app, session):
+the cumulative totals and the loop-state history live in the shared state store
+(``znyx_core.state_store``), so replicas pointed at the same Redis enforce one budget
+between them and a restart does not reset it. With the default in-process store the
+behaviour is the old per-process one. If a ``closed``-mode store is unreachable the
+cumulative checks fail closed (see ``_STATE_UNAVAILABLE_RULE``).
 
 Runs in the ``agent_loop`` stage (per-iteration budget/depth) and in ``input``/``output``
 (cumulative token/cost accounting). Budget signals are read from request metadata:
@@ -41,12 +44,12 @@ the remainder of ``session_window_seconds`` (the window then resets).
 """
 import hashlib
 import math
-import threading
-import time
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
+from znyx_core.state_store import StateUnavailable, get_state_store
+
+_STATE_UNAVAILABLE_RULE = "unbounded_consumption.state_unavailable"
 
 
 def _coerce_nonneg_int(v: Any) -> int:
@@ -102,15 +105,8 @@ class UnboundedConsumptionDetector:
         self.ratio_min_thinking_tokens = self.config.get('ratio_min_thinking_tokens', 4_000)
         # Same agent state seen this many times in the window → the loop is not progressing.
         self.max_repeated_states = self.config.get('max_repeated_states', 3)
-        # Bounded so a long-lived session cannot grow this without limit.
+        # Bound on the loop-state history kept per session (see _record_state).
         self.max_tracked_states = self.config.get('max_tracked_states', 64)
-        # key -> {"tokens": int, "cost": float, "thinking": int,
-        #         "states": OrderedDict[hash, count], "first_ts": float}
-        self._sessions: Dict[str, Dict[str, Any]] = {}
-        self._last_cleanup = time.time()
-        # Guards _sessions read-modify sections; pure metadata coercion and
-        # rule construction stay outside it.
-        self._lock = threading.Lock()
 
     @staticmethod
     def _key(tenant_id: str, app_id: str, session_id: Optional[str],
@@ -124,15 +120,30 @@ class UnboundedConsumptionDetector:
             return f"{tenant_id}:{app_id}:u:{user_id}"
         return None
 
-    def _cleanup(self, now: float) -> None:
-        with self._lock:
-            if now - self._last_cleanup < 300:
-                return
-            stale = [k for k, v in self._sessions.items()
-                     if now - v.get('first_ts', now) > self.session_window_seconds]
-            for k in stale:
-                del self._sessions[k]
-            self._last_cleanup = now
+    def _window_tag(self) -> str:
+        """The configured window, in the store keys, so two differently configured
+        detectors (or a config change) never share counters whose expiry differs."""
+        w = self.session_window_seconds
+        return str(int(w)) if float(w).is_integer() else repr(float(w))
+
+    def _record_state(self, store, key: str, digest: str) -> int:
+        """Record one sighting of ``digest`` for the session and return how many times it
+        appears in that session's recent history.
+
+        The history is the newest ``max_tracked_states`` sightings (store.push_capped),
+        not a table of per-state counters. That is an approximation of the old
+        in-process table: the count is "occurrences within the last N steps" rather than
+        "occurrences since the window opened", and the history's lifetime is refreshed on
+        every step rather than being a fixed window. The bound still never turns into a
+        bypass: an agent spinning on one state fills the history with that state, so its
+        count only grows. Only a state that recurs less often than once per N steps
+        escapes, which is not a tight loop. The cap is never below
+        ``max_repeated_states`` or the rule could not fire."""
+        cap = max(int(self.max_tracked_states), int(self.max_repeated_states), 1)
+        history = store.push_capped(
+            f"budget:uc:states:{self._window_tag()}:{key}", digest, cap,
+            ttl_seconds=self.session_window_seconds)
+        return history.count(digest)
 
     def detect(self, text: str, tenant_id: str = "", app_id: str = "",
                session_id: Optional[str] = None, context: str = "input",
@@ -144,8 +155,6 @@ class UnboundedConsumptionDetector:
         # Guard against a non-dict metadata (list/str/int) reaching .get() — an internal/SDK
         # caller could pass one (the API path is already protected by Pydantic's Optional[Dict]).
         meta = metadata if isinstance(metadata, dict) else {}
-        now = time.time()
-        self._cleanup(now)
 
         rule_hits: List[RuleHit] = []
 
@@ -163,23 +172,26 @@ class UnboundedConsumptionDetector:
         # would let one user's usage block an unrelated user). Instead we check THIS request
         # alone — so a single anonymous runaway is still caught, with no cross-contamination.
         key = self._key(tenant_id, app_id, session_id, user_id)
-        state = None
+        store_down = False
         if key is not None:
-            with self._lock:
-                state = self._sessions.get(key)
-                if state is None or (now - state.get('first_ts', now)) > self.session_window_seconds:
-                    state = {"tokens": 0, "cost": 0.0, "thinking": 0,
-                             "states": OrderedDict(), "first_ts": now}
-                    self._sessions[key] = state
-                state.setdefault('thinking', 0)      # tolerate state from an older process
-                # OrderedDict so the loop-state table can evict its oldest entry when full.
-                if not isinstance(state.get('states'), OrderedDict):
-                    state['states'] = OrderedDict(state.get('states') or {})
-                state['tokens'] += req_tokens
-                state['cost'] += req_cost
-                state['thinking'] += req_thinking
-                total_tokens, total_cost = state['tokens'], state['cost']
-                total_thinking = state['thinking']
+            try:
+                totals = get_state_store().incr(
+                    f"budget:uc:{self._window_tag()}:{key}",
+                    {"tokens": req_tokens, "cost": req_cost, "thinking": req_thinking},
+                    ttl_seconds=self.session_window_seconds)
+                total_tokens = int(totals.get('tokens', 0))
+                total_cost = float(totals.get('cost', 0.0))
+                total_thinking = int(totals.get('thinking', 0))
+            except StateUnavailable as exc:
+                # Cannot tell what the session has used, so treat it as over budget
+                # rather than let an outage switch the budget off.
+                store_down = True
+                total_tokens, total_cost, total_thinking = req_tokens, req_cost, req_thinking
+                rule_hits.append(RuleHit(
+                    rule_id=_STATE_UNAVAILABLE_RULE, severity=Severity.HIGH,
+                    message=("Session budget cannot be verified: the shared state store is "
+                             f"unavailable, treating the session as over budget ({exc})"),
+                ))
         else:
             total_tokens, total_cost = req_tokens, req_cost
             total_thinking = req_thinking
@@ -261,26 +273,17 @@ class UnboundedConsumptionDetector:
             raw_state = raw_state.strip()
             if raw_state:
                 digest = hashlib.sha256(raw_state.encode('utf-8', 'ignore')).hexdigest()[:16]
-                # `state` was fetched/created under the lock above; a concurrent
-                # cleanup may have dropped the key, so never re-read _sessions here.
-                with self._lock:
-                    states: "OrderedDict[str, int]" = state['states']
-                    seen = states.get(digest, 0) + 1
-                    if digest in states:
-                        states[digest] = seen
-                        # Recently-seen states are the ones worth keeping, so touching an
-                        # entry moves it to the end of the eviction order.
-                        states.move_to_end(digest)
-                    else:
-                        # EVICT the oldest rather than refuse the new state. Refusing turned a
-                        # full table into a bypass: once max_tracked_states distinct states had
-                        # been seen, every later state was recomputed as seen == 1 forever, so
-                        # an agent could spin on state 65 indefinitely without ever tripping the
-                        # rule. Eviction costs history, never detection of an active loop.
-                        if len(states) >= self.max_tracked_states:
-                            states.popitem(last=False)
-                        states[digest] = seen
-                if seen >= self.max_repeated_states:
+                seen = 0
+                if not store_down:
+                    try:
+                        seen = self._record_state(get_state_store(), key, digest)
+                    except StateUnavailable as exc:
+                        rule_hits.append(RuleHit(
+                            rule_id=_STATE_UNAVAILABLE_RULE, severity=Severity.HIGH,
+                            message=("Agent-loop history cannot be verified: the shared "
+                                     f"state store is unavailable, failing closed ({exc})"),
+                        ))
+                if seen and seen >= self.max_repeated_states:
                     rule_hits.append(RuleHit(
                         rule_id="unbounded_consumption.agent_loop_state_repeat",
                         severity=Severity.HIGH,

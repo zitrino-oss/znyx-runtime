@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.net_guard import assert_safe_egress_url
+from znyx_core.secret_refs import maybe_resolve
 
 # (url, json_payload, headers, timeout_seconds) -> parsed JSON dict
 PostFn = Callable[[str, Dict[str, Any], Dict[str, str], float], Dict[str, Any]]
@@ -43,7 +44,8 @@ class OpenAIModerationAdapter:
 
     def build_request(self, text: str, config: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
         url = config.get("endpoint_url") or DEFAULT_URL
-        key = config.get("auth_value") or config.get("api_key") or ""
+        key = maybe_resolve(config.get("auth_value") or config.get("api_key") or "",
+                            what="openai moderation key")
         model = config.get("model_id") or DEFAULT_MODEL
         headers = {"Content-Type": "application/json"}
         if key:

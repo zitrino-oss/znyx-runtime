@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from znyx_core.core.models import Decision, DetectorResult, RuleHit, Severity
 from znyx_core.net_guard import assert_safe_egress_url
+from znyx_core.secret_refs import maybe_resolve
 
 PostFn = Callable[[str, Dict[str, Any], Dict[str, str], float], Dict[str, Any]]
 
@@ -61,7 +62,8 @@ class AzureContentSafetyAdapter:
             url = base
         else:
             url = f"{base}{_ANALYZE_PATH}?api-version={api_version}"
-        key = config.get("auth_value") or config.get("api_key") or ""
+        key = maybe_resolve(config.get("auth_value") or config.get("api_key") or "",
+                            what="azure content safety key")
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Ocp-Apim-Subscription-Key"] = key

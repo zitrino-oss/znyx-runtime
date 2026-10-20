@@ -1,0 +1,21 @@
+apiVersion: v2
+name: znyx
+description: >-
+  Znyx, the single-container AI gateway: guardrails, token optimisation, FinOps and
+  observability for every agent and app AI call. One image, one port, no sidecar.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.25.0-0"
+home: https://znyx.ai
+keywords:
+  - ai
+  - guardrails
+  - llm
+  - gateway
+  - security
+sources:
+  - https://github.com/zitrino-oss/znyx-runtime
+maintainers:
+  - name: Zitrino
+    email: support@zitrino.com

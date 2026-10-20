@@ -13,13 +13,22 @@ Usage:
     ZNYX_MODE=managed ZNYX_CONTROL_PLANE_URL=https://cp.example.com \
         ZNYX_RUNTIME_TOKEN=rt_xxx uvicorn znyx_runtime.main:app --port 8080
 """
+import asyncio
+import json
 import os
 import logging
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
 from dotenv import load_dotenv
-load_dotenv()  # Load environment variables from .env file if present
+# A .env in the directory the service is started from, and only there. Searching from
+# this module's own location, as before, read whatever .env sat above the installed
+# package (an application's own .env when the runtime is installed in that
+# application's virtual environment), and a parent directory's .env belongs to some
+# other project; either could switch auth off. Under `znyx serve` the supervisor has
+# already read it, so its workers do not read it again.
+if not os.getenv("ZNYX_SKIP_DOTENV") and os.path.isfile(".env"):
+    load_dotenv(".env")
 
 from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,8 +45,15 @@ from znyx_runtime.heartbeat import Heartbeat
 from znyx_runtime.install_state import record_run
 from znyx_runtime.api.routes import router
 from znyx_runtime.api.stream_routes import router as stream_router
+from znyx_runtime.api.dashboard_routes import router as dashboard_router
+from znyx_runtime.gateway.routes import router as gateway_router
+from znyx_runtime.workers import (
+    RecentDecisions, WorkerReporter, instance_snapshot, is_leader, run_dir as worker_run_dir,
+    worker_count, worker_index,
+)
 from znyx_core.engine.evaluator import GuardrailsEvaluator
 from znyx_core.detectors.plugin import plugin_registry, init_plugins
+from znyx_core.utils.env import is_airgapped
 
 logging.basicConfig(level=logging.INFO, format="%(message)s",
                     handlers=[SafeStreamHandler()])
@@ -88,14 +104,39 @@ telemetry: TelemetryEmitter = None
 heartbeat: Heartbeat = None
 evaluator: GuardrailsEvaluator = None
 runtime_judge = None  # RuntimeJudgeAudit — durable judge audit + cached budget
+# The last decisions this worker made (metadata only), for the local dashboard.
+recent_decisions = RecentDecisions()
+worker_reporter: Optional[WorkerReporter] = None
+
+
+def _on_evaluation(event: dict) -> None:
+    """Every evaluation's metadata: kept for the local dashboard, then queued for the
+    control plane (when telemetry is on)."""
+    try:
+        recent_decisions.record(event)
+    except Exception:  # noqa: BLE001 - the dashboard must never affect a decision
+        pass
+    if telemetry is not None:
+        telemetry.emit(event)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, bundle_manager, telemetry, heartbeat, evaluator, runtime_judge
+    global config, bundle_manager, telemetry, heartbeat, evaluator, runtime_judge, worker_reporter
 
-    logger.info("ZNYX Runtime starting...")
+    # With several worker processes (znyx serve), only worker 0 runs the jobs that
+    # must happen once per instance: delivering spools, the heartbeat, the benchmark
+    # queue, model-pin pushes and control-plane reports. See workers.py.
+    leader = is_leader()
+    if worker_count() > 1:
+        logger.info("ZNYX Runtime worker %d of %d starting...", worker_index(), worker_count())
+    else:
+        logger.info("ZNYX Runtime starting...")
     config = RuntimeConfig.from_env()
+    # Managed mode: secret references arrive in bundles and may only name what this
+    # side allows (znyx_core.secret_refs); local configuration is the operator's own.
+    from znyx_core import secret_refs
+    secret_refs.restrict_references(config.mode == "managed")
 
     # Initialize bundle manager
     bundle_manager = BundleManager(config)
@@ -116,15 +157,17 @@ async def lifespan(app: FastAPI):
 
     async def _on_bundle_cycle(policy) -> None:
         # Order matters: push first so the report carries the sidecar's state as of this
-        # cycle rather than the previous one.
+        # cycle rather than the previous one. One report per environment served.
         await inference_sync.push(policy)
-        await runtime_reporter.report(
-            bundle_manager.bundle_info,
-            sidecar_models=inference_sync.reported_models,
-            sidecar_version=inference_sync.sidecar_version,
-        )
+        for info in bundle_manager.report_infos():
+            await runtime_reporter.report(
+                info,
+                sidecar_models=inference_sync.reported_models,
+                sidecar_version=inference_sync.sidecar_version,
+            )
 
-    bundle_manager.add_cycle_listener(_on_bundle_cycle)
+    if leader:
+        bundle_manager.add_cycle_listener(_on_bundle_cycle)
     app.state.inference_sync = inference_sync
     app.state.runtime_reporter = runtime_reporter
 
@@ -136,11 +179,15 @@ async def lifespan(app: FastAPI):
         control_plane_url=config.control_plane_url,
         runtime_token=config.runtime_token,
         enabled=config.telemetry_enabled,
+        spool_path=config.telemetry_spool_path or None,
+        ship=leader,
     )
     await telemetry.start()
 
-    # Initialize anonymous heartbeat (opt-in: set ZNYX_TELEMETRY=true - off by default)
-    heartbeat = Heartbeat(enabled=config.heartbeat_enabled, mode=config.mode)
+    # Initialize anonymous heartbeat (opt-in: set ZNYX_TELEMETRY=true - off by default).
+    # Never from an air-gapped install, and once per instance.
+    heartbeat = Heartbeat(enabled=config.heartbeat_enabled and leader and not is_airgapped(),
+                          mode=config.mode)
     await heartbeat.start()
 
     # Initialize plugin registry for custom detectors. `plugin_registry` here is the
@@ -165,11 +212,48 @@ async def lifespan(app: FastAPI):
     evaluator = GuardrailsEvaluator(
         policy_resolver=None,
         log_redacted_text=config.log_redacted_text,
-        on_evaluation=telemetry.emit,
+        on_evaluation=_on_evaluation,
         plugin_registry=plugin_registry,
         egress_sink=egress_sink,
     )
     app.state.egress_audit_sink = audit_sink
+
+    # The AI gateway (OpenAI- and Anthropic-compatible endpoints). Configured from
+    # gateway.yaml, or from OPENAI_API_KEY / ANTHROPIC_API_KEY with nothing else; an
+    # explicit but broken configuration stops the start rather than serving without it.
+    from znyx_runtime.gateway import config as gateway_config
+    from znyx_runtime.gateway.pipeline import Gateway
+    if config.mode == "managed":
+        # The console's providers and keys arrive in the signed bundles (one per
+        # environment served) and are re-read on every bundle cycle, in every worker.
+        # Each environment's section stands alone: a broken one leaves only that
+        # environment without a gateway.
+        initial = gateway_config.from_bundle_members(bundle_manager.gateway_documents(),
+                                                     shared=bundle_manager.serves_several)
+    else:
+        initial = gateway_config.load()
+    app.state.gateway = Gateway(initial, evaluator=evaluator, bundle_manager=bundle_manager,
+                                egress_sink=egress_sink)
+    if config.mode == "managed":
+        gateway_state = {"doc": json.dumps([bundle_manager.serves_several, bundle_manager.gateway_documents()],
+                                           sort_keys=True, default=str)}
+
+        def _refresh_gateway() -> None:
+            # Run by the bundle manager the moment its bundles change: a key disabled or
+            # removed in the console stops working with the next fetch, in every worker.
+            documents = bundle_manager.gateway_documents()
+            doc = json.dumps([bundle_manager.serves_several, documents], sort_keys=True, default=str)
+            if doc == gateway_state["doc"]:
+                return
+            app.state.gateway.update_config(gateway_config.from_bundle_members(
+                documents, shared=bundle_manager.serves_several))
+            gateway_state["doc"] = doc
+            logger.info("Gateway configuration updated from the bundles")
+
+        bundle_manager.add_change_listener(_refresh_gateway)
+    if app.state.gateway.config.enabled:
+        logger.info("Gateway: %s (%s)", ", ".join(sorted(app.state.gateway.config.providers)),
+                    app.state.gateway.config.source)
 
     #: runtime-local judge audit (durable spool the CP drains) + cached
     # deny-of-wallet (bundle-delivered caps vs the runtime's own spend tally). Lets a
@@ -182,6 +266,26 @@ async def lifespan(app: FastAPI):
     )
     app.state.runtime_judge = runtime_judge
 
+    # Durable delivery of the two audit spools to the control plane (managed mode
+    # only). They used to be read only by a control plane sharing this disk, so a
+    # runtime in a customer's network never delivered them.
+    audit_shippers = []
+    if leader and config.mode == "managed" and config.control_plane_url and config.runtime_token:
+        from znyx_runtime.shipper import SpoolShipper, http_post
+        cp = config.control_plane_url.rstrip("/")
+        sender = http_post(config.runtime_token)
+        egress_path = getattr(audit_sink, "path", None)
+        if egress_path is not None:
+            audit_shippers.append(SpoolShipper(str(egress_path), f"{cp}/v1/runtime/audit/egress",
+                                               sender, name="egress-audit"))
+        judge_spool = getattr(runtime_judge, "spool", None)
+        if judge_spool is not None and getattr(judge_spool, "path", None) is not None:
+            audit_shippers.append(SpoolShipper(str(judge_spool.path), f"{cp}/v1/runtime/audit/judge",
+                                               sender, name="judge-audit"))
+        for shipper in audit_shippers:
+            shipper.start()
+    app.state.audit_shippers = audit_shippers
+
     # Control-plane-queued benchmarks. Only this runtime can reach its own inference
     # sidecar, so a model-backed benchmark is evaluated here rather than in the control
     # plane (which must never dial a tenant-supplied URL and has no route into a customer
@@ -189,23 +293,33 @@ async def lifespan(app: FastAPI):
     # multi-minute run parked there would starve model-pin pushes and heartbeats, because
     # _spawn_cycle skips a tick while the previous one is still in flight.
     from znyx_runtime.benchmark_worker import BenchmarkWorker
-    benchmark_worker = BenchmarkWorker(
-        control_plane_url=config.control_plane_url,
-        runtime_token=config.runtime_token,
-        evaluator=evaluator,
-    )
-    await benchmark_worker.start()
+    benchmark_worker = None
+    if leader:
+        benchmark_worker = BenchmarkWorker(
+            control_plane_url=config.control_plane_url,
+            runtime_token=config.runtime_token,
+            evaluator=evaluator,
+        )
+        await benchmark_worker.start()
     app.state.benchmark_worker = benchmark_worker
 
-    # Record this startup in shared install state (increments run_count).
-    state = record_run(mode=config.mode)
-    run_count = state["run_count"]
+    # Liveness and metrics for the supervisor and the dashboard (znyx serve only).
+    directory = worker_run_dir()
+    if directory is not None:
+        from znyx_core.middleware.metrics import MetricsCollector as _Collector
+        worker_reporter = WorkerReporter(_Collector(), recent_decisions, directory,
+                                         version=__version__)
+        await worker_reporter.start()
+
+    # Record this startup in shared install state (increments run_count). Once per
+    # instance start, not once per worker.
+    run_count = record_run(mode=config.mode)["run_count"] if leader else 0
 
     # First-run welcome banner: shown exactly once per install (local mode).
     # Also fires a one-shot first_run telemetry ping (best-effort).
     if config.mode == "local" and run_count == 1:
         safe_print(_WELCOME_BANNER)
-        if config.heartbeat_enabled:
+        if heartbeat.enabled:
             try:
                 await heartbeat.send_first_run_ping(run_count=run_count)
             except Exception:
@@ -222,9 +336,17 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    await benchmark_worker.stop()
+    gateway = getattr(app.state, "gateway", None)
+    if gateway is not None:
+        await gateway.close()
+    if worker_reporter is not None:
+        await worker_reporter.stop()
+    if benchmark_worker is not None:
+        await benchmark_worker.stop()
     await heartbeat.stop()
     await telemetry.stop()
+    for shipper in getattr(app.state, "audit_shippers", []):
+        await shipper.stop(final_attempt=True)
     await bundle_manager.stop()
     logger.info("ZNYX Runtime shut down")
 
@@ -301,7 +423,8 @@ app.add_middleware(RuntimeSecurityHeadersMiddleware)
 
 
 class LocalModeNudgeMiddleware(BaseHTTPMiddleware):
-    """Attach X-Znyx-Console and X-Znyx-Mode headers when running in local mode."""
+    """Attach X-Znyx-Console and X-Znyx-Mode headers when running in local mode, and
+    X-Znyx-Worker (which worker process answered) when there are several."""
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response = await call_next(request)
@@ -309,6 +432,8 @@ class LocalModeNudgeMiddleware(BaseHTTPMiddleware):
             if CONSOLE_URL:
                 response.headers["X-Znyx-Console"] = CONSOLE_URL
             response.headers["X-Znyx-Mode"] = "local"
+        if worker_count() > 1:
+            response.headers["X-Znyx-Worker"] = str(worker_index())
         return response
 
 
@@ -345,6 +470,10 @@ app.add_middleware(SdkIdentificationMiddleware)
 from znyx_core.middleware.metrics import MetricsCollector, MetricsMiddleware
 app.add_middleware(MetricsMiddleware, collector=MetricsCollector())
 
+# Bodies are read before a route's authentication runs: capped in size and time.
+from znyx_runtime.request_limits import BodyLimitMiddleware
+app.add_middleware(BodyLimitMiddleware)
+
 
 @app.get("/metrics", include_in_schema=False)
 async def runtime_metrics(
@@ -375,12 +504,21 @@ async def runtime_metrics(
                 status_code=401,
                 media_type="text/plain",
             )
-    body = MetricsCollector().format_prometheus()
+    collector = MetricsCollector()
+    if worker_count() > 1:
+        # Any worker may answer the scrape: report the whole instance, not one worker.
+        snapshot = await asyncio.to_thread(instance_snapshot, collector, recent_decisions,
+                                           worker_reporter)
+        body = collector.format_prometheus(snapshot["metrics"])
+    else:
+        body = collector.format_prometheus()
     return _Response(content=body, media_type="text/plain; version=0.0.4")
 
 
 app.include_router(router)
 app.include_router(stream_router)
+app.include_router(dashboard_router)
+app.include_router(gateway_router)
 
 
 @app.get("/")
@@ -388,6 +526,7 @@ async def root():
     return {
         "service": "ZNYX Runtime",
         "version": __version__,
+        "platform_version": os.getenv("ZNYX_PLATFORM_VERSION") or __version__,
         "mode": config.mode if config else "initializing",
         "endpoints": {
             "evaluation": "/v1/evaluate/{input|output|tool}",
@@ -395,6 +534,7 @@ async def root():
             "health": "/healthz",
             "readiness": "/readyz",
             "bundle_status": "/v1/bundle/status",
+            "dashboard": "/dashboard",
             "docs": "/docs",
         },
     }

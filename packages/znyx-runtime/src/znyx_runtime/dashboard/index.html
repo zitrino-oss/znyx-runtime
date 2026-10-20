@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Znyx dashboard</title>
+<link rel="stylesheet" href="/dashboard/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><span class="mark" aria-hidden="true"></span>Znyx <span class="muted">local dashboard</span></div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<main>
+  <section id="signin" class="card signin" hidden>
+    <h1>Sign in</h1>
+    <p>Enter this instance's API key. <code>znyx serve</code> prints it when it starts, and
+      saves it in <code>~/.znyx/api-key</code>.</p>
+    <form id="keyform" autocomplete="off">
+      <label for="key">API key</label>
+      <input id="key" type="password" spellcheck="false" required>
+      <button type="submit">Open dashboard</button>
+    </form>
+    <p class="error" id="signin-error" role="alert"></p>
+  </section>
+
+  <div id="content" hidden>
+    <section class="stats" aria-label="Totals">
+      <div class="card stat"><div class="label">Evaluations</div><div class="value" id="s-evals">-</div><div class="sub" id="s-evals-sub"></div></div>
+      <div class="card stat"><div class="label">Blocked</div><div class="value" id="s-blocked">-</div><div class="sub" id="s-blocked-sub"></div></div>
+      <div class="card stat"><div class="label">Redacted or changed</div><div class="value" id="s-changed">-</div><div class="sub" id="s-changed-sub"></div></div>
+      <div class="card stat"><div class="label">Latency p95</div><div class="value" id="s-p95">-</div><div class="sub" id="s-lat-sub"></div></div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Decisions</h2>
+        <div id="decisions" class="bars"></div>
+      </section>
+      <section class="card">
+        <h2>Top rules</h2>
+        <table class="table"><thead><tr><th>Rule</th><th class="num">Hits</th></tr></thead><tbody id="rules"></tbody></table>
+        <p class="empty" id="rules-empty" hidden>No rule has fired yet.</p>
+      </section>
+    </div>
+
+    <section class="card" id="gateway-card" hidden>
+      <h2>AI gateway</h2>
+      <p class="hint" id="gw-providers"></p>
+      <div class="stats gw-stats">
+        <div class="stat"><div class="label">LLM calls</div><div class="value" id="gw-calls">-</div><div class="sub" id="gw-outcomes"></div></div>
+        <div class="stat"><div class="label">Tokens</div><div class="value" id="gw-tokens">-</div><div class="sub" id="gw-tokens-sub"></div></div>
+        <div class="stat"><div class="label">Cost</div><div class="value" id="gw-cost">-</div><div class="sub">from the price table</div></div>
+        <div class="stat"><div class="label">Guard overhead p50</div><div class="value" id="gw-guard">-</div><div class="sub" id="gw-ttft"></div></div>
+      </div>
+      <div class="grid">
+        <div>
+          <h3>By model</h3>
+          <table class="table"><thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody id="gw-models"></tbody></table>
+        </div>
+        <div>
+          <h3>Recent calls</h3>
+          <div class="scroll">
+            <table class="table"><thead><tr><th>App</th><th>Model</th><th>Outcome</th><th class="num">Tokens</th><th class="num">ms</th></tr></thead><tbody id="gw-recent"></tbody></table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Try it</h2>
+      <form id="tryform" class="try">
+        <label for="try-text" class="visually-hidden">Text to check</label>
+        <textarea id="try-text" rows="3" spellcheck="false">My card is 4111 1111 1111 1111, email me at jane@example.com</textarea>
+        <div class="try-actions">
+          <select id="try-context" aria-label="Check as">
+            <option value="input">Check as a prompt (input)</option>
+            <option value="output">Check as a response (output)</option>
+          </select>
+          <button type="submit">Check</button>
+        </div>
+      </form>
+      <div id="try-result" class="try-result" hidden></div>
+      <details class="curl"><summary>The same call with curl</summary><pre id="curl"></pre></details>
+    </section>
+
+    <section class="card">
+      <h2>Recent decisions</h2>
+      <p class="hint">Metadata only. Request and response text is never kept.</p>
+      <div class="scroll">
+        <table class="table"><thead><tr><th>Time</th><th>Stage</th><th>Decision</th><th class="num">Risk</th><th>Rules</th><th class="num">ms</th><th>App</th></tr></thead><tbody id="recent"></tbody></table>
+      </div>
+      <p class="empty" id="recent-empty" hidden>Nothing evaluated yet. Use "Try it" above.</p>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Workers</h2>
+        <table class="table"><thead><tr><th>Worker</th><th class="num">PID</th><th class="num">Up</th><th class="num">Evaluations</th><th class="num">Last report</th></tr></thead><tbody id="workers"></tbody></table>
+        <p class="empty" id="workers-empty" hidden>Single process (started without <code>znyx serve</code>).</p>
+      </section>
+      <section class="card">
+        <h2>Policy and models</h2>
+        <dl class="kv" id="policy"></dl>
+        <h3>Model server</h3>
+        <div id="models"></div>
+      </section>
+    </div>
+  </div>
+</main>
+<footer class="foot"><span id="updated"></span> <button id="signout" class="link" hidden>Sign out</button></footer>
+<script src="/dashboard/app.js"></script>
+</body>
+</html>

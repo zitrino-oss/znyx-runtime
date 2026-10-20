@@ -1,4 +1,7 @@
-# Publish znyx-core and znyx-runtime to PyPI, and the runtime image to a registry.
+# Publish znyx (the one install) and its components znyx-core, znyx-runtime and
+# znyx-inference to PyPI, the znyx/znyx images (and, for one deprecation window, the
+# old znyx/runtime and znyx/inference images) to a registry, and the standalone
+# `znyx` binaries to the GitHub release.
 #
 # PyPI uses OIDC Trusted Publishing (no long-lived token). Before the first run,
 # register each project's trusted publisher on PyPI:
@@ -33,6 +36,7 @@ on:
         default: all
         options:
           - all
+          - znyx
           - znyx-core
           - znyx-runtime
           - znyx-inference
@@ -90,7 +94,7 @@ jobs:
         run: |
           SELECTED="${SELECTED:-all}"
           if [ "$SELECTED" = "all" ]; then
-            echo 'packages=["packages/znyx-core","packages/znyx-runtime","packages/znyx-inference"]' >> "$GITHUB_OUTPUT"
+            echo 'packages=["packages/znyx-core","packages/znyx-runtime","packages/znyx-inference","packages/znyx"]' >> "$GITHUB_OUTPUT"
             echo "publish_all=true" >> "$GITHUB_OUTPUT"
           else
             echo "packages=[\"packages/${SELECTED}\"]" >> "$GITHUB_OUTPUT"
@@ -119,13 +123,11 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           # The released version comes from the tag, not the checked-in manifest,
-          # so a forgotten manifest bump can no longer publish the wrong number.
-          sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" ${{ matrix.package }}/pyproject.toml
-          # Keep the three packages in lockstep: znyx-runtime and znyx-inference each
-          # depend on znyx-core, and leaving the floor at an older release would let
-          # pip satisfy a new runtime with a stale core.
-          sed -i -E "s/znyx-core>=[0-9][^\"]*/znyx-core>=${VERSION}/" ${{ matrix.package }}/pyproject.toml
-          grep -E "^version|znyx-core>=" ${{ matrix.package }}/pyproject.toml
+          # so a forgotten manifest bump can no longer publish the wrong number. One
+          # script stamps every package: the services' znyx-core floor and the znyx
+          # package's exact pins move with the version, so the four stay in lockstep.
+          python scripts/set_version.py "$VERSION"
+          grep -E "^version|znyx-(core|runtime|inference)(\[[a-z,]+\])?(>=|==)" ${{ matrix.package }}/pyproject.toml
       - name: Build
         run: |
           python -m pip install --upgrade build twine
@@ -138,9 +140,11 @@ jobs:
           packages-dir: ${{ matrix.package }}/dist/
           skip-existing: true
 
-  # Standalone platform executables for the @znyx/runtime npm wrapper.
-  # PyInstaller bundles the znyx-runtime CLI together with znyx-core into a
-  # single self-contained binary per platform; no Python needed on the target.
+  # Standalone platform executables for the @znyx/runtime npm wrapper (which
+  # installs them as the `znyx` command). PyInstaller bundles the znyx CLI with all
+  # its components into one self-contained binary per platform; no Python needed on
+  # the target. Named znyx-<target>; releases before the one install used
+  # znyx-runtime-<target>, which the npm wrapper falls back to.
   #
   # A workflow_dispatch run from a branch builds and smoke-tests only (a dry
   # run). Assets are uploaded when the workflow runs for a published release
@@ -176,37 +180,42 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          # Stamped before install so `znyx-runtime --version` and /healthz inside the
-          # binary report the released number rather than the checked-in manifest.
-          for pkg in znyx-core znyx-runtime; do
-            sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" "packages/$pkg/pyproject.toml"
-            sed -i -E "s/znyx-core>=[0-9][^\"]*/znyx-core>=${VERSION}/" "packages/$pkg/pyproject.toml"
-          done
+          # Stamped before install so `znyx version` and the APIs inside the binary
+          # report the released number rather than the checked-in manifest.
+          python scripts/set_version.py "$VERSION"
       - name: Build binary
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install ./packages/znyx-core ./packages/znyx-runtime pyinstaller
-          # --collect-all bundles both packages plus their data files (YAML
-          # policies). znyx_runtime.main is loaded from a string by
-          # uvicorn.run, so PyInstaller cannot trace it and needs the hint.
-          pyinstaller --onefile --name "znyx-runtime-${{ matrix.target }}" \
-            --collect-all znyx_runtime --collect-all znyx_core \
-            --collect-submodules uvicorn \
-            --hidden-import znyx_runtime.main \
-            packages/znyx-runtime/src/znyx_runtime/cli.py
-          FILE="znyx-runtime-${{ matrix.target }}"
+          pip install ./packages/znyx-core ./packages/znyx-runtime ./packages/znyx-inference \
+            ./packages/znyx pyinstaller
+          # --collect-all bundles every package plus its data files (the starter
+          # policy, the dashboard). The services are loaded from strings by uvicorn
+          # in the worker processes, so PyInstaller cannot trace them and needs the
+          # hints. __main__ calls multiprocessing.freeze_support() for the workers.
+          pyinstaller --onefile --name "znyx-${{ matrix.target }}" \
+            --collect-all znyx --collect-all znyx_runtime --collect-all znyx_core \
+            --collect-all znyx_inference --collect-submodules uvicorn \
+            --hidden-import znyx_runtime.main --hidden-import znyx_inference.main \
+            packages/znyx/src/znyx/__main__.py
+          FILE="znyx-${{ matrix.target }}"
           if [ "${{ runner.os }}" = "Windows" ]; then FILE="$FILE.exe"; fi
           echo "FILE=$FILE" >> "$GITHUB_ENV"
       - name: Smoke test
         shell: bash
         run: |
-          "./dist/$FILE" --help
-          "./dist/$FILE" serve --port 8199 &
+          "./dist/$FILE" --version
+          # Explicit paths: Windows ignores HOME for the home directory.
+          export ZNYX_API_KEY_FILE="$RUNNER_TEMP/znyx-api-key" ZNYX_RUN_DIR="$RUNNER_TEMP/znyx-run"
+          "./dist/$FILE" serve --port 8199 --workers 2 &
           SERVER=$!
           STATUS=0
           curl -sf --retry 30 --retry-delay 1 --retry-connrefused \
             --retry-all-errors http://127.0.0.1:8199/healthz || STATUS=1
+          # One real evaluation through a worker process, with the generated key.
+          curl -sf http://127.0.0.1:8199/v1/evaluate/input \
+            -H "X-API-Key: $(cat "$ZNYX_API_KEY_FILE")" -H 'Content-Type: application/json' \
+            -d '{"request_id":"smoke","tenant_id":"ci","app_id":"ci","text":"hello"}' || STATUS=1
           kill "$SERVER" || true
           exit "$STATUS"
       - name: Checksum
@@ -241,23 +250,38 @@ jobs:
     strategy:
       matrix:
         include:
+          # The one install: rules-only, and with the ML model server runtime.
+          - dockerfile: Dockerfile
+            target: znyx
+            image_name: znyx/znyx
+            suffix: ""
+            latest: latest
+          - dockerfile: Dockerfile
+            target: znyx-ml
+            image_name: znyx/znyx
+            suffix: "-ml"
+            latest: ml
+          # Deprecated images, published for one deprecation window.
           - dockerfile: Dockerfile.runtime
+            target: ""
             image_name: znyx/runtime
+            suffix: ""
+            latest: latest
           - dockerfile: Dockerfile.inference
+            target: ""
             image_name: znyx/inference
+            suffix: ""
+            latest: latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set version
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          # Both Dockerfiles COPY these packages and pip install them, so the version
+          # The Dockerfiles COPY these packages and pip install them, so the version
           # baked into the image comes from the manifests - stamp them here and the
           # image tag and the version the running code reports can no longer disagree.
-          for pkg in znyx-core znyx-runtime znyx-inference; do
-            sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" "packages/$pkg/pyproject.toml"
-            sed -i -E "s/znyx-core>=[0-9][^\"]*/znyx-core>=${VERSION}/" "packages/$pkg/pyproject.toml"
-          done
+          python scripts/set_version.py "$VERSION"
       - name: Log in to registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -268,11 +292,12 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
           push: true
           # Tagged from the derived version, not github.ref_name: a manual run from a
           # branch used to publish `znyx/runtime:main`. The v-prefixed tag is kept as
           # an alias so anything already pulling `:vX.Y.Z` keeps working.
           tags: |
-            ${{ matrix.image_name }}:latest
-            ${{ matrix.image_name }}:${{ needs.version.outputs.version }}
-            ${{ matrix.image_name }}:v${{ needs.version.outputs.version }}
+            ${{ matrix.image_name }}:${{ matrix.latest }}
+            ${{ matrix.image_name }}:${{ needs.version.outputs.version }}${{ matrix.suffix }}
+            ${{ matrix.image_name }}:v${{ needs.version.outputs.version }}${{ matrix.suffix }}
