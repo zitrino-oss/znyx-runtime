@@ -106,6 +106,10 @@ def call_span(record, event: Dict[str, Any]) -> Dict[str, Any]:
         "znyx.upstream_ms": record.upstream_ms,
         "znyx.guard_ms": record.guard_ms,
         "znyx.techniques": [f"{k}={v}" for k, v in sorted(record.techniques.items())] or None,
+        "znyx.optimise.profile": getattr(record, "profile", None),
+        "znyx.optimise.saved_usd": event.get("saved_usd"),
+        "znyx.optimise.baseline_cost_usd": event.get("baseline_cost_usd"),
+        "znyx.optimise.techniques": [e["technique"] for e in event.get("optimisations") or []] or None,
     })
     span = {"traceId": record.trace_id, "spanId": record.span_id, "name": f"chat {model}",
             "kind": SPAN_KIND_CLIENT, "startTimeUnixNano": str(record.started_ns),

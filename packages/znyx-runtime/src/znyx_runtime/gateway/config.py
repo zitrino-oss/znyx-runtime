@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from znyx_core import secret_refs
+from znyx_runtime.gateway.optimise import PROFILES, KeyOptimisation
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,9 @@ class GatewayKey:
     default_provider: Optional[str] = None
     allowed_models: Tuple[str, ...] = ()     # glob patterns; empty = any model
     limits: Limits = field(default_factory=Limits)
-    profile: str = "balanced"
+    profile: str = "balanced"                # optimisation profile (gateway.optimise.PROFILES)
+    profile_chosen: bool = False             # set for this key (else stage A and named techniques only)
+    optimisation: KeyOptimisation = field(default_factory=KeyOptimisation)
     disabled: bool = False
     instance_key: bool = False               # the instance's RUNTIME_API_KEY
     member: str = ""                         # the environment (bundle set member) it belongs to
@@ -350,7 +353,8 @@ def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider]) 
     where = f"keys[{index}]"
     _require(isinstance(raw, Mapping), where, "expected a mapping")
     allowed = {"id", "key", "key_sha256", "tenant_id", "app_id", "agent_id", "environment",
-               "providers", "default_provider", "allowed_models", "limits", "profile", "disabled"}
+               "providers", "default_provider", "allowed_models", "limits", "profile", "optimisation",
+               "disabled"}
     unknown = set(raw) - allowed
     _require(not unknown, where, f"unknown setting(s) {', '.join(sorted(unknown))}")
     key_id = raw.get("id")
@@ -373,6 +377,13 @@ def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider]) 
         _require(name in providers, where, f"unknown provider {name!r}")
     default = raw.get("default_provider")
     _require(default is None or default in providers, where, f"unknown default_provider {default!r}")
+    profile = raw.get("profile") or "balanced"
+    chosen = isinstance(profile, str) and profile in PROFILES and bool(raw.get("profile"))
+    if not isinstance(profile, str) or profile not in PROFILES:
+        # Older consoles stored free text here: such a key keeps working, on the default.
+        logger.warning("gateway: %s has unknown profile %r; using balanced (known: %s)", where, profile,
+                       ", ".join(PROFILES))
+        profile = "balanced"
     return GatewayKey(
         id=key_id, key_sha256=digest.lower(),
         tenant_id=str(raw.get("tenant_id") or "default"), app_id=str(raw.get("app_id") or key_id),
@@ -380,7 +391,33 @@ def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider]) 
         providers=names, default_provider=default,
         allowed_models=_str_list(raw.get("allowed_models"), f"{where}.allowed_models"),
         limits=_limits(raw.get("limits"), f"{where}.limits"),
-        profile=str(raw.get("profile") or "balanced"), disabled=bool(raw.get("disabled", False)))
+        profile=profile, profile_chosen=chosen,
+        optimisation=_optimisation(raw.get("optimisation"), f"{where}.optimisation"),
+        disabled=bool(raw.get("disabled", False)))
+
+
+def _optimisation(raw: Any, where: str) -> KeyOptimisation:
+    """A key's technique choices. Technique ids are not checked here: one this runtime
+    does not know (from a newer console) is ignored, and so are settings it does not
+    know yet, so a newer control plane never makes the whole gateway configuration
+    unloadable."""
+    if raw is None:
+        return KeyOptimisation()
+    _require(isinstance(raw, Mapping), where, "expected a mapping")
+    lists = {}
+    for name in ("enable", "disable", "approved"):
+        value = raw.get(name)
+        if value is None:
+            value = []
+        elif isinstance(value, str):
+            value = [value]
+        _require(isinstance(value, list), where, f"{name} must be a list of technique ids")
+        kept = [v for v in value if isinstance(v, str)]
+        if len(kept) != len(value):
+            logger.warning("gateway: %s.%s has entries that are not technique ids; they are ignored",
+                           where, name)
+        lists[name] = tuple(kept)
+    return KeyOptimisation(**lists)
 
 
 def _settings(raw: Any) -> GatewaySettings:
@@ -495,6 +532,10 @@ def from_bundle_members(documents: List[Tuple[str, Optional[Mapping[str, Any]]]]
         except GatewayConfigError as exc:
             logger.error("Gateway: the section for environment %s was rejected, its keys are not "
                          "served: %s", member or "-", exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 - one environment's section must not stop the others
+            logger.error("Gateway: the section for environment %s could not be read, its keys are not "
+                         "served: %s: %s", member or "-", type(exc).__name__, exc)
             continue
         for name, provider in part.providers.items():
             providers[f"{member}/{name}" if member else name] = dataclasses.replace(provider, member=member)

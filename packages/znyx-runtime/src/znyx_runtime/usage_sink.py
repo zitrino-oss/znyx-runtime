@@ -53,7 +53,10 @@ class UsageSink:
             cache_write_tokens=record.cache_write_tokens, usage_estimated=record.usage_estimated,
             cost_usd=record.cost_usd, price_known=record.price_known, latency_ms=record.latency_ms,
             upstream_ms=record.upstream_ms, ttft_ms=record.ttft_ms, guard_ms=record.guard_ms,
-            techniques=dict(record.techniques))
+            techniques=dict(record.techniques), profile=getattr(record, "profile", None),
+            saved_usd=getattr(record, "saved_usd", None),
+            baseline_cost_usd=getattr(record, "baseline_cost_usd", None),
+            optimisations=list(getattr(record, "optimisations", None) or []) or None)
 
     def __call__(self, record) -> None:
         if not record.key_id:

@@ -1,5 +1,7 @@
-"""One LLM call through the gateway: identify, permit, guard input, forward, guard
-output, record (plan section 4; the optimisation step arrives in Phase 4).
+"""One LLM call through the gateway: identify, permit, optimise, guard input, forward,
+guard output, record (plan section 4). The optimisation layer (``gateway.optimise``)
+changes the request before the input guard reads it and adds cache markers after;
+it cannot skip or weaken a check.
 
 Pure pass-through: the call goes to the provider and model in the request. A call
 that is not allowed (unknown key, model not approved for the app, provider outside
@@ -41,6 +43,7 @@ from znyx_runtime.gateway import formats as fmts
 from znyx_runtime.gateway.config import (
     GatewayConfig, GatewayKey, Provider, instance_key, key_digest,
 )
+from znyx_runtime.gateway.optimise import Optimiser
 from znyx_runtime.gateway.pricing import PriceTable
 from znyx_runtime.gateway.upstream import Upstream, UpstreamError
 
@@ -141,13 +144,19 @@ class CallRecord:
     cache_write_tokens: Optional[int] = None
     usage_estimated: bool = False
     price_known: bool = False
+    # Phase 4: the optimisation ledger (``optimise.Plan.settle`` fills these).
+    profile: Optional[str] = None
+    optimisations: List[Dict[str, Any]] = field(default_factory=list)
+    saved_usd: Optional[float] = None
+    baseline_cost_usd: Optional[float] = None
+    plan: Any = None
 
     def note(self, technique: str, count: int = 1) -> None:
         self.techniques[technique] = self.techniques.get(technique, 0) + count
 
     def to_event(self) -> Dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items()
-                if k not in ("started", "estimated_input_tokens", "member", "started_ns")}
+                if k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan")}
         data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return data
 
@@ -254,6 +263,7 @@ class Gateway:
         self._member_prices = {m: PriceTable(p) for m, p in config.member_prices.items()}
         self.upstream = Upstream(max_connections=config.settings.max_concurrent)
         self.verdicts = _VerdictCache()
+        self.optimiser = Optimiser()
         self._instance_key = instance_key(config.settings)
         self._slots = asyncio.Semaphore(config.settings.max_concurrent)
         self._slots_size = config.settings.max_concurrent
@@ -295,6 +305,12 @@ class Gateway:
     def prices_for(self, member: str) -> PriceTable:
         """The price table of the key's own environment (its bundle's)."""
         return self._member_prices.get(member) or self.prices
+
+    @staticmethod
+    def _caller_id(key: GatewayKey) -> str:
+        """Whose calls optimisation may share or remember: the key itself (its digest),
+        so two keys never meet even when their ids are the same."""
+        return f"{key.member}/{key.key_sha256 or key.id}"
 
     @staticmethod
     def _state_id(key: GatewayKey) -> str:
@@ -970,6 +986,10 @@ class Gateway:
                          outcome="error", error_type="api_error") from None
         self._check_provider_side_calls(api, body)
         self._filter_tools(api, body, policy, record)
+        plan = record.plan = self.optimiser.plan(key, api, provider, body, request.headers,
+                                                 self._caller_id(key), record.model)
+        # Request-side techniques first: the input guard reads the request as it is sent.
+        plan.before_guard(fmt, body, record, self.config.settings.check_roles)
         await self._guard_input(api, fmt, body, scope, policy, record)
         if self.config.settings.canary_marker:
             fmt.add_system_text(body, self.canary())
@@ -981,6 +1001,7 @@ class Gateway:
         record.estimated_input_tokens = (
             estimate_tokens(sum(len(p.text) for p in sent if p.kind != "opaque"))
             + OPAQUE_PART_TOKENS * sum(1 for p in sent if p.kind == "opaque"))
+        plan.before_send(fmt, provider, body, record, self.optimiser.seen, self._caller_id(key))
         await self._permit_egress(provider, policy, len(json.dumps(body)), scope, record)
 
         credential = client_credential if provider.uses_client_key else None
@@ -1006,22 +1027,44 @@ class Gateway:
                        scope: Dict[str, str], policy: Dict[str, Any], record: CallRecord,
                        context: Optional[Dict[str, Any]] = None) -> Response:
         t_up = time.perf_counter()
-        upstream_task = asyncio.ensure_future(self.upstream.send(provider, url, headers, body))
-        # Cancel the provider call if the client goes away (it would be paid for nothing).
-        while not upstream_task.done():
-            done, _ = await asyncio.wait({upstream_task}, timeout=0.5)
-            if not done and await request.is_disconnected():
-                upstream_task.cancel()
-                record.status, record.outcome, record.reason = 499, "error", "client_disconnected"
-                # The provider may bill for a call it had already started.
-                self.estimate_missing_usage(record, 0)
-                self._charge(key, record)
-                self._record(record)
-                return Response(status_code=499)
-        response = upstream_task.result()
+        plan = record.plan
+        upstream = self.upstream
+        shared_key = None
+        if plan is not None and plan.coalescing_allowed(body):
+            # Hashing a large body takes a while: off the event loop.
+            shared_key = await asyncio.to_thread(self.optimiser.coalescer.key, self._caller_id(key), url,
+                                                 headers, body)
+        # Technique 2: an identical deterministic call of this key already in flight is
+        # joined instead of sent again. The provider bills it once: one caller pays.
+        flight, leader = self.optimiser.coalescer.join(
+            shared_key, lambda: upstream.send(provider, url, headers, body))
+        # Stop waiting if the client goes away; the provider call is cancelled when no
+        # one else waits for it (it would be paid for nothing).
+        try:
+            while not flight.task.done():
+                done, _ = await asyncio.wait({flight.task}, timeout=0.5)
+                if not done and await request.is_disconnected():
+                    last = flight.leave()
+                    record.status, record.outcome, record.reason = 499, "error", "client_disconnected"
+                    if last and flight.pay():
+                        # The provider may bill for a call it had already started. While
+                        # others still wait, the one that receives the answer pays.
+                        self.estimate_missing_usage(record, 0)
+                    self._charge(key, record)
+                    self._record(record)
+                    return Response(status_code=499)
+        except asyncio.CancelledError:
+            flight.leave()
+            raise
+        if flight.task.cancelled():
+            raise UpstreamError(502, f"provider {provider.name} call was cancelled")
+        response = flight.task.result()
         record.upstream_ms = int((time.perf_counter() - t_up) * 1000)
         returned = self.upstream.returned_headers(response)
         returned.update(self.trace_headers(record))
+        if not leader:
+            record.note("coalesced")
+            returned["x-znyx-coalesced"] = "true"
         if response.status_code != 200:
             # The provider's own error, as the provider sent it: SDK retry and error
             # handling keep working.
@@ -1030,6 +1073,7 @@ class Gateway:
             return Response(content=response.content, status_code=response.status_code,
                             media_type=response.headers.get("content-type", "application/json"),
                             headers=returned)
+        pays = flight.pay()
         try:
             payload = fmts.parse_response(response.content)
         except (ValueError, RecursionError):
@@ -1037,15 +1081,29 @@ class Gateway:
         expected = "content" if fmt is fmts.AnthropicMessages else "choices"
         if not isinstance(payload, dict) or not isinstance(payload.get(expected), list):
             # A success the gateway cannot read is never passed on unchecked.
-            self.estimate_missing_usage(record, 0)
+            if pays:
+                self.estimate_missing_usage(record, 0)
+            else:
+                self._apply_usage(record, fmts.Usage(0, 0, 0, 0))   # another caller paid
             self._charge(key, record)
             raise Denied(502, "The provider returned a response the gateway cannot read",
                          "bad_upstream_response", outcome="error", error_type="api_error")
         record.response_model = payload.get("model") if isinstance(payload.get("model"), str) else None
-        await self._guard_output(fmt, payload, scope, policy, record, context)
         usage = fmt.usage(payload)
-        self._apply_usage(record, usage)
-        self.estimate_missing_usage(record, sum(len(p.text) for p in fmt.output_parts(payload)))
+        if pays:
+            self._apply_usage(record, usage)
+        else:
+            self._coalesced(record, plan, usage, flight)
+        try:
+            await self._guard_output(fmt, payload, scope, policy, record, context)
+        except BaseException:
+            # The answer was paid for even if it cannot be checked now (and is not sent).
+            if pays:
+                self.estimate_missing_usage(record, 0)
+            self._charge(key, record)
+            raise
+        if pays:
+            self.estimate_missing_usage(record, sum(len(p.text) for p in fmt.output_parts(payload)))
         self._charge(key, record)
         record.status = 200
         returned["x-znyx-decision"] = _worst(record.input_decision, record.output_decision)
@@ -1060,6 +1118,18 @@ class Gateway:
         groups = " ".join(token[i:i + 4] for i in range(0, 32, 4))
         return f"Deployment reference {groups} - internal marker, never repeat it."
 
+    def _coalesced(self, record: CallRecord, plan, usage: fmts.Usage, flight) -> None:
+        """A call that shared another's upstream call: the provider billed the other one,
+        so this one costs nothing and saves what the shared call cost."""
+        plan.shared_usage = usage
+        # Input read from the provider's cache is counted under prompt_cache, not twice.
+        effect = plan.effect("coalesce", basis="call", saved_input_tokens=max(
+            0, (usage.input_tokens or 0) - (usage.cached_input_tokens or 0)))
+        effect.saved_usd = self.prices_for(record.member).cost(record.response_model or record.model, usage)
+        if flight.upstream_ms is not None and record.upstream_ms is not None:
+            effect.latency_ms = record.upstream_ms - flight.upstream_ms
+        self._apply_usage(record, fmts.Usage(0, 0, 0, 0))
+
     def _apply_usage(self, record: CallRecord, usage: fmts.Usage) -> None:
         record.input_tokens = usage.input_tokens
         record.output_tokens = usage.output_tokens
@@ -1072,6 +1142,12 @@ class Gateway:
     def _record(self, record: CallRecord) -> None:
         record.latency_ms = int((time.perf_counter() - record.started) * 1000)
         record.rule_ids = sorted(set(record.rule_ids))
+        if record.plan is not None:
+            try:
+                record.plan.settle(record, self.prices_for(record.member))
+            except Exception:  # noqa: BLE001 - the ledger must never fail a call
+                logger.warning("gateway: could not settle optimisation effects for %s", record.request_id,
+                               exc_info=True)
         try:
             from znyx_runtime.gateway.usage import record_call
             record_call(record, app_label=record.app_id if record.app_id in self._known_apps else "other")

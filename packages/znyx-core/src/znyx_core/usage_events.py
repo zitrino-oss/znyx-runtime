@@ -4,9 +4,9 @@ observability and FinOps.
 Metadata only, never text: who called (key, app, agent, end user as a pseudonym), which
 provider and model, tokens as the provider reported them (or an estimate, flagged),
 cost from the price table, timings, what the guardrails decided, which techniques ran,
-and where the call sits in a trace. One flat record with scalar fields (plus two small
-lists and one small map), so it fits a row store with rollups now and a columnar store
-later without reshaping.
+where the call sits in a trace, and what the optimisation layer saved (the ledger). One
+flat record with scalar fields (plus small lists and one small map), so it fits a row
+store with rollups now and a columnar store later without reshaping.
 
 The runtime builds events with ``build``; the control plane accepts them with
 ``validate``, which never trusts the sender: it keeps only known fields, coerces types,
@@ -62,6 +62,12 @@ FIELDS: Dict[str, str] = {
     "ttft_ms": "int",
     "guard_ms": "int",
     "techniques": "countmap",       # technique -> how many times it acted
+    # The optimisation ledger (Phase 4). saved_usd may be negative (a cache written and
+    # never read); baseline_cost_usd is what the call would have cost unoptimised.
+    "profile": "str",
+    "saved_usd": "sfloat",
+    "baseline_cost_usd": "float",
+    "optimisations": "effects",     # [{technique, stage, saved_input_tokens, saved_usd, ...}]
 }
 
 MAX_STR = 200
@@ -74,6 +80,11 @@ _CAPS = {"input_tokens": 10_000_000, "output_tokens": 10_000_000, "cached_input_
          "ttft_ms": 86_400_000, "guard_ms": 86_400_000, "status": 999}
 MAX_COST_USD = 100_000.0
 MAX_COUNT = 1_000_000
+MAX_EFFECTS = 20
+MAX_PROFILE = 40
+_TECHNIQUE_ID = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_EFFECT_FIELDS = ("technique", "stage", "saved_input_tokens", "saved_usd", "latency_ms", "verified",
+                  "estimated")
 # Characters a database text column refuses (NUL) or that cannot be encoded (lone surrogates).
 _UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
 OUTCOMES = ("ok", "blocked_input", "blocked_output", "denied", "error")
@@ -148,6 +159,12 @@ def _coerce(kind: str, value: Any, cap: int = 2 ** 53):
         except (TypeError, ValueError, OverflowError):
             return None
         return number if math.isfinite(number) and 0 <= number <= MAX_COST_USD else None
+    if kind == "sfloat":
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) and abs(number) <= MAX_COST_USD else None
     if kind == "bool":
         return value is True
     if kind == "time":
@@ -169,7 +186,41 @@ def _coerce(kind: str, value: Any, cap: int = 2 ** 53):
             if number is not None:
                 out[clean_str(k)] = number
         return out
+    if kind == "effects":
+        return _effects(value)
     return None
+
+
+def _effects(value: Any) -> Optional[List[Dict[str, Any]]]:
+    """The ledger entries: one per technique (a repeat is dropped), known fields only,
+    numbers bounded."""
+    if not isinstance(value, list):
+        return None
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in value[:MAX_EFFECTS]:
+        if not isinstance(item, dict):
+            continue
+        technique = item.get("technique")
+        if not isinstance(technique, str) or not _TECHNIQUE_ID.fullmatch(technique) or technique in seen:
+            continue
+        seen.add(technique)
+        entry: Dict[str, Any] = {
+            "technique": technique,
+            "stage": item.get("stage") if item.get("stage") in ("A", "B", "C") else "",
+            "saved_input_tokens": _coerce("int", item.get("saved_input_tokens"), 10_000_000) or 0,
+            "estimated": item.get("estimated") is True,
+        }
+        saved = _coerce("sfloat", item.get("saved_usd"))
+        if saved is not None:
+            entry["saved_usd"] = saved
+        latency = item.get("latency_ms")
+        if isinstance(latency, (int, float)) and not isinstance(latency, bool) and math.isfinite(latency):
+            entry["latency_ms"] = int(max(-86_400_000, min(int(latency), 86_400_000)))
+        if item.get("verified") in ("pass", "fail"):
+            entry["verified"] = item["verified"]
+        out.append(entry)
+    return out
 
 
 def validate(event: Any) -> Optional[Dict[str, Any]]:
@@ -187,7 +238,35 @@ def validate(event: Any) -> Optional[Dict[str, Any]]:
         return None
     if out.get("outcome") not in OUTCOMES:
         out["outcome"] = "error" if out.get("status", 0) >= 400 else "ok"
+    if "profile" in out:
+        out["profile"] = out["profile"][:MAX_PROFILE]
+    _settle_ledger(out)
     return out
+
+
+def _settle_ledger(out: Dict[str, Any]) -> None:
+    """Make the ledger agree with itself whatever the sender wrote: the call's saving is
+    the sum of its techniques', and its baseline is its cost plus that saving."""
+    effects = out.get("optimisations")
+    if not effects:
+        out.pop("optimisations", None)
+        out.pop("saved_usd", None)
+        out.pop("baseline_cost_usd", None)
+        return
+    savings = [e["saved_usd"] for e in effects if "saved_usd" in e]
+    if savings:
+        total = round(sum(savings), 8)
+        cost = out.get("cost_usd")
+        # A call cannot have cost less than nothing without optimisation: a loss is at most
+        # the call's own cost, so baseline = cost + saved always holds and is never negative.
+        floor = -cost if cost is not None else -MAX_COST_USD
+        out["saved_usd"] = max(floor, min(total, MAX_COST_USD - (cost or 0.0)))
+    else:
+        out.pop("saved_usd", None)
+    if out.get("cost_usd") is not None and "saved_usd" in out:
+        out["baseline_cost_usd"] = round(out["cost_usd"] + out["saved_usd"], 8)
+    else:
+        out.pop("baseline_cost_usd", None)
 
 
 def total_tokens(event: Dict[str, Any]) -> int:

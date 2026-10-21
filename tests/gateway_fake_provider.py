@@ -24,6 +24,7 @@ received: List[Dict[str, Any]] = []
 scripted = None
 STREAM_PIECE = 7          # characters per streamed delta
 STREAM_DELAY = 0.0
+RESPONSE_DELAY = 0.0      # seconds before a non-streamed answer (calls in flight together)
 
 
 def _last_user_text(body: Dict[str, Any]) -> str:
@@ -79,6 +80,8 @@ def build_app() -> FastAPI:
         received.append({"api": "azure" if deployment else "openai", "body": body,
                          "headers": dict(request.headers), "deployment": deployment,
                          "query": dict(request.query_params)})
+        if RESPONSE_DELAY and not body.get("stream"):
+            await asyncio.sleep(RESPONSE_DELAY)
         if scripted is not None:
             return _scripted(body)
         kind, value = _script(body)
@@ -138,6 +141,8 @@ def build_app() -> FastAPI:
     async def messages(request: Request):
         body = await request.json()
         received.append({"api": "anthropic", "body": body, "headers": dict(request.headers)})
+        if RESPONSE_DELAY and not body.get("stream"):
+            await asyncio.sleep(RESPONSE_DELAY)
         if scripted is not None:
             return _scripted(body)
         kind, value = _script(body)
@@ -199,6 +204,7 @@ def build_app() -> FastAPI:
 
 
 def reset() -> None:
-    global scripted
+    global scripted, RESPONSE_DELAY
     received.clear()
     scripted = None
+    RESPONSE_DELAY = 0.0

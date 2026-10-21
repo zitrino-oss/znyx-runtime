@@ -289,6 +289,39 @@ Air-gapped, an endpoint outside the network is refused. Prometheus labels on gat
 metrics stay bounded: models the provider reported serving, configured provider names, and
 the apps of configured keys (others count as `other`).
 
+### Optimisation
+
+A key may have a `profile` (`balanced`, `cost`, `accuracy`, `latency` or `security`) and may
+switch techniques on or off by name. A key without a profile runs only the techniques that are
+on by default, plus those it names; a profile adds its own once they are released. The
+parallel input check is never switched on by a profile (the provider would receive the request
+before the checks finish), only by naming it:
+
+```yaml
+keys:
+  - id: support-bot
+    key_sha256: 9f2c...
+    profile: cost
+    optimisation: {enable: [exact_cache], disable: [coalesce]}
+```
+
+Four techniques are on in every profile because they never change what an answer says:
+prompt-cache markers for Anthropic once a prefix repeats (and `prompt_cache_key` on OpenAI's
+own API), sharing one upstream call between identical deterministic requests in flight
+together (temperature 0, one choice, not streamed), sending a large text repeated within a
+request only once, and sending JSON without its whitespace. More techniques arrive in later
+releases; the ids of all of them are in `znyx_core.optimisation`, and ids this runtime does
+not have yet are ignored.
+
+Optimisation never weakens a check. Techniques that change the request run before the input
+guard, so it reads exactly what is sent; cache markers change no text; a shared answer is
+checked again for every caller. Send `X-Znyx-Optimise: off` to switch optimisation off for
+one call. Each call's usage event records its profile, what every technique saved (from the
+provider's own figures where it reports them, flagged as an estimate otherwise) and what the
+call would have cost without them. Savings counted by the gateway use about four characters
+per token; with `ZNYX_TOKENIZER=tiktoken` and the optional `tiktoken` package (its encoding
+files present, `TIKTOKEN_CACHE_DIR` on an air-gapped host) OpenAI text is counted exactly.
+
 ## Secure by default
 
 - **Auth on by default.** The evaluate endpoints require an API key. In
