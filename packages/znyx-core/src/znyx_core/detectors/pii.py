@@ -73,6 +73,16 @@ def _au_acn_check(number: str) -> bool:
     return check == int(digits[8])
 
 
+def pii_token(pii_type: str, value: str, key: str) -> str:
+    """The placeholder that stands for ``value`` under the "token" strategy: a keyed hash,
+    so it is the same for the same value and cannot be guessed without the key."""
+    import hashlib
+    import hmac
+    digest = hmac.new(key.encode("utf-8"), f"{pii_type}\x1f{value}".encode("utf-8", "surrogatepass"),
+                      hashlib.sha256).hexdigest()[:8]
+    return f"[[{pii_type}_{digest}]]"
+
+
 class PIIDetector:
     """Detects PII (Personally Identifiable Information) in text"""
 
@@ -621,7 +631,10 @@ class PIIDetector:
                 - action: "REDACT"/"TRANSFORM", "BLOCK" or "ALLOW"
                           (default: "REDACT") - default action
                 - enabled: bool (default: True)
-                - redaction_strategy: "full" or "partial" (default: "full")
+                - redaction_strategy: "full", "partial" or "token" (default: "full"); "token"
+                  replaces each value by a placeholder such as ``[[EMAIL_3f2a9c1d]]``, the
+                  same for the same value, derived with ``token_key`` (``pii_token``), so a
+                  caller holding the original text can put the values back
                 - skip_private_ips: bool (default: True)
                 - types: dict of per-type configurations (optional)
                     Each type can have:
@@ -632,6 +645,7 @@ class PIIDetector:
         self.default_action = self._normalize_action(config.get('action', 'REDACT'))
         self.enabled = config.get('enabled', True)
         self.redaction_strategy = config.get('redaction_strategy', 'full')
+        self.token_key = str(config.get('token_key') or '')
         self.skip_private_ips = config.get('skip_private_ips', True)
         # When luhn_strict=False, skip Luhn validation for synthetic/test card numbers
         self.luhn_strict = config.get('luhn_strict', True)
@@ -1288,6 +1302,8 @@ class PIIDetector:
         Returns:
             Redacted replacement string
         """
+        if self.redaction_strategy == "token":
+            return pii_token(pii_type, matched_text, self.token_key)
         if self.redaction_strategy == "partial":
             # Partial redaction - show some characters
             if pii_type == "EMAIL":

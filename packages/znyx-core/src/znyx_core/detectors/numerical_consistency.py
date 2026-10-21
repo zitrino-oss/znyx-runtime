@@ -62,20 +62,16 @@ class NumericalConsistencyDetector:
         if not self.enabled or not text:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)
 
-        hits: List[RuleHit] = []
-        for m in _EQN_RE.finditer(text):
-            a, b, c = _to_float(m.group("a")), _to_float(m.group("b")), _to_float(m.group("c"))
-            if a is None or b is None or c is None:
-                continue
-            expected = _apply(a, m.group("op"), b)
-            if expected is None:  # e.g. division by zero — can't verify
-                continue
-            if _mismatch(expected, c):
-                hits.append(RuleHit(
-                    rule_id="numerical_consistency.bad_equation",
-                    message=f"Arithmetic error: '{m.group(0).strip()}' (expected {expected:g})",
-                    severity=Severity.HIGH,
-                ))
+        # Equations and chains of sums, read the way ``engine.claims`` reads them: a chain is
+        # checked as a whole ("1 + 2 + 3 = 7" is wrong, "1 + 2 + 3 = 6" is right), and a
+        # value is accepted within the precision it is written with.
+        from znyx_core.engine.claims import find_wrong_claims
+        hits: List[RuleHit] = [
+            RuleHit(rule_id="numerical_consistency.bad_equation",
+                    message=f"Arithmetic error: '{claim.text.strip()}' (expected {claim.correct})",
+                    severity=Severity.HIGH)
+            for claim in find_wrong_claims(text, limit=20, kinds=("equation", "sum"))
+        ]
 
         if not hits:
             return DetectorResult(decision=Decision.ALLOW, risk_score=0)

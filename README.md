@@ -302,16 +302,46 @@ keys:
   - id: support-bot
     key_sha256: 9f2c...
     profile: cost
-    optimisation: {enable: [exact_cache], disable: [coalesce]}
+    optimisation:
+      enable: [exact_cache, output_caps]
+      disable: [coalesce]
+      settings: {max_output_tokens: 1024, loop_max_calls: 50, cache_ttl_seconds: 300}
 ```
 
 Four techniques are on in every profile because they never change what an answer says:
 prompt-cache markers for Anthropic once a prefix repeats (and `prompt_cache_key` on OpenAI's
 own API), sharing one upstream call between identical deterministic requests in flight
 together (temperature 0, one choice, not streamed), sending a large text repeated within a
-request only once, and sending JSON without its whitespace. More techniques arrive in later
-releases; the ids of all of them are in `znyx_core.optimisation`, and ids this runtime does
-not have yet are ignored.
+request only once, and sending JSON without its whitespace.
+
+The others are switched on by a profile or by name:
+
+- **Cost:** an exact response cache (the same deterministic request within `cache_ttl_seconds`
+  is answered from the stored answer, per key and policy version, checked again on every hit;
+  `Cache-Control: no-cache` skips it); answer caps (`max_output_tokens`) and a stop for a
+  session that keeps calling (`loop_max_calls` or `loop_max_tokens` within
+  `loop_window_seconds`, counted per `X-Znyx-Session-Id`, or per trace the caller names, from
+  the provider's real usage; 429 `agent_loop_stopped`); budget-aware degradation (a tighter cap
+  once a budget is `degrade_at_percent` used).
+- **Accuracy:** answers are checked against the app's output contract (the policy's
+  `output_contract`: a JSON schema and `rules` such as allowed values, ranges and required
+  text), its computable claims (arithmetic, percentages, unit conversions, dates) and the
+  request's documents and tool results; a simple fault is fixed in place, otherwise the model is
+  asked again once, then once on `escalate_to`. OpenAI is asked for schema-constrained output
+  when the app set no format. A call marked `X-Znyx-Stakes: high` can take `vote_samples`
+  answers and return the one most agree with. Every extra call is paid for and shown in the
+  ledger as a negative saving.
+- **Security and latency:** PII the policy redacts on the way in can be sent as placeholders
+  and put back in the answer (an output policy that redacts PII still redacts it); a session
+  whose checks keep finding things (`risk_threshold`) is checked more strictly (lower block
+  thresholds, the whole history read again, buffered streams); the parallel input check, named
+  explicitly, starts the provider call while the input checks run, never where the policy can
+  rewrite input, and releases nothing before they pass.
+
+Batch submission and continuous tuning come with the shadow tests in a later release; the ids
+of all techniques are in `znyx_core.optimisation`, and ids this runtime does not have yet are
+ignored. The request's documents, search results and tool results now reach the policy's own
+groundedness and citation checks on gateway calls too.
 
 Optimisation never weakens a check. Techniques that change the request run before the input
 guard, so it reads exactly what is sent; cache markers change no text; a shared answer is

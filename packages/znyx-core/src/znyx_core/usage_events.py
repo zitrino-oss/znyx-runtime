@@ -254,6 +254,8 @@ def _settle_ledger(out: Dict[str, Any]) -> None:
         out.pop("baseline_cost_usd", None)
         return
     savings = [e["saved_usd"] for e in effects if "saved_usd" in e]
+    if out.get("cost_usd") is None:
+        savings = []                         # a saving is only shown against a known cost
     if savings:
         total = round(sum(savings), 8)
         cost = out.get("cost_usd")

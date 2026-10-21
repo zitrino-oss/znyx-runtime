@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from znyx_core import secret_refs
+from znyx_core.optimisation import clean_settings
 from znyx_runtime.gateway.optimise import PROFILES, KeyOptimisation
 
 logger = logging.getLogger(__name__)
@@ -417,7 +418,10 @@ def _optimisation(raw: Any, where: str) -> KeyOptimisation:
             logger.warning("gateway: %s.%s has entries that are not technique ids; they are ignored",
                            where, name)
         lists[name] = tuple(kept)
-    return KeyOptimisation(**lists)
+    settings, problems = clean_settings(raw.get("settings"))
+    for problem in problems:
+        logger.warning("gateway: %s.settings: %s; ignored", where, problem)
+    return KeyOptimisation(**lists, settings=tuple(sorted(settings.items())))
 
 
 def _settings(raw: Any) -> GatewaySettings:

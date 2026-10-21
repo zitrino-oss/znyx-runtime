@@ -17,7 +17,7 @@ switched on by a profile: the key has to name them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -36,9 +36,9 @@ _CATALOGUE = (
     Technique("coalesce", 2, "A", "Request coalescing", True),
     Technique("dedupe", 3, "A", "Deduplication", True),
     Technique("minify", 4, "A", "Format minification", True),
-    Technique("exact_cache", 5, "B", "Exact response cache"),
-    Technique("output_caps", 6, "B", "Output caps and runaway-loop stop"),
-    Technique("budget_degrade", 7, "B", "Budget-aware degradation"),
+    Technique("exact_cache", 5, "B", "Exact response cache", True),
+    Technique("output_caps", 6, "B", "Output caps and runaway-loop stop", True),
+    Technique("budget_degrade", 7, "B", "Budget-aware degradation", True),
     Technique("batch", 8, "B", "Batch submission"),
     Technique("tool_pruning", 9, "C", "Tool pruning"),
     Technique("semantic_cache", 10, "C", "Semantic cache"),
@@ -46,23 +46,27 @@ _CATALOGUE = (
     Technique("summarise_history", 12, "C", "History summarisation"),
     Technique("compress", 13, "C", "Prompt compression"),
     Technique("right_size", 14, "C", "Model right-sizing"),
-    Technique("structured_output", 15, "B", "Structured output"),
-    Technique("repair", 16, "B", "Validate and repair"),
-    Technique("grounded_retry", 17, "B", "Groundedness retry"),
-    Technique("computed_claims", 18, "B", "Computable claims"),
-    Technique("business_rules", 19, "B", "Business-rule checks"),
+    Technique("structured_output", 15, "B", "Structured output", True),
+    Technique("repair", 16, "B", "Validate and repair", True),
+    Technique("grounded_retry", 17, "B", "Groundedness retry", True),
+    Technique("computed_claims", 18, "B", "Computable claims", True),
+    Technique("business_rules", 19, "B", "Business-rule checks", True),
     Technique("context_order", 20, "C", "Context ordering"),
-    Technique("escalate", 21, "B", "Escalate on failure"),
-    Technique("voting", 22, "B", "Self-consistency voting"),
+    Technique("escalate", 21, "B", "Escalate on failure", True),
+    Technique("voting", 22, "B", "Self-consistency voting", True),
     Technique("tuning", 23, "B", "Continuous tuning"),
-    Technique("pii_tokenise", 30, "B", "PII tokenise and restore"),
+    Technique("pii_tokenise", 30, "B", "PII tokenise and restore", True),
     Technique("mark_untrusted", 31, "C", "Marking untrusted content"),
-    Technique("risk_adaptive", 32, "B", "Risk-adaptive checking"),
-    Technique("parallel_input", 40, "B", "Parallel input check", explicit_only=True,
+    Technique("risk_adaptive", 32, "B", "Risk-adaptive checking", True),
+    Technique("parallel_input", 40, "B", "Parallel input check", True, explicit_only=True,
               caution="The provider receives the request before the input checks finish; the answer is "
                       "held back until they pass and the call is cancelled if they fail."),
 )
 TECHNIQUES: Dict[str, Technique] = {t.id: t for t in _CATALOGUE}
+# What a caller may switch off for one call (``X-Znyx-Optimise: off``): techniques that only
+# save cost. Limits, checks and protections the key's owner set (answer caps, loop stops,
+# degradation, contracts, PII tokenising, risk-adaptive checking) stay on.
+CALLER_MAY_SKIP = frozenset({"prompt_cache", "coalesce", "dedupe", "minify", "exact_cache"})
 STAGE_C = frozenset(t.id for t in _CATALOGUE if t.stage == "C")
 
 
@@ -90,14 +94,66 @@ PROFILES: Dict[str, Profile] = {p.name: p for p in (
 DEFAULT_PROFILE = "balanced"
 
 
+# Per-key settings of stage B techniques (``optimisation.settings``): name -> (type, low, high).
+# For a string the bounds are its length.
+SETTINGS: Dict[str, Tuple[type, int, int]] = {
+    "max_output_tokens": (int, 1, 1_000_000),          # output_caps
+    "loop_max_calls": (int, 1, 1_000_000),             # output_caps: per session or trace
+    "loop_max_tokens": (int, 1, 1_000_000_000),        # output_caps: real tokens per session or trace
+    "loop_window_seconds": (int, 10, 86_400),          # output_caps (default 600)
+    "cache_ttl_seconds": (int, 1, 86_400),             # exact_cache (default 300)
+    "degrade_at_percent": (int, 1, 99),                # budget_degrade (default 80)
+    "degrade_max_output_tokens": (int, 1, 1_000_000),  # budget_degrade
+    "escalate_to": (str, 1, 200),                      # escalate: a model the key may use
+    "vote_samples": (int, 2, 5),                       # voting (default 3)
+    "risk_threshold": (int, 1, 100),                   # risk_adaptive (default 60)
+}
+
+
+def clean_settings(raw: Any) -> Tuple[Dict[str, Any], List[str]]:
+    """The settings that are known and in range, and a description of each one that is
+    not (the control plane refuses those; the runtime ignores them)."""
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, Mapping):
+        return {}, ["settings must be a mapping"]
+    out: Dict[str, Any] = {}
+    problems: List[str] = []
+    for name, value in raw.items():
+        spec = SETTINGS.get(name)
+        if spec is None:
+            problems.append(f"unknown setting {name!r}")
+            continue
+        kind, low, high = spec
+        if kind is int:
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                problems.append(f"{name} must be a whole number from {low} to {high}")
+                continue
+        elif not isinstance(value, str) or not low <= len(value.strip()) <= high:
+            problems.append(f"{name} must be text of {low} to {high} characters")
+            continue
+        else:
+            value = value.strip()
+        out[name] = value
+    return out, problems
+
+
 @dataclass(frozen=True)
 class KeyOptimisation:
     """A key's own choices on top of its profile (``optimisation:`` in its config).
     ``disable`` always wins; stage C also needs ``approved`` (a reviewed shadow test).
-    Ids this runtime does not know are ignored (they may come from a newer console)."""
+    Ids this runtime does not know are ignored (they may come from a newer console).
+    ``settings``: the stage B settings (``SETTINGS``), as sorted pairs."""
     enable: Tuple[str, ...] = ()
     disable: Tuple[str, ...] = ()
     approved: Tuple[str, ...] = ()
+    settings: Tuple[Tuple[str, Any], ...] = ()
+
+    def setting(self, name: str, default: Optional[Any] = None) -> Any:
+        for key, value in self.settings:
+            if key == name:
+                return value
+        return default
 
 
 def active_techniques(profile: str, opts: KeyOptimisation, chosen: bool = True) -> List[str]:
@@ -126,6 +182,11 @@ def catalogue() -> List[Dict[str, object]]:
     """The techniques as plain data (for an API or a console)."""
     return [{"id": t.id, "number": t.number, "stage": t.stage, "title": t.title, "built": t.built,
              "explicit_only": t.explicit_only, "caution": t.caution} for t in _CATALOGUE]
+
+
+def settings_spec() -> List[Dict[str, object]]:
+    return [{"name": name, "type": kind.__name__, "min": low, "max": high}
+            for name, (kind, low, high) in SETTINGS.items()]
 
 
 def profiles() -> List[Dict[str, object]]:

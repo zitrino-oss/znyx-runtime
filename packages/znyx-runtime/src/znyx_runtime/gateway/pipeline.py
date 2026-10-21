@@ -538,6 +538,104 @@ class Gateway:
             raise Denied(503, "Limits cannot be checked right now (fail-closed)", "limits_unavailable",
                          outcome="error", error_type="api_error", retry_after=1) from None
 
+    @staticmethod
+    def _session_of(request: Request, record: CallRecord) -> Optional[str]:
+        """What a runaway-loop allowance is counted for: the session the caller names, else a
+        trace it names (a call that starts its own trace is a session of one)."""
+        session = (request.headers.get("x-znyx-session-id") or "").strip()
+        if session:
+            return "s:" + session[:128]
+        if request.headers.get("traceparent") or request.headers.get("x-znyx-trace-id"):
+            return "t:" + record.trace_id
+        return None
+
+    def _check_loop(self, key: GatewayKey, plan) -> None:
+        """Technique 6: a session that has used its allowance of calls or tokens within the
+        window is stopped before anything is checked or sent."""
+        limits = plan.loop_limits()
+        if not limits:
+            return
+        from znyx_core.state_store import StateUnavailable, get_state_store
+        from znyx_runtime.gateway.optimise.stage_b import loop_key
+        max_calls, max_tokens, window = limits
+        try:
+            used = get_state_store().get(loop_key(self._caller_id(key), plan.session))
+        except StateUnavailable:
+            raise Denied(503, "Limits cannot be checked right now (fail-closed)", "limits_unavailable",
+                         outcome="error", error_type="api_error", retry_after=1) from None
+        over = ((max_calls and used.get("calls", 0) >= max_calls)
+                or (max_tokens and used.get("tokens", 0) >= max_tokens))
+        if over:
+            plan.effect("output_caps")
+            what = f"{max_calls} calls" if max_calls and used.get("calls", 0) >= max_calls else f"{max_tokens} tokens"
+            raise Denied(429, f"This session reached its allowance of {what} within {window} seconds and was "
+                              "stopped; start a new session or wait", "agent_loop_stopped",
+                         error_type="rate_limit_error", retry_after=min(window, 60))
+
+    def _count_loop(self, key: GatewayKey, record: CallRecord, tokens: int) -> None:
+        plan = record.plan
+        limits = plan.loop_limits() if plan is not None else None
+        if not limits:
+            return
+        try:
+            from znyx_core.state_store import get_state_store
+            from znyx_runtime.gateway.optimise.stage_b import loop_key
+            get_state_store().incr(loop_key(self._caller_id(key), plan.session), {"calls": 1, "tokens": tokens},
+                                   ttl_seconds=limits[2])
+        except Exception:  # noqa: BLE001 - the call already happened; never fail its response
+            logger.warning("gateway: could not count the session's usage for key %s", key.id)
+
+    def _count_risk(self, record: CallRecord) -> None:
+        plan = record.plan
+        if not plan.on("risk_adaptive") or not plan.session:
+            return
+        from znyx_runtime.gateway.optimise import stage_b
+        points = stage_b.risk_points(record)
+        if not points:
+            return
+        try:
+            from znyx_core.state_store import get_state_store
+            get_state_store().incr(stage_b.risk_key(plan.caller, plan.session), {"score": points},
+                                   ttl_seconds=stage_b.RISK_TTL_SECONDS)
+        except Exception:  # noqa: BLE001 - recording must never fail a call
+            logger.warning("gateway: could not record the session's risk for key %s", record.key_id)
+
+    def _near_budget(self, key: GatewayKey, member, plan) -> bool:
+        """Technique 7: whether one of the key's budgets is nearly used: its daily limits on
+        this runtime, or a console budget in its scope (``controls.spend_near``)."""
+        from znyx_runtime.gateway.optimise.stage_b import DEFAULT_DEGRADE_AT_PERCENT
+        share = (plan.opts.setting("degrade_at_percent") or DEFAULT_DEGRADE_AT_PERCENT) / 100.0
+        limits = key.limits
+        if (limits.tokens_per_day or limits.spend_usd_per_day) and not key.instance_key:
+            try:
+                from znyx_core.state_store import get_state_store
+                used = get_state_store().get(self._day_key(key))
+            except Exception:  # noqa: BLE001 - the limits themselves were checked on the way in
+                used = {}
+            if limits.tokens_per_day and used.get("tokens", 0) >= limits.tokens_per_day * share:
+                return True
+            if limits.spend_usd_per_day and used.get("cost", 0) >= limits.spend_usd_per_day * share:
+                return True
+        controls = getattr(self.bundle_manager, "controls", None) or {}
+        project = member.project_id if member is not None else ""
+        environment = member.environment_id if member is not None else ""
+        now = datetime.now(timezone.utc)
+        wanted = int(share * 100) // 10 * 10           # the key's own percentage, in the bands sent
+        for entry in (controls.get("spend_near") or []) if isinstance(controls, dict) else []:
+            if not isinstance(entry, dict) or not self._in_scope(entry, key, project, environment):
+                continue
+            band = entry.get("band")
+            if isinstance(band, (int, float)) and not isinstance(band, bool) and band < wanted:
+                continue                                 # used, but not yet as far as this key wants
+            try:
+                until = datetime.fromisoformat(str(entry.get("until")).replace("Z", "+00:00"))
+                if (until if until.tzinfo else until.replace(tzinfo=timezone.utc)) <= now:
+                    continue
+            except ValueError:
+                pass
+            return True
+        return False
+
     @classmethod
     def _day_key(cls, key: GatewayKey) -> str:
         # "pin:": never evicted from the in-memory store by other traffic.
@@ -545,6 +643,7 @@ class Gateway:
 
     def _charge(self, key: GatewayKey, record: CallRecord) -> None:
         tokens = (record.input_tokens or 0) + (record.output_tokens or 0)
+        self._count_loop(key, record, tokens)
         if not (key.limits.tokens_per_day or key.limits.spend_usd_per_day) or key.instance_key:
             return
         try:
@@ -790,6 +889,24 @@ class Gateway:
         return verdict.merge(await self._check_one(probe, kind, role, tool_name, stage, scope, record,
                                                    quiet, label + "n", context))
 
+    def _normalise(self, fmt, body: Dict[str, Any], record: Optional[CallRecord],
+                   parts: Optional[List[fmts.Part]] = None) -> None:
+        """Remove invisible characters from the texts the input guard reads (technique 25),
+        before they are checked and sent."""
+        if not self.config.settings.normalise_before_send:
+            return
+        if parts is None:
+            parts = [p for p in fmt.input_parts(body, self.config.settings.check_roles) if p.kind != "opaque"]
+        for part in parts:
+            if part.kind == "history_tool_call" and fmt is fmts.AnthropicMessages:
+                continue                       # an object, not a string; its copy is checked
+            cleaned, removed = strip_invisible(part.text)
+            if removed:
+                if record is not None:
+                    record.note("invisible_removed", removed)
+                fmt.set_text(body, part, cleaned)
+                part.text = cleaned
+
     async def _guard_input(self, api: str, fmt, body: Dict[str, Any], scope: Dict[str, str],
                            policy: Dict[str, Any], record: CallRecord) -> None:
         settings = self.config.settings
@@ -805,15 +922,7 @@ class Gateway:
         parts = [p for p in parts if p.kind != "opaque"]
         if not parts:
             return
-        if settings.normalise_before_send:
-            for part in parts:
-                if part.kind == "history_tool_call" and fmt is fmts.AnthropicMessages:
-                    continue                       # an object, not a string; its copy is checked
-                cleaned, removed = strip_invisible(part.text)
-                if removed:
-                    record.note("invisible_removed", removed)
-                    fmt.set_text(body, part, cleaned)
-                    part.text = cleaned
+        self._normalise(fmt, body, record, parts)
         units = _units(parts)
         # The user text this call adds: user messages after the last assistant turn.
         # Its last unit is always checked, with the full policy (stateful checks count
@@ -829,11 +938,13 @@ class Gateway:
         scope_key = (scope["tenant_id"], scope["app_id"], scope["agent_id"], version)
         quiet = quiet_policy(policy)
         gate = asyncio.Semaphore(settings.max_parallel_checks)
+        # A session checked more strictly (technique 32) has its whole history read again.
+        recheck = bool(getattr(record.plan, "elevated", False))
 
         async def check(n: int, unit: _Unit) -> Optional[_Verdict]:
             text = unit.text
             cache_key = self.verdicts.key(scope_key, "input:" + unit.first.kind, text)
-            if unit is not charged and self.verdicts.seen(cache_key):
+            if unit is not charged and not recheck and self.verdicts.seen(cache_key):
                 record.note("checks_skipped_seen")
                 return None
             async with gate:
@@ -988,19 +1099,83 @@ class Gateway:
         self._filter_tools(api, body, policy, record)
         plan = record.plan = self.optimiser.plan(key, api, provider, body, request.headers,
                                                  self._caller_id(key), record.model)
+        plan.session = self._session_of(request, record)
+        self._check_loop(key, plan)
+        if plan.wants_contract():
+            from znyx_runtime.gateway.optimise.verify import contract_of
+            plan.contract = contract_of(policy)
+        if isinstance(policy.get("hallucination"), dict):
+            plan.grounding_config = policy["hallucination"]
+        from znyx_runtime.gateway.optimise import stage_b
+        policy = self._adapt_to_risk(key, plan, policy, record)
         # Request-side techniques first: the input guard reads the request as it is sent.
         plan.before_guard(fmt, body, record, self.config.settings.check_roles)
-        await self._guard_input(api, fmt, body, scope, policy, record)
+        input_policy = self._tokenising(fmt, body, plan, policy, record)
+        send = dict(fmt=fmt, provider=provider, key=key, member=member, scope=scope, policy=policy, record=record,
+                    request=request, client_credential=client_credential, deployment=deployment,
+                    api_version=api_version)
+        if (plan.on("parallel_input") and not fmt.is_stream(body)
+                and not stage_b.input_may_be_rewritten(policy)):
+            # Technique 40: send while the input checks run. The policy cannot rewrite the
+            # input, so what is sent is what the checks read; it is used only if they pass and
+            # left the text exactly as sent, and cancelled otherwise. Nothing is released
+            # before the output guard.
+            early_body = fmts.deep_copy(body)
+            self._normalise(fmt, early_body, None)
+            expected = self._sent_texts(fmt, early_body)
+            context, url, headers = await self._prepare_send(body=early_body, **send)
+            early = asyncio.ensure_future(self.upstream.send(provider, url, headers, early_body))
+            try:
+                await self._guard_input(api, fmt, body, scope, input_policy, record)
+            except BaseException:
+                early.cancel()
+                self._bill_early(fmt, key, plan, record, early, apart=False)    # blocked: still paid
+                raise
+            if self._sent_texts(fmt, body) == expected:
+                record.note("parallel_input")
+                plan.effect("parallel_input").latency_ms = -record.guard_ms
+                return await self._forward(request, fmt, provider, url, headers, early_body, key, scope, policy,
+                                           record, context, early=early)
+            early.cancel()
+            record.note("parallel_input_discarded")
+            self._bill_early(fmt, key, plan, record, early, apart=True)
+        else:
+            await self._guard_input(api, fmt, body, scope, input_policy, record)
+        context, url, headers = await self._prepare_send(body=body, **send)
+        if record.stream:
+            from znyx_runtime.gateway.streaming import stream_call
+            return await stream_call(self, request, api, fmt, provider, url, headers, body,
+                                     key, scope, policy, record, context, release)
+        return await self._forward(request, fmt, provider, url, headers, body, key, scope, policy,
+                                   record, context)
+
+    async def _prepare_send(self, *, fmt, provider: Provider, body: Dict[str, Any], key: GatewayKey, member,
+                            scope: Dict[str, str], policy: Dict[str, Any], record: CallRecord, request: Request,
+                            client_credential: Optional[str], deployment: Optional[str],
+                            api_version: Optional[str]) -> Tuple[Dict[str, Any], str, Dict[str, str]]:
+        """Everything after the input guard that makes the request ready to send: the
+        canary, the context the output checks read, caps and cache markers, the egress gate
+        (audited) and the provider's credential and URL."""
+        plan = record.plan
         if self.config.settings.canary_marker:
             fmt.add_system_text(body, self.canary())
             record.note("canary")
         context = {"hidden_context": fmt.hidden_context(body)}
         if isinstance(body.get("tools"), list):
             context["tools"] = body["tools"]
+        # The request's documents, search results and tool results: what the answer may rest
+        # on, for the policy's groundedness and citation checks (in memory, never recorded).
+        from znyx_runtime.gateway.optimise.verify import grounding_sources
+        plan.sources = grounding_sources(fmt, body)
+        if plan.sources:
+            context["grounding_sources"] = plan.sources
+            context["source_context"] = "\n\n".join(s["text"] for s in plan.sources)
         sent = fmt.input_parts(body, _ALL_ROLES)
         record.estimated_input_tokens = (
             estimate_tokens(sum(len(p.text) for p in sent if p.kind != "opaque"))
             + OPAQUE_PART_TOKENS * sum(1 for p in sent if p.kind == "opaque"))
+        if plan.on("budget_degrade"):
+            plan.near_budget = self._near_budget(key, member, plan)
         plan.before_send(fmt, provider, body, record, self.optimiser.seen, self._caller_id(key))
         await self._permit_egress(provider, policy, len(json.dumps(body)), scope, record)
 
@@ -1015,29 +1190,117 @@ class Gateway:
         url = self.upstream.url(provider, deployment=deployment, api_version=api_version)
         headers = self.upstream.headers(provider, request.headers, credential)
         record.stream = fmt.is_stream(body)
-        if record.stream:
-            from znyx_runtime.gateway.streaming import stream_call
-            return await stream_call(self, request, api, fmt, provider, url, headers, body,
-                                     key, scope, policy, record, context, release)
-        return await self._forward(request, fmt, provider, url, headers, body, key, scope, policy,
-                                   record, context)
+        return context, url, headers
+
+    def _bill_early(self, fmt, key: GatewayKey, plan, record: CallRecord, early, apart: bool) -> None:
+        """The early call of the parallel input check, not used (blocked, or the checks
+        changed the text): the provider may have billed it, so it is charged, from its own
+        usage when it had answered, else as an estimate. ``apart``: as an extra call next to
+        the one sent instead; otherwise as this (blocked) call's own usage."""
+        usage, estimated = None, False
+        if early.done() and not early.cancelled() and early.exception() is None:
+            response = early.result()
+            if response.status_code != 200:
+                return                                   # a provider error is not billed
+            try:
+                usage = fmt.usage(fmts.parse_response(response.content))
+            except (ValueError, RecursionError):
+                usage = None
+        if usage is None or usage.input_tokens is None:
+            usage, estimated = fmts.Usage(record.estimated_input_tokens, 0), True
+        if apart:
+            self._extra_call(plan, record, "parallel_input", None, usage, estimated=estimated)
+            return
+        self._apply_usage(record, usage)
+        if estimated:
+            record.usage_estimated = True
+            record.note("usage_estimated")
+        self._charge(key, record)
+
+    def _tokenising(self, fmt, body: Dict[str, Any], plan, policy: Dict[str, Any],
+                    record: CallRecord) -> Dict[str, Any]:
+        """Technique 30: the policy the input guard uses. The guard still reads the original
+        text with every check; only the PII check's redaction writes placeholders whose values
+        this call keeps, to put back in the answer."""
+        from znyx_runtime.gateway.optimise import stage_b
+        if not plan.on("pii_tokenise") or fmt.is_stream(body) or not stage_b.pii_applies_to_input(policy.get("pii")):
+            return policy
+        self._normalise(fmt, body, record)       # the values as the guard will read them
+        token_key = self._pii_token_key()
+        plan.vault = stage_b.build_vault(fmt, body, self.config.settings.check_roles, policy["pii"], token_key)
+        if not len(plan.vault):
+            return policy
+        record.note("pii_tokenise", len(plan.vault))
+        plan.effect("pii_tokenise")
+        return stage_b.tokenising_policy(policy, token_key)
+
+    def _pii_token_key(self) -> str:
+        """The key placeholders are derived with: the same on every worker of an install
+        (from the end-user pseudonym key), so the same value gets the same placeholder."""
+        key = getattr(self, "_token_key_cache", None)
+        if key is None:
+            import hmac
+            from znyx_runtime.install_state import user_id_key
+            key = self._token_key_cache = hmac.new(user_id_key(), b"znyx-pii-token", hashlib.sha256).hexdigest()
+        return key
+
+    @staticmethod
+    def _sent_texts(fmt, body: Dict[str, Any]) -> List[Tuple[Any, str]]:
+        return [(p.path, p.text) for p in fmt.input_parts(body, _ALL_ROLES)]
+
+    def _adapt_to_risk(self, key: GatewayKey, plan, policy: Dict[str, Any], record: CallRecord) -> Dict[str, Any]:
+        """Technique 32: a session whose risk climbed past the key's threshold is checked
+        more strictly (never less: ``stage_b.stricter`` only tightens)."""
+        if not plan.on("risk_adaptive") or not plan.session:
+            return policy
+        from znyx_runtime.gateway.optimise import stage_b
+        try:
+            from znyx_core.state_store import get_state_store
+            score = get_state_store().get(stage_b.risk_key(self._caller_id(key), plan.session)).get("score", 0)
+        except Exception:  # noqa: BLE001 - unknown risk: the checks stay as the policy sets them
+            return policy
+        threshold = plan.opts.setting("risk_threshold") or stage_b.DEFAULT_RISK_THRESHOLD
+        if score < threshold:
+            return policy
+        plan.elevated = True
+        record.note("risk_elevated")
+        plan.effect("risk_adaptive")
+        return stage_b.stricter(policy)
 
     async def _forward(self, request: Request, fmt, provider: Provider, url: str,
                        headers: Dict[str, str], body: Dict[str, Any], key: GatewayKey,
                        scope: Dict[str, str], policy: Dict[str, Any], record: CallRecord,
-                       context: Optional[Dict[str, Any]] = None) -> Response:
+                       context: Optional[Dict[str, Any]] = None, early=None) -> Response:
         t_up = time.perf_counter()
         plan = record.plan
         upstream = self.upstream
-        shared_key = None
-        if plan is not None and plan.coalescing_allowed(body):
+        shared_key = cache_key = None
+        votes = plan.vote_count(body, request.headers) if plan is not None and early is None else 0
+        if (not votes and early is None and plan is not None
+                and (plan.coalescing_allowed(body) or plan.caching_allowed(body))):
             # Hashing a large body takes a while: off the event loop.
-            shared_key = await asyncio.to_thread(self.optimiser.coalescer.key, self._caller_id(key), url,
-                                                 headers, body)
+            base = await asyncio.to_thread(self.optimiser.coalescer.key, self._caller_id(key), url, headers, body)
+            shared_key = base if plan.coalescing_allowed(body) else None
+            if plan.caching_allowed(body):
+                # Technique 29: a stored answer is never served under another policy version.
+                cache_key = hashlib.sha256(f"{base}|{policy.get('policy_version') or ''}".encode()).hexdigest()
+                fresh = "no-cache" in (request.headers.get("cache-control") or "").lower()
+                hit = None if fresh else self.optimiser.cache.get(cache_key, plan.cache_ttl())
+                if hit is not None:
+                    return await self._answer_from_cache(fmt, key, scope, policy, record, context, hit)
         # Technique 2: an identical deterministic call of this key already in flight is
         # joined instead of sent again. The provider bills it once: one caller pays.
-        flight, leader = self.optimiser.coalescer.join(
-            shared_key, lambda: upstream.send(provider, url, headers, body))
+        if early is not None:
+            def start():
+                return early                       # already on its way (parallel input check)
+        elif votes:
+            def start():
+                return self._vote(fmt, upstream, provider, url, headers, body, votes, plan, record,
+                                  policy=policy, scope=scope)
+        else:
+            def start():
+                return upstream.send(provider, url, headers, body)
+        flight, leader = self.optimiser.coalescer.join(shared_key, start)
         # Stop waiting if the client goes away; the provider call is cancelled when no
         # one else waits for it (it would be paid for nothing).
         try:
@@ -1050,6 +1313,10 @@ class Gateway:
                         # The provider may bill for a call it had already started. While
                         # others still wait, the one that receives the answer pays.
                         self.estimate_missing_usage(record, 0)
+                        for _ in range(max(0, votes - 1)):          # the other answers of a vote
+                            self._extra_call(plan, record, "voting", None,
+                                             fmts.Usage(record.estimated_input_tokens, 0), estimated=True)
+                        self._add_extra_calls(record, plan)
                     self._charge(key, record)
                     self._record(record)
                     return Response(status_code=499)
@@ -1094,11 +1361,23 @@ class Gateway:
             self._apply_usage(record, usage)
         else:
             self._coalesced(record, plan, usage, flight)
+        stored = response.content
         try:
+            if pays and plan is not None and plan.verifies():
+                payload = await self._verify(fmt, provider, url, headers, body, payload, plan, record, key,
+                                             scope, policy)
+                if plan.answer_changed:
+                    stored = json.dumps(payload).encode()     # the answer that passed, before the guard
+            if pays and plan is not None:
+                self._add_extra_calls(record, plan)
+            self._restore_pii(fmt, payload, plan, record)
+            await self._enforce_contract(fmt, payload, policy, record)
             await self._guard_output(fmt, payload, scope, policy, record, context)
         except BaseException:
             # The answer was paid for even if it cannot be checked now (and is not sent).
             if pays:
+                if plan is not None:
+                    self._add_extra_calls(record, plan)
                 self.estimate_missing_usage(record, 0)
             self._charge(key, record)
             raise
@@ -1106,6 +1385,296 @@ class Gateway:
             self.estimate_missing_usage(record, sum(len(p.text) for p in fmt.output_parts(payload)))
         self._charge(key, record)
         record.status = 200
+        returned["x-znyx-decision"] = _worst(record.input_decision, record.output_decision)
+        if plan is not None and plan.escalated_from:
+            returned["x-znyx-escalated-from"] = plan.escalated_from
+        if (cache_key is not None and record.outcome == "ok" and record.output_decision in ("ALLOW", "WARN")
+                and not record.techniques.get("output_rewritten")
+                and "no-store" not in (request.headers.get("cache-control") or "").lower()):
+            # Stored before the output guard: every later hit is checked again.
+            self.optimiser.cache.put(cache_key, stored, self.upstream.returned_headers(response),
+                                     flight.upstream_ms)
+        self._record(record)
+        return JSONResponse(payload, status_code=200, headers=returned)
+
+    # -- verification and voting (stage B) -------------------------------------------
+
+    _RETRY_OWNER = {"structured_output": "repair", "business_rules": "business_rules",
+                    "computed_claims": "computed_claims", "grounded_retry": "grounded_retry"}
+
+    async def _faults(self, fmt, text: str, plan, scope: Dict[str, str], record: CallRecord,
+                      policy: Dict[str, Any]):
+        from znyx_runtime.gateway.optimise import verify
+        faults = verify.Faults()
+        contract = plan.contract
+        # Parsing and scanning a long answer is CPU work: off the event loop.
+        if contract is not None and (plan.on("structured_output") or plan.on("repair")):
+            faults.add("structured_output", await asyncio.to_thread(verify.check_contract, text, contract))
+        if contract is not None and contract.rules and plan.on("business_rules"):
+            faults.add("business_rules", await asyncio.to_thread(verify.check_rules, text, contract.rules))
+        if plan.on("computed_claims"):
+            faults.add("computed_claims", await asyncio.to_thread(verify.check_claims, text))
+        if plan.on("grounded_retry") and plan.sources:
+            nli = None
+            config = plan.grounding_config or {}
+            if isinstance(config.get("nli"), dict) and config["nli"].get("enabled"):
+                from znyx_core.engine.quality.nli_client import nli_scorer_from_config
+                nli = nli_scorer_from_config(config, runtime_policy=policy.get("runtime_policy"), policy=policy,
+                                             egress_sink=self.egress_sink,
+                                             request=self._request(scope, record, "ground", text, "assistant"))
+            # NLI calls out and token overlap is CPU work: off the event loop.
+            faults.add("grounded_retry", await asyncio.to_thread(verify.check_grounded, text, plan.sources,
+                                                                 config, nli))
+        return faults
+
+    async def _verify(self, fmt, provider: Provider, url: str, headers: Dict[str, str], body: Dict[str, Any],
+                      payload: Dict[str, Any], plan, record: CallRecord, key: GatewayKey,
+                      scope: Dict[str, str], policy: Dict[str, Any]) -> Dict[str, Any]:
+        """Check the answer (contract, business rules, computed claims, groundedness); fix a
+        simple fault in place, else ask again once, then once on the stronger model. The
+        answer returned still goes through the output guard."""
+        from znyx_runtime.gateway.optimise import verify
+        text = verify.answer_text(fmt, payload)
+        if text is None:
+            return payload
+        faults = await self._faults(fmt, text, plan, scope, record, policy)
+        if faults.by_technique.get("structured_output") and plan.on("repair"):
+            fixed = verify.simple_repair(text)
+            if fixed is not None and not verify.check_contract(fixed, plan.contract):
+                verify.set_answer_text(fmt, payload, fixed)
+                text, plan.answer_changed = fixed, True
+                record.note("answer_repaired")
+                plan.effect("repair")
+                faults = await self._faults(fmt, text, plan, scope, record, policy)
+        owners = [self._RETRY_OWNER[t] for t in faults.by_technique
+                  if t in self._RETRY_OWNER and plan.on(self._RETRY_OWNER[t])]
+        if owners:
+            again = await self._ask_again(fmt, provider, url, headers, body, text, faults, plan, record, owners[0],
+                                          policy=policy, scope=scope)
+            if again is not None:
+                payload, text = again
+                faults = await self._faults(fmt, text, plan, scope, record, policy)
+        target = plan.opts.setting("escalate_to")
+        if (faults and plan.on("escalate") and target and record.api != "azure"
+                and target != (record.response_model or record.model) and key.model_allowed(target)
+                and self._may_escalate(key, target, record)):
+            again = await self._ask_again(fmt, provider, url, headers, body, text, faults, plan, record, "escalate",
+                                          model=target, policy=policy, scope=scope)
+            if again is not None:
+                plan.escalated_from = record.model
+                payload, text = again
+                faults = await self._faults(fmt, text, plan, scope, record, policy)
+        contract = plan.contract
+        checked = {
+            "structured_output": contract is not None and bool(contract.json_schema),
+            "business_rules": contract is not None and bool(contract.rules),
+            "computed_claims": True,
+            "grounded_retry": bool(plan.sources),
+        }
+        for technique, ran in checked.items():
+            if ran and plan.on(technique):
+                plan.effect(technique).verified = "fail" if technique in faults.by_technique else "pass"
+        for technique in ("repair", "escalate"):
+            if technique in plan.effects:
+                plan.effects[technique].verified = "fail" if faults else "pass"
+        return payload
+
+    def _may_escalate(self, key: GatewayKey, target: str, record: CallRecord) -> bool:
+        """The stronger model passes the same gates a request naming it would: a price where
+        the key's spend is limited, and the console's budgets (blocked, priced only)."""
+        if (key.limits.spend_usd_per_day and not key.instance_key
+                and self.prices_for(key.member).lookup(target) is None):
+            record.note("escalation_refused")
+            return False
+        try:
+            member = self.bundle_manager.member_by_key(key.member or None)
+            self._check_spend_controls(key, member, target)
+        except Exception:  # noqa: BLE001 - Denied, or a member no longer served: no escalation
+            record.note("escalation_refused")
+            return False
+        return True
+
+    async def _enforce_contract(self, fmt, payload: Dict[str, Any], policy: Dict[str, Any],
+                                record: CallRecord) -> None:
+        """A policy check, whatever techniques the key uses: an output contract set to block
+        withholds every answer choice whose text does not follow it."""
+        from znyx_runtime.gateway.optimise import verify
+        contract = verify.contract_of(policy)
+        if contract is None or str(contract.on_fail or "").lower() != "block" or not contract.json_schema:
+            return
+        for index, text in verify.choice_texts(fmt, payload):
+            if text is None:
+                continue                       # a tool call: governed by the tool policy
+            if await asyncio.to_thread(verify.check_contract, text, contract):
+                fmt.withhold_choice(payload, index, self.config.settings.output_block_message)
+                record.outcome = "blocked_output"
+                record.output_decision = "BLOCK"
+                record.rule_ids.append("output_contract.invalid")
+
+    def _extra_call(self, plan, record: CallRecord, owner: str, model: Optional[str], usage: fmts.Usage,
+                    estimated: bool = False) -> None:
+        """An extra call the provider billed (a retry, an escalation, a vote): its usage is
+        added to the call's, and its cost is the owning technique's negative saving."""
+        served = model or record.model
+        cost = self.prices_for(record.member).cost(served, usage)
+        if cost is None:
+            record.price_known = False
+        plan.extra_calls.append((served, usage, cost))
+        if estimated:
+            record.usage_estimated = True
+            record.note("usage_estimated")
+        effect = plan.effect(owner)
+        effect.basis = "fixed"
+        effect.saved_usd = round((effect.saved_usd or 0.0) - (cost or 0.0), 8)
+
+    async def _ask_again(self, fmt, provider: Provider, url: str, headers: Dict[str, str], body: Dict[str, Any],
+                         text: str, faults, plan, record: CallRecord, owner: str, model: Optional[str] = None,
+                         *, policy: Dict[str, Any], scope: Dict[str, str]):
+        """One more call with what was wrong (and, to escalate, on the stronger model). It
+        passes the egress gate (audited) like the first, and is paid for."""
+        from znyx_runtime.gateway.optimise import verify
+        retry = verify.retry_body(fmt, body, text, faults)
+        if retry is None:
+            return None
+        if model:
+            retry["model"] = model
+        raw = json.dumps(retry)
+        try:
+            await self._permit_egress(provider, policy, len(raw), scope, record)
+        except Denied:
+            record.note("retry_refused")
+            return None
+        t0 = time.perf_counter()
+        estimate = fmts.Usage(estimate_tokens(len(raw)), 0)
+        try:
+            response = await self.upstream.send(provider, url, headers, retry)
+        except UpstreamError as exc:
+            record.note("retry_failed")
+            if exc.status == 504:              # timed out: the provider may have billed it
+                self._extra_call(plan, record, owner, model, estimate, estimated=True)
+            return None
+        expected = "content" if fmt is fmts.AnthropicMessages else "choices"
+        try:
+            again = fmts.parse_response(response.content) if response.status_code == 200 else None
+        except (ValueError, RecursionError):
+            again = None
+        if not isinstance(again, dict) or not isinstance(again.get(expected), list):
+            record.note("retry_failed")
+            if response.status_code == 200:    # answered, but unreadable: billed all the same
+                self._extra_call(plan, record, owner, model, estimate, estimated=True)
+            return None
+        usage = fmt.usage(again)
+        served = again.get("model") if isinstance(again.get("model"), str) else (model or record.model)
+        self._extra_call(plan, record, owner, served, usage)
+        effect = plan.effect(owner)
+        effect.latency_ms = (effect.latency_ms or 0) + int((time.perf_counter() - t0) * 1000)
+        record.note("escalated" if model else "asked_again")
+        new_text = verify.answer_text(fmt, again)
+        if new_text is None:
+            return None
+        if model:
+            record.response_model = served
+        plan.answer_changed = True
+        return again, new_text
+
+    async def _vote(self, fmt, upstream, provider: Provider, url: str, headers: Dict[str, str],
+                    body: Dict[str, Any], count: int, plan, record: CallRecord, *, policy: Dict[str, Any],
+                    scope: Dict[str, str]):
+        """Technique 22: ``count`` answers at once; the one most agree with is the answer.
+        At temperature 0 the answers would not differ, so the samples use 0.7. Every sample
+        beyond the first passes the egress gate (audited) on its own."""
+        from znyx_runtime.gateway.optimise import verify
+        sample = dict(body)
+        temperature = body.get("temperature")
+        if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) or temperature <= 0:
+            sample["temperature"] = 0.7
+        raw = json.dumps(sample)
+        for _ in range(count - 1):
+            await self._permit_egress(provider, policy, len(raw), scope, record)
+        results = await asyncio.gather(*(upstream.send(provider, url, headers, sample) for _ in range(count)),
+                                       return_exceptions=True)
+        estimate = fmts.Usage(estimate_tokens(len(raw)), 0)
+        for r in results:
+            if isinstance(r, UpstreamError) and r.status == 504:
+                self._extra_call(plan, record, "voting", None, estimate, estimated=True)
+        answered = [r for r in results if not isinstance(r, BaseException) and r.status_code == 200]
+        if not answered:
+            for r in results:
+                if isinstance(r, BaseException):
+                    raise r
+            return results[0]
+        payloads = []
+        for r in answered:
+            try:
+                payloads.append(fmts.parse_response(r.content))
+            except (ValueError, RecursionError):
+                payloads.append(None)
+        texts = [verify.answer_text(fmt, p) if isinstance(p, dict) else None for p in payloads]
+        best, agreement = verify.choose_by_vote(texts)
+        effect = plan.effect("voting")
+        effect.basis = "fixed"
+        effect.saved_usd = effect.saved_usd or 0.0
+        effect.verified = "pass" if agreement > 0.5 else "fail"
+        for i, p in enumerate(payloads):
+            if i == best:
+                continue
+            if not isinstance(p, dict):
+                self._extra_call(plan, record, "voting", None, estimate, estimated=True)
+                continue
+            served = p.get("model") if isinstance(p.get("model"), str) else None
+            self._extra_call(plan, record, "voting", served, fmt.usage(p))
+        record.note("voted", len(results))
+        return answered[best]
+
+    @staticmethod
+    def _restore_pii(fmt, payload: Dict[str, Any], plan, record: CallRecord) -> None:
+        """Technique 30: the request's own PII back in the answer, before the output guard
+        checks it (an output policy that redacts PII redacts it again)."""
+        if plan is None or not len(plan.vault):
+            return
+        from znyx_runtime.gateway.optimise.stage_b import restore_pii
+        restored = restore_pii(fmt, payload, plan.vault)
+        if restored:
+            record.note("pii_restored", restored)
+
+    def _add_extra_calls(self, record: CallRecord, plan) -> None:
+        """The usage and cost of retries and votes, added to the call's own: the provider
+        billed every one of them."""
+        for _, usage, cost in plan.extra_calls:
+            for name in ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens"):
+                value = getattr(usage, name)
+                if value:
+                    setattr(record, name, (getattr(record, name) or 0) + value)
+            if cost is not None and record.cost_usd is not None:
+                record.cost_usd = round(record.cost_usd + cost, 8)
+        plan.extra_calls = []
+
+    async def _answer_from_cache(self, fmt, key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any],
+                                 record: CallRecord, context: Optional[Dict[str, Any]], hit) -> Response:
+        """Technique 5: the provider's stored answer to this exact request, checked again
+        under the current policy. It costs nothing and saves what the stored call cost."""
+        plan = record.plan
+        record.note("exact_cache_hit")
+        payload = fmts.parse_response(hit.content)
+        record.response_model = payload.get("model") if isinstance(payload.get("model"), str) else None
+        usage = fmt.usage(payload)
+        plan.shared_usage = usage
+        effect = plan.effect("exact_cache", basis="call", saved_input_tokens=max(
+            0, (usage.input_tokens or 0) - (usage.cached_input_tokens or 0)))
+        effect.saved_usd = self.prices_for(record.member).cost(record.response_model or record.model, usage)
+        if hit.upstream_ms is not None:
+            effect.latency_ms = -hit.upstream_ms
+        self._apply_usage(record, fmts.Usage(0, 0, 0, 0))
+        try:
+            self._restore_pii(fmt, payload, plan, record)
+            await self._enforce_contract(fmt, payload, policy, record)
+            await self._guard_output(fmt, payload, scope, policy, record, context)
+        finally:
+            self._charge(key, record)
+        record.status = 200
+        returned = dict(hit.headers)
+        returned.update(self.trace_headers(record))
+        returned["x-znyx-cache"] = "hit"
         returned["x-znyx-decision"] = _worst(record.input_decision, record.output_decision)
         self._record(record)
         return JSONResponse(payload, status_code=200, headers=returned)
@@ -1143,6 +1712,7 @@ class Gateway:
         record.latency_ms = int((time.perf_counter() - record.started) * 1000)
         record.rule_ids = sorted(set(record.rule_ids))
         if record.plan is not None:
+            self._count_risk(record)
             try:
                 record.plan.settle(record, self.prices_for(record.member))
             except Exception:  # noqa: BLE001 - the ledger must never fail a call

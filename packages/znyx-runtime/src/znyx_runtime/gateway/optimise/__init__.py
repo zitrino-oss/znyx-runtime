@@ -23,10 +23,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from znyx_core.optimisation import (  # noqa: F401 - the catalogue (shared with the control plane)
-    DEFAULT_PROFILE, PROFILES, STAGE_C, TECHNIQUES, KeyOptimisation, Profile, Technique, active_techniques,
+    CALLER_MAY_SKIP, DEFAULT_PROFILE, PROFILES, STAGE_C, TECHNIQUES, KeyOptimisation, Profile, Technique,
+    active_techniques,
 )
 from znyx_runtime.gateway import formats as fmts
-from znyx_runtime.gateway.optimise import stage_a, tokens
+from znyx_runtime.gateway.optimise import stage_a, stage_b, tokens, verify
+from znyx_runtime.gateway.optimise.cache import DEFAULT_TTL_SECONDS, ResponseCache
 from znyx_runtime.gateway.optimise.coalesce import Coalescer
 
 
@@ -58,11 +60,28 @@ class Effect:
 class Plan:
     """The techniques one call uses, and what they did."""
 
-    def __init__(self, profile: Optional[str], active: List[str], family: str, model: Optional[str]):
+    def __init__(self, profile: Optional[str], active: List[str], family: str, model: Optional[str],
+                 opts: Optional[KeyOptimisation] = None):
         self.profile = profile
         self.active = frozenset(active)
         self.family = family
         self.model = model
+        self.opts = opts or KeyOptimisation()
+        self.caller = ""                                   # whose state this call counts in
+        self.session: Optional[str] = None                 # the session or caller-named trace
+        self.near_budget = False
+        # Verification (stage B): the policy's output contract and grounding settings, handed
+        # in by the pipeline; the extra calls retries and votes made (model, usage, cost).
+        self.contract: Optional[verify.Contract] = None
+        self.grounding_config: Dict[str, Any] = {}
+        self.sources: List[Dict[str, str]] = []
+        self.extra_calls: List[Tuple[str, fmts.Usage, Optional[float]]] = []
+        self.answer_changed = False
+        self.escalated_from: Optional[str] = None
+        # Security and latency (stage B): the call's PII placeholders, and whether its
+        # session is checked more strictly.
+        self.vault = stage_b.PiiVault()
+        self.elevated = False
         self.effects: Dict[str, Effect] = {}
         self.cache_shape: Optional[stage_a.CacheShape] = None
         self.shared_usage: Optional[fmts.Usage] = None    # a coalesced call: the leader's
@@ -98,7 +117,11 @@ class Plan:
 
     def before_send(self, fmt, provider, body: Dict[str, Any], record, seen: stage_a.SeenSet,
                     caller: str) -> None:
-        """Changes that alter no text, after the input guard: cache markers."""
+        """Changes that alter no text, after the input guard: answer caps, the contract's
+        schema for the provider, cache markers."""
+        self._cap(record.api, provider, body, record)
+        if self.on("structured_output") and verify.request_schema(provider, body, self.contract, record.model):
+            record.note("schema_requested")
         shape = self.cache_shape
         if not self.on("prompt_cache") or shape is None:
             return
@@ -117,14 +140,70 @@ class Plan:
             # the discount it earned cannot be told, so the ledger claims none of it.
             record.note("prompt_cache_key")
 
-    def coalescing_allowed(self, body: Dict[str, Any]) -> bool:
-        if not self.on("coalesce") or body.get("stream") is True or body.get("store") is True:
+    def _cap(self, api: str, provider, body: Dict[str, Any], record) -> None:
+        caps = []
+        cap = self.opts.setting("max_output_tokens") if self.on("output_caps") else None
+        if cap:
+            caps.append(("output_caps", cap))
+        if self.on("budget_degrade") and self.near_budget:
+            caps.append(("budget_degrade", stage_b.degrade_cap(self.opts.setting("max_output_tokens"),
+                                                               self.opts.setting("degrade_max_output_tokens"))))
+        if not caps:
+            return
+        technique, tightest = min(caps, key=lambda c: c[1])
+        if stage_b.apply_output_cap(api, provider, body, tightest):
+            record.note("output_capped" if technique == "output_caps" else "budget_degraded")
+            self.effect(technique)
+
+    @staticmethod
+    def deterministic(body: Dict[str, Any]) -> bool:
+        """Settings under which the same request is expected to get the same answer: not
+        streamed, not stored, temperature 0, one choice."""
+        if body.get("stream") is True or body.get("store") is True:
             return False
         temperature = body.get("temperature")
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or temperature != 0:
             return False
         n = body.get("n")
         return n is None or (isinstance(n, int) and not isinstance(n, bool) and n == 1)
+
+    def coalescing_allowed(self, body: Dict[str, Any]) -> bool:
+        # A caller whose answer may be checked and asked again does not share a call.
+        return self.on("coalesce") and self.deterministic(body) and not self.verifies()
+
+    def wants_contract(self) -> bool:
+        return any(self.on(t) for t in ("structured_output", "repair", "business_rules"))
+
+    def verifies(self) -> bool:
+        """Whether the answer will be checked: a contract the key's techniques use, computed
+        claims, or grounding sources for the groundedness retry (escalation acts only on
+        what these find)."""
+        if self.contract is not None and self.wants_contract():
+            return True
+        return self.on("computed_claims") or (self.on("grounded_retry") and bool(self.sources))
+
+    def vote_count(self, body: Dict[str, Any], headers: Mapping[str, str]) -> int:
+        """Answers to take for a call the app marks as high-stakes (technique 22)."""
+        if not self.on("voting") or body.get("stream") is True:
+            return 0
+        if str(headers.get("x-znyx-stakes") or "").strip().lower() != "high":
+            return 0
+        return int(self.opts.setting("vote_samples") or 3)
+
+    def caching_allowed(self, body: Dict[str, Any]) -> bool:
+        return self.on("exact_cache") and self.deterministic(body)
+
+    def cache_ttl(self) -> int:
+        return int(self.opts.setting("cache_ttl_seconds") or DEFAULT_TTL_SECONDS)
+
+    def loop_limits(self) -> Optional[Tuple[Optional[int], Optional[int], int]]:
+        """(max calls, max tokens, window seconds) of the runaway-loop stop, when it applies."""
+        if not self.on("output_caps") or not self.session:
+            return None
+        calls, tokens_ = self.opts.setting("loop_max_calls"), self.opts.setting("loop_max_tokens")
+        if not calls and not tokens_:
+            return None
+        return calls, tokens_, int(self.opts.setting("loop_window_seconds") or stage_b.DEFAULT_LOOP_WINDOW_SECONDS)
 
     # -- the ledger ----------------------------------------------------------------
 
@@ -155,7 +234,8 @@ class Plan:
         record.optimisations = entries
         if not billed:
             record.saved_usd = 0.0
-        elif total is not None:
+        elif total is not None and record.cost_usd is not None:
+            # Without the call's own cost a saving cannot be set against anything.
             record.saved_usd = round(total, 8)
         if record.saved_usd is not None and record.cost_usd is not None:
             record.baseline_cost_usd = round(max(0.0, record.cost_usd + record.saved_usd), 8)
@@ -163,11 +243,12 @@ class Plan:
 
 class Optimiser:
     """Plans each call and holds what techniques share between calls in this process
-    (in-flight calls for coalescing, prefixes seen for the prompt cache)."""
+    (in-flight calls for coalescing, prefixes seen for the prompt cache, stored answers)."""
 
     def __init__(self) -> None:
         self.coalescer = Coalescer()
         self.seen = stage_a.SeenSet()            # prefixes seen recently (prompt cache)
+        self.cache = ResponseCache()             # stored answers (exact cache)
 
     def plan(self, key, api: str, provider, body: Dict[str, Any], headers: Mapping[str, str],
              caller: str, model: Optional[str]) -> Plan:
@@ -176,8 +257,11 @@ class Optimiser:
         off = str(headers.get("x-znyx-optimise") or "").strip().lower() in ("off", "none", "false", "0")
         chosen = bool(getattr(key, "profile_chosen", False))
         # The ledger names a profile only when the key has one (else it runs stage A only).
-        plan = Plan(profile if chosen else None, [] if off else active_techniques(profile, opts, chosen),
-                    provider.format, model)
+        active = active_techniques(profile, opts, chosen)
+        if off:
+            active = [t for t in active if t not in CALLER_MAY_SKIP]
+        plan = Plan(profile if chosen else None, active, provider.format, model, opts)
+        plan.caller = caller
         if plan.on("prompt_cache"):
             plan.cache_shape = stage_a.CacheShape(api, body, caller, model or "")
         return plan
