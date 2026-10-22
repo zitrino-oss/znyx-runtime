@@ -90,6 +90,24 @@ async def evaluate_stream(
     from znyx_core.core.models import EvaluationRequest
 
     body = apply_key_scope(body, key)
+    from znyx_runtime.api.routes import _stop_decision
+    stopped = _stop_decision(body, key, "output")
+    if stopped is not None:
+        # The kill switch: nothing is released, and the stream ends with a BLOCK (an SDK set to
+        # fail open still stops).
+        reason = stopped.user_message or "Stopped by an administrator"
+        rules = [h.rule_id for h in stopped.rule_hits]
+
+        async def refused():
+            yield f"event: block\ndata: {json.dumps({'reason': reason, 'rule_ids': rules})}\n\n"
+            done = {"total_chunks": 0, "windows_evaluated": 0, "final_decision": "BLOCK", "max_risk_score": 100,
+                    "total_rule_hits": len(rules), "total_latency_ms": 0,
+                    "full_text_length": sum(len(c) for c in body.chunks), "released_text_length": 0,
+                    "reason": reason}
+            yield f"event: done\ndata: {json.dumps(done)}\n\n"
+
+        return StreamingResponse(refused(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     # Bound the work one request can ask for. An unbroken token is evaluated whole
     # however long it is, so the request itself is what must be capped.

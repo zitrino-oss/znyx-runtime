@@ -115,6 +115,26 @@ def build_parser() -> argparse.ArgumentParser:
     mfetch.add_argument("--revision")
     mfetch.add_argument("--allow-unvetted", action="store_true")
 
+    disc = sub.add_parser("discover", help="Find AI services reached around the gateway, in network logs.")
+    disc.add_argument("logs", nargs="+", metavar="LOG", help="Log files (.gz read as is).")
+    disc.add_argument("--format", choices=("auto", "squid", "w3c", "zeek", "csv", "jsonl"), default="auto")
+    disc.add_argument("--source", help="A name for this log source (default: the first file's name).")
+    disc.add_argument("--host-column", help="CSV or JSON field with the destination host or URL.")
+    disc.add_argument("--user-column", help="CSV or JSON field with the user name.")
+    disc.add_argument("--time-column", help="CSV or JSON field with the time.")
+    disc.add_argument("--client-column", help="CSV or JSON field with the client address.")
+    disc.add_argument("--exclude-source", action="append", default=[], metavar="ADDRESS",
+                      help="A client address to leave out (the gateway's own); repeatable.")
+    disc.add_argument("--keep-user-names", action="store_true",
+                      help="Report user names as they are (default: pseudonymised).")
+    disc.add_argument("--output", "-o", metavar="FILE", help="Write the report (JSON) to FILE.")
+    disc.add_argument("--json", action="store_true", help="Print the report (JSON) instead of a summary.")
+    disc.add_argument("--upload", action="store_true",
+                      help="Send the report (aggregates only) to the console.")
+    disc.add_argument("--control-plane", help="Console URL (default: ZNYX_CONTROL_PLANE_URL).")
+    disc.add_argument("--org", help="Organization id (default: ZNYX_ORG_ID).")
+    disc.add_argument("--token", help="An org-wide console token with org:write (default: ZNYX_CONSOLE_TOKEN).")
+
     from znyx_runtime.benchmark import add_arguments as _benchmark_args
     _benchmark_args(sub.add_parser(
         "benchmark", help="Benchmark a model-backed detector and stamp its scorecard."))
@@ -465,6 +485,47 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_discover(args: argparse.Namespace) -> int:
+    import json
+    import os
+
+    from znyx import discover
+
+    columns = discover.Columns(host=args.host_column, user=args.user_column, time=args.time_column,
+                               client=args.client_column)
+    found = discover.Discovery(keep_user_names=args.keep_user_names, exclude_sources=args.exclude_source)
+    for name in args.logs:
+        path = Path(name)
+        if not path.is_file():
+            print(f"znyx discover: {name}: no such file", file=sys.stderr)
+            return 2
+        for line in discover.read_lines(path, args.format, columns):
+            found.add(line)
+    report = found.report(args.source or Path(args.logs[0]).name, tool_version=f"znyx {__version__}")
+    if args.output:
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        discover.print_summary(report)
+    if args.upload:
+        control_plane = args.control_plane or os.getenv("ZNYX_CONTROL_PLANE_URL")
+        org = args.org or os.getenv("ZNYX_ORG_ID")
+        token = args.token or os.getenv("ZNYX_CONSOLE_TOKEN")
+        missing = [n for n, v in (("--control-plane", control_plane), ("--org", org), ("--token", token)) if not v]
+        if missing:
+            print(f"znyx discover: --upload needs {', '.join(missing)}", file=sys.stderr)
+            return 2
+        try:
+            result = discover.upload(report, control_plane, org, token)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            print(f"znyx discover: upload failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"Uploaded: {result.get('findings', 0)} finding(s) as source {result.get('source')!r}.",
+              file=sys.stderr)
+    return 0
+
+
 def cmd_benchmark(args: argparse.Namespace) -> int:
     from znyx_runtime.benchmark import run_benchmark
     return run_benchmark(args)
@@ -472,7 +533,8 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
 
 COMMANDS = {"serve": cmd_serve, "start": cmd_serve, "init": cmd_init, "config": cmd_config,
             "status": cmd_status, "version": cmd_version, "models": cmd_models,
-            "benchmark": cmd_benchmark, "key": cmd_key, "gateway-key": cmd_gateway_key}
+            "benchmark": cmd_benchmark, "key": cmd_key, "gateway-key": cmd_gateway_key,
+            "discover": cmd_discover}
 
 
 def main(argv: Optional[List[str]] = None) -> None:

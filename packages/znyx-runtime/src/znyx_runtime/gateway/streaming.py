@@ -284,8 +284,12 @@ async def _openai(gw, upstream, fmt, scope, policy, record, added_usage: bool, t
                 if verdict.sanitized_tool_args is not None:
                     arguments = json.dumps(verdict.sanitized_tool_args)
                     record.note("output_rewritten")
-                complete.append({"index": k, "id": call["id"], "type": call.get("type") or "function",
-                                 "function": {"name": call["name"], "arguments": arguments}})
+                if call.get("type") == "custom":
+                    complete.append({"index": k, "id": call["id"], "type": "custom",
+                                     "custom": {"name": call["name"], "input": arguments}})
+                else:
+                    complete.append({"index": k, "id": call["id"], "type": call.get("type") or "function",
+                                     "function": {"name": call["name"], "arguments": arguments}})
             out.append(chunk(index, {"tool_calls": complete}))
         fn = functions.get(index)
         if fn is not None:
@@ -359,9 +363,13 @@ async def _openai(gw, upstream, fmt, scope, policy, record, added_usage: bool, t
                 slot["id"] = tc.get("id") or slot["id"]
                 slot["type"] = tc.get("type") or slot["type"]
                 fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                slot["name"] += str(fn.get("name") or "")
-                slot["arguments"] += str(fn.get("arguments") or "")
-                state.generated_chars += len(str(fn.get("arguments") or ""))
+                custom = tc.get("custom") if isinstance(tc.get("custom"), dict) else {}
+                if custom:
+                    slot["type"] = "custom"           # free-text input instead of JSON arguments
+                piece = str(fn.get("arguments") or custom.get("input") or "")
+                slot["name"] += str(fn.get("name") or custom.get("name") or "")
+                slot["arguments"] += piece
+                state.generated_chars += len(piece)
             fc = delta.get("function_call")
             if isinstance(fc, dict):
                 slot = functions.setdefault(index, {"name": "", "arguments": ""})

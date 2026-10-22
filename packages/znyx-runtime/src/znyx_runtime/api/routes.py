@@ -84,7 +84,7 @@ async def _caller_key(
         from znyx_runtime.gateway.config import key_digest
         key = gateway.config.keys_by_digest.get(key_digest(token))
         if key is not None:
-            if key.disabled:
+            if key.disabled or not gateway.key_usable(key):
                 raise HTTPException(status_code=401, detail="Invalid authentication token")
             return key
     await _optional_runtime_auth(x_api_key=x_api_key, authorization=authorization)
@@ -119,6 +119,49 @@ def _apply_key_scope(body, key):
 
 
 from znyx_runtime.bundle_manager import ScopeNotServed  # noqa: E402
+
+# Checks of what an agent does (not what it says): refused for a quarantined caller.
+_ACTING_STAGES = frozenset({"tool", "agent_plan", "agent_step", "memory_write"})
+
+
+def _get_gateway():
+    from znyx_runtime.main import app
+    return getattr(app.state, "gateway", None)
+
+
+def _stop_decision(body, key, stage: str) -> Optional[EvaluationResponse]:
+    """The kill switch on the evaluate API: a stopped caller (or a quarantined one checking
+    an action, or a stopped tool) gets a BLOCK decision rather than an error, so an SDK set
+    to fail open still stops."""
+    gateway = _get_gateway()
+    stops = gateway.stop_set() if gateway is not None else None
+    if not stops:
+        return None
+    from znyx_core.governance import RULE_QUARANTINED, RULE_STOPPED, RULE_TOOL_STOPPED
+    try:
+        member = _get_bundle_manager().member_for(getattr(key, "member", "") or None,
+                                                  getattr(body, "app_id", None), getattr(body, "env", None))
+    except ScopeNotServed:
+        return None                          # the evaluation itself refuses the call
+    call = stops.for_caller(project_id=member.project_id if member is not None else "",
+                            environment_id=member.environment_id if member is not None else "",
+                            app_id=getattr(body, "app_id", None), agent_id=getattr(body, "agent_id", None),
+                            key_id=key.id if key is not None and not key.instance_key else None)
+    hit, rule = call.stopped, RULE_STOPPED
+    if hit is None and stage in _ACTING_STAGES:
+        hit, rule = call.quarantined, RULE_QUARANTINED
+    if hit is None and stage == "tool":
+        hit, rule = call.tool_stop(getattr(body, "tool_name", None)), RULE_TOOL_STOPPED
+    if hit is None:
+        return None
+    from znyx_core.core.models import Decision, RuleHit, Severity
+    logger.info("Evaluate %s refused by stop %s (%s %s)", stage, hit.id or "-", hit.target, hit.match or "")
+    return EvaluationResponse(
+        request_id=str(getattr(body, "request_id", "") or ""), decision=Decision.BLOCK, risk_score=100,
+        policy_version="kill_switch", rule_hits=[RuleHit(rule_id=rule, severity=Severity.HIGH, message=hit.message())],
+        user_message=hit.message(), developer_message=f"Refused by stop {hit.id}" if hit.id else "Refused by a stop",
+        trace_id=getattr(body, "trace_id", None), session_id=getattr(body, "session_id", None),
+        span_id=getattr(body, "span_id", None))
 
 
 def _get_evaluator():
@@ -185,6 +228,9 @@ apply_key_scope = _apply_key_scope
 async def evaluate_input(request: EvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate input text before sending to LLM."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "input")
+    if stopped is not None:
+        return stopped
     try:
         bm = _get_bundle_manager()
         request, policy = bm.resolve(request, key)
@@ -218,6 +264,9 @@ async def evaluate_input(request: EvaluationRequest, key=Depends(_caller_key)) -
 async def evaluate_output(request: EvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate output text from LLM before returning to user."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "output")
+    if stopped is not None:
+        return stopped
     try:
         bm = _get_bundle_manager()
         request, policy = bm.resolve(request, key)
@@ -251,6 +300,9 @@ async def evaluate_output(request: EvaluationRequest, key=Depends(_caller_key)) 
 async def evaluate_tool(request: ToolEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate tool invocation against governance policies."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "tool")
+    if stopped is not None:
+        return stopped
     try:
         bm = _get_bundle_manager()
         request, policy = bm.resolve(request, key)
@@ -300,6 +352,9 @@ async def _evaluate_stage_runtime(scoped, stage: str, key=None) -> EvaluationRes
 async def evaluate_retrieval(request: RetrievalEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate retrieved RAG chunks for indirect prompt injection before they enter context (LLM01)."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "retrieval")
+    if stopped is not None:
+        return stopped
     try:
         return await _evaluate_stage_runtime(request, "retrieval", key)
     except EvaluatorOverloadedError:
@@ -324,6 +379,9 @@ async def evaluate_retrieval(request: RetrievalEvaluationRequest, key=Depends(_c
 async def evaluate_agent_plan(request: AgentPlanEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate a proposed multi-step agent plan for excessive agency (LLM03)."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "agent_plan")
+    if stopped is not None:
+        return stopped
     try:
         return await _evaluate_stage_runtime(request, "agent_plan", key)
     except EvaluatorOverloadedError:
@@ -348,6 +406,9 @@ async def evaluate_agent_plan(request: AgentPlanEvaluationRequest, key=Depends(_
 async def evaluate_agent_step(request: AgentStepEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate a single agent-loop iteration for budget/depth caps (LLM06)."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "agent_step")
+    if stopped is not None:
+        return stopped
     try:
         return await _evaluate_stage_runtime(request, "agent_loop", key)
     except EvaluatorOverloadedError:
@@ -372,6 +433,9 @@ async def evaluate_agent_step(request: AgentStepEvaluationRequest, key=Depends(_
 async def evaluate_memory_write(request: MemoryWriteEvaluationRequest, key=Depends(_caller_key)) -> EvaluationResponse:
     """Evaluate text being written to agent memory for persistent injection (LLM01)."""
     request = _apply_key_scope(request, key)
+    stopped = _stop_decision(request, key, "memory_write")
+    if stopped is not None:
+        return stopped
     try:
         return await _evaluate_stage_runtime(request, "memory_write", key)
     except EvaluatorOverloadedError:

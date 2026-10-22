@@ -309,10 +309,16 @@ class OpenAIChat:
                                   "audio", choice=index))
             for k, call in enumerate(msg.get("tool_calls") or []):
                 fn = call.get("function") if isinstance(call, dict) else None
+                custom = call.get("custom") if isinstance(call, dict) else None
                 if isinstance(fn, dict):
                     parts.append(Part(base + ("tool_calls", k, "function", "arguments"), "assistant",
                                       str(fn.get("arguments") or ""), "tool_call",
                                       str(fn.get("name") or "tool"), choice=index))
+                elif isinstance(custom, dict):
+                    # A custom tool (free-text input instead of JSON arguments): checked the same way.
+                    parts.append(Part(base + ("tool_calls", k, "custom", "input"), "assistant",
+                                      str(custom.get("input") or ""), "tool_call",
+                                      str(custom.get("name") or "tool"), choice=index))
             fc = msg.get("function_call")
             if isinstance(fc, dict):
                 parts.append(Part(base + ("function_call", "arguments"), "assistant",

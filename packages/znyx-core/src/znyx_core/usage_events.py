@@ -68,6 +68,9 @@ FIELDS: Dict[str, str] = {
     "saved_usd": "sfloat",
     "baseline_cost_usd": "float",
     "optimisations": "effects",     # [{technique, stage, saved_input_tokens, saved_usd, ...}]
+    # Phase 5: tool names (never arguments), for the AI inventory.
+    "tools_offered": "strlist",     # the tools the model was offered
+    "tools_called": "strlist",      # the tools it called in its answer
 }
 
 MAX_STR = 200

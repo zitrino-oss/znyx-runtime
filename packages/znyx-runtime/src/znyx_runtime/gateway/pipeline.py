@@ -178,15 +178,23 @@ class CallRecord:
     optimisations: List[Dict[str, Any]] = field(default_factory=list)
     saved_usd: Optional[float] = None
     baseline_cost_usd: Optional[float] = None
+    # Phase 5: the tools offered to the model and those it called (names only), for the
+    # inventory.
+    tools_offered: List[str] = field(default_factory=list)
+    tools_called: List[str] = field(default_factory=list)
     plan: Any = None
 
     def note(self, technique: str, count: int = 1) -> None:
         self.techniques[technique] = self.techniques.get(technique, 0) + count
 
+    def saw_tool_call(self, name: Optional[str]) -> None:
+        if name and name not in self.tools_called and len(self.tools_called) < 50:
+            self.tools_called.append(name[:200])
+
     def to_event(self) -> Dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items()
                 if k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan", "_recorded",
-                             "_cache_user")}
+                             "_cache_user", "_stops")}
         data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return data
 
@@ -298,6 +306,8 @@ class Gateway:
         self._slots = asyncio.Semaphore(config.settings.max_concurrent)
         self._slots_size = config.settings.max_concurrent
         self._known_apps = self._app_labels(config)
+        self._stops_memo: Optional[tuple] = None
+        self._live_memo: Optional[tuple] = None
 
     @staticmethod
     def _app_labels(config: GatewayConfig) -> set:
@@ -528,7 +538,7 @@ class Gateway:
         key = self.config.keys_by_digest.get(digest)
         if key is None and self._instance_key is not None and digest == self._instance_key.key_sha256:
             key = self._instance_key
-        if key is None or key.disabled:
+        if key is None or key.disabled or not self.key_usable(key):
             raise Denied(401, "Invalid gateway key", "invalid_api_key", error_type="authentication_error")
         client_credential = standard if explicit and standard else None
         return key, client_credential
@@ -754,20 +764,41 @@ class Gateway:
                          error_type="permission_error")
 
     @staticmethod
+    def _has_tool_blocks(body: Dict[str, Any]) -> bool:
+        for message in body.get("messages") or []:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list) and any(isinstance(b, dict) and str(b.get("type", "")).endswith(
+                    ("tool_use", "tool_result")) for b in content):
+                return True
+        return False
+
+    @staticmethod
+    def _note_offered(body: Dict[str, Any], record: CallRecord, name_of, fname) -> None:
+        tools = body.get("tools")
+        names = [name_of(t) for t in tools] if isinstance(tools, list) else []
+        if isinstance(body.get("functions"), list):
+            names += [fname(f) for f in body["functions"]]
+        record.tools_offered = list(dict.fromkeys(n[:200] for n in names if n))[:50]
+
+    @staticmethod
     def _filter_tools(api: str, body: Dict[str, Any], policy: Dict[str, Any],
                       record: CallRecord) -> None:
         """Least-privilege tools (technique 26): the model only sees tools the policy
-        allows, when the policy names them. Legacy OpenAI ``functions`` too, and a
-        forced choice of a removed tool is dropped."""
+        allows, when the policy names them, and none a stop concerns (a stopped tool; every
+        tool for a quarantined caller). Legacy OpenAI ``functions`` too, and a forced choice
+        of a removed tool is dropped. The names offered are kept for the inventory."""
         tools_policy = policy.get("tools") or {}
         if not isinstance(tools_policy, dict) or not tools_policy.get("enabled", True):
-            return
+            tools_policy = {}
         allowed = set(tools_policy.get("allowed") or tools_policy.get("allowed_tools") or [])
         denied = set(tools_policy.get("denied") or tools_policy.get("blocked_tools") or [])
-        if not (allowed or denied):
-            return
+        stops = getattr(record, "_stops", None)
+        restricted = stops is not None and stops.restricts_tools
 
         def permitted(name: str) -> bool:
+            # Under a stop, a tool whose name cannot be read is removed too (fail closed).
+            if restricted and (stops.quarantined is not None or not name or stops.tool_stop(name) is not None):
+                return False
             return (not allowed or name in allowed) and name not in denied
 
         def name_of(tool: Any) -> str:
@@ -775,8 +806,23 @@ class Gateway:
                 return ""
             if api == "anthropic":
                 return str(tool.get("name") or "")
-            fn = tool.get("function")
-            return str(fn.get("name") or "") if isinstance(fn, dict) else ""
+            for kind in ("function", "custom"):
+                inner = tool.get(kind)
+                if isinstance(inner, dict) and inner.get("name"):
+                    return str(inner["name"])
+            return ""
+
+        def fname(f: Any) -> str:
+            return str(f.get("name") or "") if isinstance(f, dict) else ""
+
+        if not (allowed or denied or restricted):
+            Gateway._note_offered(body, record, name_of, fname)
+            return
+        if restricted and api == "anthropic" and body.get("mcp_servers"):
+            # MCP servers the provider calls itself: their tools cannot be filtered one by one.
+            body.pop("mcp_servers", None)
+            record.note("mcp_servers_removed")
+        offered_before = list(body.get("tools") or []) if isinstance(body.get("tools"), list) else []
 
         removed: set = set()
         tools = body.get("tools")
@@ -791,8 +837,6 @@ class Gateway:
                     body.pop("tool_choice", None)
         functions = body.get("functions") if api != "anthropic" else None
         if isinstance(functions, list):
-            def fname(f: Any) -> str:
-                return str(f.get("name") or "") if isinstance(f, dict) else ""
             kept_functions = [f for f in functions if permitted(fname(f))]
             removed |= {fname(f) for f in functions if not permitted(fname(f))}
             if len(kept_functions) != len(functions):
@@ -801,9 +845,22 @@ class Gateway:
                 else:
                     body.pop("functions", None)
                     body.pop("function_call", None)
+        Gateway._note_offered(body, record, name_of, fname)
         if not removed:
             return
         record.note("tools_filtered", len(removed))
+        if restricted and stops.quarantined is not None:
+            record.note("quarantined")
+        if not body.get("tools") and not body.get("functions"):
+            # Settings that are only valid with tools would make the provider refuse the request.
+            for name in ("parallel_tool_calls", "function_call"):
+                body.pop(name, None)
+            if api == "anthropic" and offered_before and Gateway._has_tool_blocks(body):
+                # Anthropic refuses a conversation with tool blocks and no tools: offer one inert
+                # placeholder the model may not call.
+                body["tools"] = [{"name": "znyx_no_tools", "description": "No tools are available.",
+                                  "input_schema": {"type": "object", "properties": {}}}]
+                body["tool_choice"] = {"type": "none"}
         choice = body.get("tool_choice")
         if isinstance(choice, dict):
             forced = choice.get("name") if api == "anthropic" else (choice.get("function") or {}).get("name")
@@ -824,6 +881,68 @@ class Gateway:
                 or (scope == "key" and entry.get("key_id") == key.id
                     and entry.get("project_id") in (None, "", project)
                     and entry.get("environment_id") in (None, "", environment)))
+
+    # -- the kill switch (Phase 5) ---------------------------------------------------
+
+    def _controls(self) -> Dict[str, Any]:
+        controls = getattr(self.bundle_manager, "controls", None) or {}
+        return controls if isinstance(controls, dict) else {}
+
+    def key_usable(self, key: GatewayKey) -> bool:
+        """False for a key the console no longer lists as usable (disabled, deleted, rotated or
+        expired since the last publish): the signed controls carry the usable keys' digests,
+        so such a key stops working with the next poll. Only when the controls carry the list
+        (managed mode, where every key comes from the console); never the instance key."""
+        if key.instance_key:
+            return True
+        live = self._controls().get("live_keys")
+        if not isinstance(live, list):
+            return True
+        memo = self._live_memo
+        if memo is None or memo[0] is not live:
+            memo = self._live_memo = (live, frozenset(d for d in live if isinstance(d, str)))
+        return key.key_sha256 in memo[1]
+
+    def stop_set(self):
+        """The active stops: the console's (signed controls) and the gateway file's."""
+        from znyx_core.governance import StopSet, clean_stops
+        raw = self._controls().get("stops")
+        memo = self._stops_memo
+        if memo is not None and memo[0] is raw and memo[1] is self.config:
+            return memo[2]
+        stops = StopSet(clean_stops(raw, "bundle set controls") + tuple(self.config.stops))
+        self._stops_memo = (raw, self.config, stops)
+        return stops
+
+    def stops_for(self, key: GatewayKey, member, app_id: Optional[str] = None, agent_id: Optional[str] = None):
+        from znyx_core.governance import NO_STOPS
+        stops = self.stop_set()
+        if not stops:
+            return NO_STOPS
+        return stops.for_caller(project_id=member.project_id if member is not None else "",
+                                environment_id=member.environment_id if member is not None else "",
+                                app_id=app_id or key.app_id, agent_id=agent_id or key.agent_id,
+                                key_id=None if key.instance_key else key.id)
+
+    def _check_controls(self, key: GatewayKey, member, model: Optional[str] = None, provider=None,
+                        deployment: Optional[str] = None):
+        """The console's controls for a call: stops (the caller, the model, the provider),
+        then budgets. Returns the caller's stops (quarantine, stopped tools). On Azure the
+        deployment is what runs, so a model stop is checked against it as well."""
+        from znyx_core.governance import NO_STOPS
+        call = NO_STOPS
+        stops = self.stop_set()
+        if stops:
+            project = member.project_id if member is not None else ""
+            environment = member.environment_id if member is not None else ""
+            call = self.stops_for(key, member)
+            hit = (call.stopped or stops.model(model, project, environment)
+                   or (stops.model(deployment, project, environment) if deployment else None)
+                   or (stops.provider(provider.name, project, environment) if provider is not None else None))
+            if hit is not None:
+                raise Denied(403, hit.message(), "stopped", error_type="permission_error")
+        self._check_spend_controls(key, member, model)
+        return call
 
     def _check_spend_controls(self, key: GatewayKey, member, model: Optional[str] = None) -> None:
         """Budgets the console set to block (signed in the bundle set). A spent one refuses
@@ -890,6 +1009,16 @@ class Gateway:
         from znyx_core.core.models import ToolEvaluationRequest
         from znyx_runtime.api.routes import runtime_judge_ctx
 
+        if kind == "tool_call":
+            record.saw_tool_call(tool_name)
+            stops = getattr(record, "_stops", None)
+            hit = (stops.quarantined or stops.tool_stop(tool_name)) if stops is not None and stops.restricts_tools \
+                else None
+            if hit is not None:
+                from znyx_core.governance import RULE_QUARANTINED, RULE_TOOL_STOPPED
+                record.note("tool_call_stopped")
+                return _Verdict("BLOCK", [RULE_QUARANTINED if hit is stops.quarantined else RULE_TOOL_STOPPED],
+                                user_message=hit.message(), hits=1)
         if kind in ("tool_result", "tool_call"):
             args: Dict[str, Any] = {}
             if kind == "tool_call":
@@ -1128,7 +1257,8 @@ class Gateway:
             member = self.bundle_manager.member_by_key(key.member or None)
         except ScopeNotServed as exc:
             raise Denied(403, str(exc), "project_not_served", error_type="permission_error") from None
-        self._check_spend_controls(key, member, record.model)
+        record._stops = self._check_controls(key, member, record.model, provider,
+                                             deployment if api == "azure" else None)
         scope = self._scope(key, request, member)
         try:
             policy = self.bundle_manager.get_policy(tenant_id=scope["tenant_id"], app_id=scope["app_id"],
@@ -1333,7 +1463,8 @@ class Gateway:
 
     def _batch_key(self, job: Dict[str, Any], usable: bool = True) -> Optional[GatewayKey]:
         return next((k for k in self.config.keys_by_digest.values()
-                     if (k.key_sha256 or k.id) == job["key_sha256"] and (not usable or not k.disabled)), None)
+                     if (k.key_sha256 or k.id) == job["key_sha256"]
+                     and (not usable or (not k.disabled and self.key_usable(k)))), None)
 
     async def batch_job_allowed(self, job: Dict[str, Any]) -> Optional[str]:
         """Why a queued call may no longer be sent (None when it may): the key, its budgets
@@ -1346,7 +1477,16 @@ class Gateway:
         try:
             member = self.bundle_manager.member_by_key(key.member or None)
             body = json.loads(job["body"] or "{}")
-            self._check_spend_controls(key, member, body.get("model"))
+            stops = self._check_controls(key, member, body.get("model"), self.config.providers.get(job["provider"]))
+            if stops.restricts_tools:
+                # Queued before a quarantine or a tool stop: sending it now would offer what is stopped.
+                offered = CallRecord(request_id="", key_id="", tenant_id="", app_id="", agent_id="", api=job["api"])
+                offered._stops = stops
+                probe = json.loads(job["body"] or "{}")
+                self._filter_tools("anthropic" if job["api"] == "anthropic" else "openai", probe, {}, offered)
+                if offered.techniques.get("tools_filtered"):
+                    hit = stops.quarantined or next(iter(stops.tools))
+                    return hit.message()
             policy = self.bundle_manager.get_policy(tenant_id=scope.get("tenant_id", key.tenant_id),
                                                     app_id=scope.get("app_id", key.app_id),
                                                     agent_id=scope.get("agent_id", key.agent_id),
@@ -1421,6 +1561,9 @@ class Gateway:
                 raise Denied(502, error or "The provider returned an answer the gateway cannot read", "batch_failed",
                              outcome="error", error_type="api_error")
             member = self.bundle_manager.member_by_key(key.member or None)
+            record._stops = self.stops_for(key, member)            # tool calls a stop concerns are withheld
+            if record._stops.stopped is not None:
+                raise Denied(403, record._stops.stopped.message(), "stopped", error_type="permission_error")
             policy = self.bundle_manager.get_policy(tenant_id=scope.get("tenant_id", key.tenant_id),
                                                     app_id=scope.get("app_id", key.app_id),
                                                     agent_id=scope.get("agent_id", key.agent_id),
@@ -1446,6 +1589,14 @@ class Gateway:
         Only the key that queued it may read it."""
         try:
             key, _ = self._identify(request)
+            from znyx_runtime.bundle_manager import ScopeNotServed
+            try:
+                member = self.bundle_manager.member_by_key(key.member or None)
+            except ScopeNotServed:
+                member = None
+            caller_stops = self.stops_for(key, member)
+            if caller_stops.stopped is not None:
+                raise Denied(403, caller_stops.stopped.message(), "stopped", error_type="permission_error")
         except Denied as denied:
             return JSONResponse({"error": {"message": denied.message, "code": denied.code}}, status_code=denied.status)
         job = await asyncio.to_thread(self.batch_store().get, job_id) if job_id.startswith("zbatch_") else None
@@ -1455,6 +1606,13 @@ class Gateway:
                                "created": int(job["created"])}
         if job["status"] == "done":
             out["result"] = json.loads(job["result"])
+            if caller_stops.restricts_tools:
+                # Finished before a quarantine or a tool stop: its tool calls are not released now.
+                fmt = fmts.FORMATS[job["api"]]
+                withheld = {p.choice for p in fmt.output_parts(out["result"]) if p.kind == "tool_call"
+                            and (caller_stops.quarantined or caller_stops.tool_stop(p.tool_name))}
+                for choice in withheld:
+                    fmt.withhold_choice(out["result"], choice, self.config.settings.output_block_message)
         if job["status"] == "failed":
             out["error"] = job["error"]
         return JSONResponse(out)
@@ -1606,7 +1764,7 @@ class Gateway:
             variant = test["variant"]
             try:
                 member = self.bundle_manager.member_by_key(key.member or None)
-                self._check_spend_controls(key, member, (variant or {}).get("model") or record.model)
+                self._check_controls(key, member, (variant or {}).get("model") or record.model)
             except Exception:  # noqa: BLE001 - a spent budget or a member no longer served: no test
                 record.note("shadow_refused")
                 return
@@ -2213,7 +2371,7 @@ class Gateway:
             return False
         try:
             member = self.bundle_manager.member_by_key(key.member or None)
-            self._check_spend_controls(key, member, target)
+            self._check_controls(key, member, target)
         except Exception:  # noqa: BLE001 - Denied, or a member no longer served
             record.note(note)
             return False

@@ -56,7 +56,9 @@ class UsageSink:
             techniques=dict(record.techniques), profile=getattr(record, "profile", None),
             saved_usd=getattr(record, "saved_usd", None),
             baseline_cost_usd=getattr(record, "baseline_cost_usd", None),
-            optimisations=list(getattr(record, "optimisations", None) or []) or None)
+            optimisations=list(getattr(record, "optimisations", None) or []) or None,
+            tools_offered=list(getattr(record, "tools_offered", None) or []) or None,
+            tools_called=list(getattr(record, "tools_called", None) or []) or None)
 
     def __call__(self, record) -> None:
         if not record.key_id:

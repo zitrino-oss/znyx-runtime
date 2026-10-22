@@ -375,6 +375,37 @@ call would have cost without them. Savings counted by the gateway use about four
 per token; with `ZNYX_TOKENIZER=tiktoken` and the optional `tiktoken` package (its encoding
 files present, `TIKTOKEN_CACHE_DIR` on an air-gapped host) OpenAI text is counted exactly.
 
+### Kill switch and AI inventory
+
+A stop refuses every call of an app, agent or gateway key, or every call naming a model or
+going to a provider, or everything; a quarantine lets an app, agent or key keep answering in
+words but takes its tools away (none offered to the model, tool calls in its answers withheld);
+a tool stop takes one tool (or a pattern such as `delete_*`) away from everyone. With a console,
+stops are made on its Kill switch page and reach every gateway with its next poll (30 seconds by
+default), with no publish; a key disabled, deleted or expired there stops working the same way.
+Without a console, list them in the gateway file:
+
+```yaml
+stops:
+  - {target: agent, match: refund-bot, reason: "Paused while we investigate"}
+  - {target: tool, match: "delete_*"}
+  - {target: app, match: support-portal, mode: quarantine}
+```
+
+The evaluate API answers a stopped caller with a BLOCK decision, so an SDK set to fail open
+still stops. Usage events carry the names of the tools offered and called (never arguments),
+which the console's AI inventory lists with every model, provider, app and agent seen.
+
+`znyx discover` finds AI services reached around the gateway in network logs you already keep
+(Squid, W3C extended, Zeek, or CSV and JSON lines with a column mapping). It runs where the logs
+are; user names become pseudonyms unless you pass `--keep-user-names`, and `--upload` sends only
+the totals (service, host, users, requests, first and last seen) to the console:
+
+```bash
+znyx discover /var/log/squid/access.log --exclude-source 10.0.4.20 \
+  --upload --control-plane https://api.znyx.ai --org $ORG_ID --token $CONSOLE_TOKEN
+```
+
 ## Secure by default
 
 - **Auth on by default.** The evaluate endpoints require an API key. In

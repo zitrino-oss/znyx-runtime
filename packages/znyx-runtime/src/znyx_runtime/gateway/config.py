@@ -185,6 +185,8 @@ class GatewayConfig:
     shared: bool = False
     # Each environment's own price table (its bundle's), by member.
     member_prices: Dict[str, Dict[str, Dict[str, float]]] = field(default_factory=dict)
+    # Stops from the gateway file (no console); the console's arrive in the signed controls.
+    stops: Tuple[Any, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -483,7 +485,8 @@ def from_document(doc: Mapping[str, Any], *, source: str = "document",
     ``managed``: the document came from a bundle, so this runtime's own limits on
     provider hosts apply (see ``DEFAULT_MANAGED_HOSTS``)."""
     _require(isinstance(doc, Mapping), source, "expected a mapping at the top level")
-    unknown = set(doc) - {"version", "providers", "keys", "settings", "prices"}
+    # Stops come from the gateway file only; a console sends them in the signed controls.
+    unknown = set(doc) - {"version", "providers", "keys", "settings", "prices"} - (set() if managed else {"stops"})
     _require(not unknown, source, f"unknown section(s) {', '.join(sorted(unknown))}")
     raw_providers = doc.get("providers") or {}
     _require(isinstance(raw_providers, Mapping), "providers", "expected a mapping")
@@ -500,7 +503,22 @@ def from_document(doc: Mapping[str, Any], *, source: str = "document",
         keys[key.key_sha256] = key
     return GatewayConfig(providers=providers, keys_by_digest=keys,
                          settings=_settings(doc.get("settings")), prices=_prices(doc.get("prices")),
-                         source=source)
+                         source=source, stops=() if managed else _stops(doc.get("stops")))
+
+
+def _stops(raw: Any) -> Tuple[Any, ...]:
+    """The gateway file's stops, strictly: a stop that cannot be read stops the start
+    rather than leaving something running that was meant to be stopped."""
+    from znyx_core.governance import clean_stop
+    if raw is None:
+        return ()
+    _require(isinstance(raw, list), "stops", "expected a list")
+    out = []
+    for i, entry in enumerate(raw):
+        stop, problem = clean_stop(entry)
+        _require(stop is not None, f"stops[{i}]", problem or "unusable")
+        out.append(stop)
+    return tuple(out)
 
 
 def from_environment(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
