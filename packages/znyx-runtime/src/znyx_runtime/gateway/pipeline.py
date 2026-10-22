@@ -64,11 +64,40 @@ _DEPLOYMENT = re.compile(r"^(?!\.+$)[A-Za-z0-9._-]{1,128}$")
 _API_VERSION = re.compile(r"^(\d{4}-\d{2}-\d{2}(-preview)?|preview|latest|v1)$")
 _ALL_ROLES = ("system", "developer", "user", "assistant", "tool", "function")
 VERDICT_TTL_SECONDS = 3600
+BATCH_PRICE_SHARE = 0.5              # batch calls are billed at half the standard price
 # Usage is estimated when the provider's count never arrives (a stream cut short, a
 # client that left): about four characters per token, and a flat amount per image or
 # file. Budgets are then charged the estimate rather than nothing.
 CHARS_PER_TOKEN = 4
 OPAQUE_PART_TOKENS = 85
+
+
+def _clean_spans(spans: Any, length: int) -> List[Tuple[int, int]]:
+    """Spans a model server returned, made safe: whole numbers within the text, in order,
+    not overlapping; anything malformed is dropped."""
+    out: List[Tuple[int, int]] = []
+    if not isinstance(spans, list):
+        return out
+    for item in spans[:10_000]:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        s, e = item[0], item[1]
+        if isinstance(s, bool) or isinstance(e, bool) or not isinstance(s, int) or not isinstance(e, int):
+            continue
+        if 0 <= s < e <= length:
+            out.append((s, e))
+    out.sort()
+    merged: List[Tuple[int, int]] = []
+    for s, e in out:
+        if merged and s < merged[-1][1]:
+            continue                          # overlapping: the earlier span wins
+        merged.append((s, e))
+    return merged
+
+
+def stage_c_parts(fmt, body: Dict[str, Any]) -> List[fmts.Part]:
+    from znyx_runtime.gateway.optimise import stage_c
+    return stage_c.retrieved_parts(fmt, body)
 
 
 def quiet_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
@@ -156,7 +185,8 @@ class CallRecord:
 
     def to_event(self) -> Dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items()
-                if k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan")}
+                if k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan", "_recorded",
+                             "_cache_user")}
         data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return data
 
@@ -300,6 +330,7 @@ class Gateway:
             pass
 
     async def close(self) -> None:
+        await self.drain()
         await self.upstream.close()
 
     def prices_for(self, member: str) -> PriceTable:
@@ -399,13 +430,13 @@ class Gateway:
         return {"x-znyx-request-id": record.request_id, "x-znyx-trace-id": record.trace_id,
                 "traceparent": usage_events.traceparent(record.trace_id, record.span_id)}
 
-    def _user_of(self, request: Request, body: Dict[str, Any]) -> Optional[str]:
+    def _user_of(self, request: Request, body: Dict[str, Any], mode: Optional[str] = None) -> Optional[str]:
         """The end user the app called for: ``X-Znyx-User``, else the API's own field
         (OpenAI ``user``, Anthropic ``metadata.user_id``). Pseudonymised by default
         (``settings.user_ids``: hash | plain | off): a keyed hash whose key stays on the
         runtime side, so the console can group spend by user without learning, or guessing,
         who the users are."""
-        mode = self.config.settings.user_ids
+        mode = mode or self.config.settings.user_ids
         if mode == "off":
             return None
         raw = request.headers.get("x-znyx-user")
@@ -642,14 +673,23 @@ class Gateway:
         return f"pin:gw:day:{cls._state_id(key)}:{time.strftime('%Y%m%d', time.gmtime())}"
 
     def _charge(self, key: GatewayKey, record: CallRecord) -> None:
-        tokens = (record.input_tokens or 0) + (record.output_tokens or 0)
-        self._count_loop(key, record, tokens)
+        """The call's own usage to the key's day and its session (extra calls, such as
+        retries and votes, were charged when they were made)."""
+        plan = record.plan
+        added_tokens = plan.extra_tokens_added if plan is not None else 0
+        added_cost = plan.extra_cost_added if plan is not None else 0.0
+        tokens = max(0, (record.input_tokens or 0) + (record.output_tokens or 0) - added_tokens)
+        self._count_loop(key, record, tokens + added_tokens)
+        self._charge_usage(key, tokens, max(0.0, (record.cost_usd or 0.0) - added_cost), requests=1)
+
+    def _charge_usage(self, key: GatewayKey, tokens: int, cost: float, requests: int = 0) -> None:
+        """Add usage to the key's day (its daily limits)."""
         if not (key.limits.tokens_per_day or key.limits.spend_usd_per_day) or key.instance_key:
             return
         try:
             from znyx_core.state_store import get_state_store
-            get_state_store().incr(self._day_key(key), {"tokens": tokens, "cost": record.cost_usd or 0.0,
-                                                        "requests": 1}, ttl_seconds=2 * 86400)
+            get_state_store().incr(self._day_key(key), {"tokens": tokens, "cost": cost, "requests": requests},
+                                   ttl_seconds=2 * 86400)
         except Exception:  # noqa: BLE001 - the call already happened; never fail its response
             logger.warning("gateway: could not record usage for key %s", key.id)
 
@@ -1058,6 +1098,8 @@ class Gateway:
         record.provider = provider.name
         record.provider_format = provider.format
         record.user = self._user_of(request, body)
+        # The semantic cache keeps end users apart even where user ids are not recorded.
+        record._cache_user = record.user or self._user_of(request, body, mode="hash")
         if provider.blocked:
             raise Denied(403, provider.blocked, "provider_not_allowed_here", error_type="permission_error")
         if provider.uses_client_key and not client_credential:
@@ -1100,6 +1142,7 @@ class Gateway:
         plan = record.plan = self.optimiser.plan(key, api, provider, body, request.headers,
                                                  self._caller_id(key), record.model)
         plan.session = self._session_of(request, record)
+        plan.key = key
         self._check_loop(key, plan)
         if plan.wants_contract():
             from znyx_runtime.gateway.optimise.verify import contract_of
@@ -1110,6 +1153,8 @@ class Gateway:
         policy = self._adapt_to_risk(key, plan, policy, record)
         # Request-side techniques first: the input guard reads the request as it is sent.
         plan.before_guard(fmt, body, record, self.config.settings.check_roles)
+        if plan.on("compress") and not fmt.is_stream(body):
+            await self._compress(fmt, body, plan, record, live=True)   # the guard reads the shortened text
         input_policy = self._tokenising(fmt, body, plan, policy, record)
         send = dict(fmt=fmt, provider=provider, key=key, member=member, scope=scope, policy=policy, record=record,
                     request=request, client_credential=client_credential, deployment=deployment,
@@ -1120,6 +1165,7 @@ class Gateway:
             # input, so what is sent is what the checks read; it is used only if they pass and
             # left the text exactly as sent, and cancelled otherwise. Nothing is released
             # before the output guard.
+            plan.parallel = True             # nothing decided from the checks' findings: they have not run
             early_body = fmts.deep_copy(body)
             self._normalise(fmt, early_body, None)
             expected = self._sent_texts(fmt, early_body)
@@ -1142,6 +1188,8 @@ class Gateway:
         else:
             await self._guard_input(api, fmt, body, scope, input_policy, record)
         context, url, headers = await self._prepare_send(body=body, **send)
+        if self._batchable(request, fmt, provider, body, plan):
+            return await self._enqueue_batch(fmt, provider, url, body, key, scope, record, plan)
         if record.stream:
             from znyx_runtime.gateway.streaming import stream_call
             return await stream_call(self, request, api, fmt, provider, url, headers, body,
@@ -1157,28 +1205,6 @@ class Gateway:
         canary, the context the output checks read, caps and cache markers, the egress gate
         (audited) and the provider's credential and URL."""
         plan = record.plan
-        if self.config.settings.canary_marker:
-            fmt.add_system_text(body, self.canary())
-            record.note("canary")
-        context = {"hidden_context": fmt.hidden_context(body)}
-        if isinstance(body.get("tools"), list):
-            context["tools"] = body["tools"]
-        # The request's documents, search results and tool results: what the answer may rest
-        # on, for the policy's groundedness and citation checks (in memory, never recorded).
-        from znyx_runtime.gateway.optimise.verify import grounding_sources
-        plan.sources = grounding_sources(fmt, body)
-        if plan.sources:
-            context["grounding_sources"] = plan.sources
-            context["source_context"] = "\n\n".join(s["text"] for s in plan.sources)
-        sent = fmt.input_parts(body, _ALL_ROLES)
-        record.estimated_input_tokens = (
-            estimate_tokens(sum(len(p.text) for p in sent if p.kind != "opaque"))
-            + OPAQUE_PART_TOKENS * sum(1 for p in sent if p.kind == "opaque"))
-        if plan.on("budget_degrade"):
-            plan.near_budget = self._near_budget(key, member, plan)
-        plan.before_send(fmt, provider, body, record, self.optimiser.seen, self._caller_id(key))
-        await self._permit_egress(provider, policy, len(json.dumps(body)), scope, record)
-
         credential = client_credential if provider.uses_client_key else None
         if not provider.uses_client_key:
             try:
@@ -1189,6 +1215,25 @@ class Gateway:
                              outcome="error", error_type="api_error") from None
         url = self.upstream.url(provider, deployment=deployment, api_version=api_version)
         headers = self.upstream.headers(provider, request.headers, credential)
+        if plan.on("summarise_history") and not fmt.is_stream(body):
+            await self._summarise(fmt, provider, url, headers, body, key, scope, policy, record, plan, live=True)
+        if self.config.settings.canary_marker:
+            fmt.add_system_text(body, self.canary())
+            record.note("canary")
+        # The request's documents, search results and tool results: what the answer may rest
+        # on, for the policy's groundedness and citation checks (in memory, never recorded).
+        context = self._output_context(fmt, body)
+        plan.sources = context.get("grounding_sources") or []
+        sent = fmt.input_parts(body, _ALL_ROLES)
+        record.estimated_input_tokens = (
+            estimate_tokens(sum(len(p.text) for p in sent if p.kind != "opaque"))
+            + OPAQUE_PART_TOKENS * sum(1 for p in sent if p.kind == "opaque"))
+        if plan.on("budget_degrade"):
+            plan.near_budget = self._near_budget(key, member, plan)
+        self._right_size(fmt, body, key, policy, record, plan)
+        plan.before_send(fmt, provider, body, record, self.optimiser.seen, self._caller_id(key))
+        self._plan_shadow(fmt, body, key, policy, record, plan, url)
+        await self._permit_egress(provider, policy, len(json.dumps(body)), scope, record)
         record.stream = fmt.is_stream(body)
         return context, url, headers
 
@@ -1244,6 +1289,616 @@ class Gateway:
             key = self._token_key_cache = hmac.new(user_id_key(), b"znyx-pii-token", hashlib.sha256).hexdigest()
         return key
 
+    # -- batch submission (technique 8) ----------------------------------------------
+
+    def batch_store(self):
+        store = getattr(self, "_batch_store", None)
+        if store is None:
+            from znyx_runtime.gateway.batch import BatchStore
+            store = self._batch_store = BatchStore()
+        return store
+
+    def _batchable(self, request: Request, fmt, provider: Provider, body: Dict[str, Any], plan) -> bool:
+        """A call the app marks as not urgent, on a provider whose batch API the gateway
+        speaks, and nothing in this call that only lives in memory (PII placeholders)."""
+        from znyx_runtime.gateway.batch import supports_batch
+        if str(request.headers.get("x-znyx-urgency") or "").strip().lower() != "low":
+            return False
+        if not plan.on("batch") or fmt.is_stream(body) or len(plan.vault) or plan.shadow is not None:
+            return False
+        return supports_batch(provider)
+
+    async def _enqueue_batch(self, fmt, provider: Provider, url: str, body: Dict[str, Any], key: GatewayKey,
+                             scope: Dict[str, str], record: CallRecord, plan) -> Response:
+        """Keep the checked call for the batch API and answer 202. What it will likely use is
+        charged to the key's day and session now (a reservation), so queued calls cannot get
+        around the key's limits; the difference is settled when the answer arrives."""
+        import dataclasses
+        asked = body.get("max_completion_tokens") or body.get("max_tokens")
+        asked = asked if isinstance(asked, int) and not isinstance(asked, bool) and asked > 0 else 1000
+        reserve_tokens = record.estimated_input_tokens + asked
+        standard = self.prices_for(record.member).cost(record.model, fmts.Usage(record.estimated_input_tokens, asked))
+        reserve_cost = round((standard or 0.0) * BATCH_PRICE_SHARE, 8)
+        self._charge_usage(key, reserve_tokens, reserve_cost, requests=1)
+        self._count_loop(key, record, reserve_tokens)
+        fields = {f.name: getattr(record, f.name) for f in dataclasses.fields(record) if f.name != "plan"}
+        fields.update(profile=plan.profile, scope=scope, reserved={"tokens": reserve_tokens, "cost": reserve_cost})
+        provider_key = f"{provider.member}/{provider.name}" if provider.member else provider.name
+        job_id = await asyncio.to_thread(
+            self.batch_store().add, key_sha256=key.key_sha256 or key.id, member=key.member, api=record.api,
+            provider=provider_key, url=url, body=body, record=fields)
+        headers = self.trace_headers(record)
+        return JSONResponse({"id": job_id, "object": "znyx.batch_job", "status": "queued",
+                             "poll": f"/v1/znyx/batches/{job_id}"}, status_code=202, headers=headers)
+
+    def _batch_key(self, job: Dict[str, Any], usable: bool = True) -> Optional[GatewayKey]:
+        return next((k for k in self.config.keys_by_digest.values()
+                     if (k.key_sha256 or k.id) == job["key_sha256"] and (not usable or not k.disabled)), None)
+
+    async def batch_job_allowed(self, job: Dict[str, Any]) -> Optional[str]:
+        """Why a queued call may no longer be sent (None when it may): the key, its budgets
+        and the egress gate are checked again at the real crossing (audited then)."""
+        key = self._batch_key(job)
+        if key is None:
+            return "the gateway key is no longer valid"
+        saved = json.loads(job["record"] or "{}")
+        scope = saved.get("scope") or {}
+        try:
+            member = self.bundle_manager.member_by_key(key.member or None)
+            body = json.loads(job["body"] or "{}")
+            self._check_spend_controls(key, member, body.get("model"))
+            policy = self.bundle_manager.get_policy(tenant_id=scope.get("tenant_id", key.tenant_id),
+                                                    app_id=scope.get("app_id", key.app_id),
+                                                    agent_id=scope.get("agent_id", key.agent_id),
+                                                    env=scope.get("env", "prod"), member=member)
+            provider = self.config.providers.get(job["provider"])
+            if provider is None:
+                return "the provider is no longer available"
+            record = CallRecord(request_id=saved.get("request_id") or job["id"], key_id=key.id,
+                                tenant_id=key.tenant_id, app_id=key.app_id, agent_id=key.agent_id, api=job["api"],
+                                model=body.get("model"))
+            await self._permit_egress(provider, policy, len(job["body"] or ""), scope, record)
+        except Denied as denied:
+            return denied.message
+        except Exception as exc:  # noqa: BLE001 - when in doubt the call is not sent
+            return f"the call cannot be sent now ({type(exc).__name__})"
+        return None
+
+    def _output_context(self, fmt, body: Dict[str, Any]) -> Dict[str, Any]:
+        """What the output checks read besides the answer: the request's own system prompt and
+        tools (hidden-context leak check) and its documents and tool results (groundedness)."""
+        from znyx_runtime.gateway.optimise.verify import grounding_sources
+        context: Dict[str, Any] = {"hidden_context": fmt.hidden_context(body)}
+        if isinstance(body.get("tools"), list):
+            context["tools"] = body["tools"]
+        sources = grounding_sources(fmt, body)
+        if sources:
+            context["grounding_sources"] = sources
+            context["source_context"] = "\n\n".join(s["text"] for s in sources)
+        return context
+
+    async def finish_batch_job(self, job: Dict[str, Any], payload: Optional[Dict[str, Any]],
+                               error: Optional[str]) -> None:
+        """A batch call's answer arrived (or failed): check it like a live answer under the
+        policy in force now, settle what it cost against the reservation, record the call,
+        and keep the checked answer for the app."""
+        import dataclasses
+        from znyx_runtime.gateway.optimise import Plan
+        store = self.batch_store()
+        fmt = fmts.FORMATS[job["api"]]
+        saved = json.loads(job["record"] or "{}")
+        scope = saved.pop("scope", None) or {}
+        profile = saved.pop("profile", None)
+        reserved = saved.pop("reserved", None) or {"tokens": 0, "cost": 0.0}
+        names = {f.name for f in dataclasses.fields(CallRecord)}
+        record = CallRecord(**{k: v for k, v in saved.items() if k in names and k not in ("plan", "started")})
+        # Latency counted from when the app queued the call.
+        record.started = time.perf_counter() - max(0.0, (time.time_ns() - record.started_ns) / 1e9)
+        key = self._batch_key(job)
+        owner = key or self._batch_key(job, usable=False)          # charged even if since disabled
+        provider = self.config.providers.get(job["provider"])
+        record.plan = Plan(profile, ["batch"], provider.format if provider else "openai", record.model)
+        expected = "content" if fmt is fmts.AnthropicMessages else "choices"
+        readable = isinstance(payload, dict) and isinstance(payload.get(expected), list)
+        if isinstance(payload, dict):
+            # Billed whether or not it can be released: usage and cost are recorded.
+            record.response_model = payload.get("model") if isinstance(payload.get("model"), str) else None
+            self._apply_usage(record, fmt.usage(payload))
+            standard = record.cost_usd
+            if standard is not None:
+                record.cost_usd = round(standard * BATCH_PRICE_SHARE, 8)
+                effect = record.plan.effect("batch")
+                effect.basis, effect.saved_usd = "fixed", round(standard - record.cost_usd, 8)
+        if owner is not None:
+            actual_tokens = (record.input_tokens or 0) + (record.output_tokens or 0)
+            self._charge_usage(owner, actual_tokens - int(reserved.get("tokens", 0)),
+                               (record.cost_usd or 0.0) - float(reserved.get("cost", 0.0)))
+        try:
+            if key is None:
+                raise Denied(403, "the gateway key is no longer valid", "batch_failed", outcome="error",
+                             error_type="api_error")
+            if error or not readable:
+                raise Denied(502, error or "The provider returned an answer the gateway cannot read", "batch_failed",
+                             outcome="error", error_type="api_error")
+            member = self.bundle_manager.member_by_key(key.member or None)
+            policy = self.bundle_manager.get_policy(tenant_id=scope.get("tenant_id", key.tenant_id),
+                                                    app_id=scope.get("app_id", key.app_id),
+                                                    agent_id=scope.get("agent_id", key.agent_id),
+                                                    env=scope.get("env", "prod"), member=member)
+            body = json.loads(job["body"] or "{}")
+            await self._enforce_contract(fmt, payload, policy, record)
+            await self._guard_output(fmt, payload, scope, policy, record, self._output_context(fmt, body))
+            record.status = 200
+            await asyncio.to_thread(store.update, job["id"], status="done", result=json.dumps(payload), body=None,
+                                    error=None)
+        except Denied as denied:
+            record.status, record.outcome, record.reason = denied.status, denied.outcome, denied.code
+            await asyncio.to_thread(store.update, job["id"], status="failed", error=denied.message, body=None)
+        except Exception:  # noqa: BLE001 - a job that cannot be finished is failed, never released unchecked
+            logger.exception("gateway: batch job %s could not be finished", job["id"])
+            record.status, record.outcome, record.reason = 500, "error", "batch_failed"
+            await asyncio.to_thread(store.update, job["id"], status="failed",
+                                    error="the answer could not be checked", body=None)
+        self._record(record)
+
+    async def batch_status(self, request: Request, job_id: str) -> Response:
+        """``GET /v1/znyx/batches/{id}``: the job's state, and its checked answer once done.
+        Only the key that queued it may read it."""
+        try:
+            key, _ = self._identify(request)
+        except Denied as denied:
+            return JSONResponse({"error": {"message": denied.message, "code": denied.code}}, status_code=denied.status)
+        job = await asyncio.to_thread(self.batch_store().get, job_id) if job_id.startswith("zbatch_") else None
+        if job is None or job["key_sha256"] != (key.key_sha256 or key.id):
+            return JSONResponse({"error": {"message": "No such batch job", "code": "not_found"}}, status_code=404)
+        out: Dict[str, Any] = {"id": job["id"], "object": "znyx.batch_job", "status": job["status"],
+                               "created": int(job["created"])}
+        if job["status"] == "done":
+            out["result"] = json.loads(job["result"])
+        if job["status"] == "failed":
+            out["error"] = job["error"]
+        return JSONResponse(out)
+
+    # -- right-sizing and shadow tests (part 3) ----------------------------------------
+
+    def _right_size_target(self, fmt, body: Dict[str, Any], key: GatewayKey, policy: Dict[str, Any],
+                           record: CallRecord, plan) -> Optional[str]:
+        """The smaller model this call may go to, or None: never for streams, agent steps,
+        calls whose input checks found something, or an app the policy marks critical."""
+        from znyx_runtime.gateway.optimise import rightsize
+        target = plan.opts.setting("right_size_to")
+        if not target or record.api == "azure" or fmt.is_stream(body) or target == record.model:
+            return None
+        if plan.parallel or plan.batch_requested:
+            return None                       # decided before the checks ran, or never verified
+        marks = policy.get("optimisation") if isinstance(policy.get("optimisation"), dict) else {}
+        if marks.get("critical") or record.input_decision != "ALLOW" or record.rule_ids:
+            return None
+        if rightsize.is_agent_step(body):
+            return None
+        if not self._model_gates_pass(key, target, record, "right_size_refused"):
+            return None
+        return target
+
+    def _right_size(self, fmt, body: Dict[str, Any], key: GatewayKey, policy: Dict[str, Any],
+                    record: CallRecord, plan) -> None:
+        """Technique 14, once approved: a request the rules or the difficulty score find easy
+        goes to the smaller model (verified after, retried on the requested model if it
+        fails). Never hidden: the response and the trace say which model answered."""
+        if not plan.on("right_size"):
+            return
+        target = self._right_size_target(fmt, body, key, policy, record, plan)
+        if target is None:
+            return
+        from znyx_runtime.gateway.optimise import rightsize
+        route, _why, _p, _values = rightsize.decide(body, plan.opts.tuned())
+        if route != "small":
+            return
+        plan.right_sized_from = record.model
+        body["model"] = target
+        record.note("right_sized")
+        plan.effect("right_size").basis = "fixed"
+
+    def _plan_shadow(self, fmt, body: Dict[str, Any], key: GatewayKey, policy: Dict[str, Any],
+                     record: CallRecord, plan, url: str = "") -> None:
+        """Pick a shadow test for this call (sampled, within the key's daily allowance): the
+        variant request it would send, or a routing verdict that needs no call."""
+        if not plan.shadow_candidates or fmt.is_stream(body) or plan.parallel or plan.optimise_off:
+            return
+        from znyx_runtime.gateway.optimise import rightsize, shadow as shadows
+        # Sample first: building variants costs time and is wasted on calls not tested.
+        if not shadows.sampled(plan.opts.setting("shadow_percent")):
+            return
+        candidates = []
+        for technique in plan.shadow_candidates:
+            if technique == "right_size":
+                target = self._right_size_target(fmt, body, key, policy, record, plan)
+                if target:
+                    candidates.append((technique, target))
+            else:
+                variant = self._stage_c_variant(technique, fmt, body, plan, record)
+                if isinstance(variant, tuple) and variant[0] == "cache":
+                    # In shadow the cache looks further (down to 60% of words the same), so the
+                    # results show where the cut-off can safely sit (technique 23 tunes it).
+                    hit = self._semantic_lookup(body, key, url, policy, plan, record, similarity=60)
+                    variant = ("answer", hit[0], hit[3]) if hit is not None else None
+                if variant is not None:
+                    candidates.append((technique, variant))
+        if not candidates:
+            return
+        technique, detail = candidates[0] if len(candidates) == 1 else shadows.pick(candidates)
+        test: Dict[str, Any] = {"technique": technique, "variant": None}
+        if technique == "right_size":
+            route, _why, _p, values = rightsize.decide(body, plan.opts.tuned())
+            test["routed"], test["features"] = route, rightsize.vector(values)
+            if route == "small":
+                test["variant"] = {**fmts.deep_copy(body), "model": detail}
+        elif isinstance(detail, tuple) and detail[0] == "answer":
+            test["answer"] = detail[1]                  # a stored answer: nothing to send
+            test["features"] = [round(detail[2], 4)]    # how similar the questions were
+        elif isinstance(detail, tuple) and detail[0] == "build":
+            test["build"], test["body"] = detail[1], fmts.deep_copy(body)
+        else:
+            test["variant"] = detail
+        if test["variant"] is not None or test.get("build"):
+            from znyx_core.state_store import get_state_store
+            if not shadows.within_daily_allowance(get_state_store(), plan.caller,
+                                                  plan.opts.setting("shadow_calls_per_day")):
+                record.note("shadow_allowance_used")
+                return
+        plan.shadow = test
+
+    def _stage_c_variant(self, technique: str, fmt, body: Dict[str, Any], plan, record: CallRecord):
+        """The request as a stage C technique would send it (a request, or for the model-backed
+        ones a coroutine that builds it), or None when it would not change it."""
+        from znyx_runtime.gateway.optimise import stage_c
+        copy = fmts.deep_copy(body)
+        if technique == "tool_pruning":
+            changed = stage_c.prune_tools(record.api, copy, plan.opts.setting("tool_keep"))
+        elif technique == "relevance_filter":
+            changed = stage_c.filter_irrelevant(fmt, copy)
+        elif technique == "context_order":
+            changed = stage_c.order_context(copy) if fmt is fmts.AnthropicMessages else 0
+        elif technique == "mark_untrusted":
+            changed = stage_c.mark_untrusted(fmt, copy)
+        elif technique == "summarise_history":
+            if stage_c.summary_cut(copy, plan.opts.setting("summarise_after_turns")) is None:
+                return None
+            return ("build", technique)
+        elif technique == "compress":
+            if not self._compress_available() or not self._compress_parts(fmt, copy):
+                return None
+            return ("build", technique)
+        elif technique == "semantic_cache":
+            return ("cache", technique)
+        else:
+            return None
+        return copy if changed else None
+
+    async def _run_shadow(self, fmt, provider: Provider, url: str, headers: Dict[str, str], plan,
+                          record: CallRecord, key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any],
+                          served_text: str, served_usage: fmts.Usage) -> None:
+        """After the client has its answer: send the variant, compare, keep only the verdict.
+        The call is recorded when the test is done (its event carries the verdict)."""
+        from znyx_runtime.gateway.optimise import shadow as shadows, verify
+        test = plan.shadow
+        technique = test["technique"]
+        effect = plan.effect(technique)
+        effect.shadow, effect.basis, effect.saved_usd = True, "fixed", 0.0
+        effect.routed, effect.features = test.get("routed"), test.get("features")
+        try:
+            if test.get("answer") is not None:
+                # The semantic cache: the stored answer it would have served, against the fresh one.
+                effect.features = test.get("features")
+                answer = fmts.parse_response(test["answer"])
+                text = verify.answer_text(fmt, answer) if isinstance(answer, dict) else None
+                served_cost = self.prices_for(record.member).cost(record.response_model or record.model, served_usage)
+                effect.projected_saved_usd = served_cost
+                if text is None:
+                    record.note("shadow_failed")
+                    return
+                nli = shadows.nli_from_policy(policy, self.egress_sink,
+                                              self._request(scope, record, "shadow", served_text, "assistant"))
+                agreed, score, method = await asyncio.to_thread(shadows.compare, served_text, text, nli)
+                effect.verified, effect.agreement, effect.method = ("pass" if agreed else "fail"), score, method
+                record.note("shadow_tested")
+                return
+            variant = test["variant"]
+            try:
+                member = self.bundle_manager.member_by_key(key.member or None)
+                self._check_spend_controls(key, member, (variant or {}).get("model") or record.model)
+            except Exception:  # noqa: BLE001 - a spent budget or a member no longer served: no test
+                record.note("shadow_refused")
+                return
+            if test.get("build"):
+                variant = await self._build_variant(test["build"], fmt, provider, url, headers, test["body"], key,
+                                                    scope, policy, record, plan)
+                if variant is None:
+                    record.note("shadow_failed")
+                    return
+            await self._permit_egress(provider, policy, len(json.dumps(variant)), scope, record)
+            response = await self.upstream.send(provider, url, headers, variant)
+            if response.status_code != 200:
+                record.note("shadow_failed")
+                return
+            answer = fmts.parse_response(response.content)
+            text = verify.answer_text(fmt, answer) if isinstance(answer, dict) else None
+            usage = fmt.usage(answer) if isinstance(answer, dict) else fmts.Usage()
+            model = (answer.get("model") if isinstance(answer, dict) and isinstance(answer.get("model"), str)
+                     else variant.get("model") or record.model)
+            prices = self.prices_for(record.member)
+            if usage.input_tokens is not None:
+                cost = prices.cost(model, usage)
+                self._extra_call(plan, record, technique, model, usage)
+                served_cost = prices.cost(record.response_model or record.model, served_usage)
+                if served_cost is not None and cost is not None:
+                    effect.projected_saved_usd = round(served_cost - cost, 8)
+            if text is None:
+                record.note("shadow_failed")
+                return
+            nli = shadows.nli_from_policy(policy, self.egress_sink,
+                                          self._request(scope, record, "shadow", served_text, "assistant"))
+            agreed, score, method = await asyncio.to_thread(shadows.compare, served_text, text, nli)
+            effect.verified, effect.agreement, effect.method = ("pass" if agreed else "fail"), score, method
+            record.note("shadow_tested")
+        except Exception:  # noqa: BLE001 - a shadow test never affects the call; it is noted
+            record.note("shadow_failed")
+            logger.debug("gateway: shadow test failed for %s", record.request_id, exc_info=True)
+        finally:
+            self._record(record)
+
+    async def _build_variant(self, technique: str, fmt, provider: Provider, url: str, headers: Dict[str, str],
+                             body: Dict[str, Any], key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any],
+                             record: CallRecord, plan) -> Optional[Dict[str, Any]]:
+        if technique == "summarise_history":
+            done = await self._summarise(fmt, provider, url, headers, body, key, scope, policy, record, plan, live=False)
+            return body if done else None
+        if technique == "compress":
+            before = {id(p): p.text for p in self._compress_parts(fmt, body)}
+            if not await self._compress(fmt, body, plan, record, live=False):
+                return None
+            # Shortened text can read differently from the checked original: checked before it leaves.
+            quiet = quiet_policy(policy)
+            for part in self._compress_parts(fmt, body) + stage_c_parts(fmt, body):
+                if part.text in before.values():
+                    continue
+                verdict = await self._check_text(part.text, part.kind, part.role, part.tool_name, "input", scope,
+                                                 record, quiet, quiet, "shadow-compress")
+                if verdict.decision == "BLOCK" or verdict.wants_change:
+                    record.note("shadow_refused")
+                    return None
+            return body
+        return None
+
+    async def _summarise(self, fmt, provider: Provider, url: str, headers: Dict[str, str], body: Dict[str, Any],
+                         key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any], record: CallRecord, plan,
+                         live: bool) -> bool:
+        """Technique 12: replace older turns by a summary from the key's summary model (same
+        provider, the same gates as any model). The summary is checked like input before it is
+        sent, and kept per conversation prefix so the next turn reuses it. Returns True when
+        the request changed."""
+        from znyx_runtime.gateway.optimise import stage_c, verify
+        model = plan.opts.setting("summary_model")
+        if not model or record.api == "azure":
+            return False
+        cut = stage_c.summary_cut(body, plan.opts.setting("summarise_after_turns"))
+        if cut is None or not self._model_gates_pass(key, model, record, "summary_refused"):
+            return False
+        store = getattr(self, "_summaries", None)
+        if store is None:
+            store = self._summaries = stage_c.SummaryStore()
+        prefix = stage_c.prefix_key(f"{plan.caller}|{policy.get('policy_version') or ''}|{scope.get('app_id')}",
+                                    body, cut)
+        summary = store.get(prefix)
+        owner = "summarise_history"
+        if summary is None:
+            ask = stage_c.summary_request(model, record.api, stage_c.transcript(body, cut))
+            try:
+                await self._permit_egress(provider, policy, len(json.dumps(ask)), scope, record)
+                response = await self.upstream.send(provider, url, headers, ask)
+                answer = fmts.parse_response(response.content) if response.status_code == 200 else None
+            except (Denied, UpstreamError, ValueError, RecursionError):
+                answer = None
+            summary = verify.answer_text(fmt, answer) if isinstance(answer, dict) else None
+            if isinstance(answer, dict):
+                usage = fmt.usage(answer)
+                if usage.input_tokens is not None:
+                    self._extra_call(plan, record, owner, model, usage)     # billed, charged at once
+            if not summary:
+                record.note("summary_failed")
+                return False
+            store.put(prefix, summary)
+        # The summary is the model's text about checked text: checked before every use, under
+        # the policy in force (a stored one too; a summary checked clean is skipped cheaply).
+        quiet = quiet_policy(policy)
+        verdict = await self._check_text(summary, "text", "system", None, "input", scope, record, quiet,
+                                         quiet, "summary")
+        if verdict.decision == "BLOCK" or verdict.wants_change:
+            record.note("summary_refused")
+            return False
+        removed = sum(len(json.dumps(m)) for m in body["messages"][:cut]) - len(summary)
+        stage_c.apply_summary(fmt, body, cut, summary)
+        if live:
+            record.note("summarised")
+            effect = plan.effect(owner)
+            effect.basis, effect.estimated = "fixed", True
+            effect.saved_input_tokens += max(0, removed // 4)
+            price = self.prices_for(record.member).lookup(record.model) or {}
+            effect.saved_usd = round((effect.saved_usd or 0.0) + max(0, removed // 4) *
+                                     price.get("input_per_mtok", 0.0) / 1_000_000, 8)
+        return True
+
+    @staticmethod
+    def _compress_available() -> bool:
+        import os
+        return bool(os.environ.get("ZNYX_INFERENCE_URL"))
+
+    @staticmethod
+    def _compress_parts(fmt, body: Dict[str, Any]) -> List[fmts.Part]:
+        from znyx_runtime.gateway.optimise import stage_c
+        return [p for p in stage_c.retrieved_parts(fmt, body)
+                if len(p.text) >= 2000 and not stage_c._cited(stage_c._block(body, p.path))]
+
+    async def _compress(self, fmt, body: Dict[str, Any], plan, record: CallRecord, live: bool) -> bool:
+        """Technique 13: long tool results and documents shortened by the model server's
+        compression model (task ``compress``: the spans of text worth keeping). In the
+        perimeter only: a model server outside the network is not called. Before the input
+        guard, which reads the shortened text. Returns True when the request changed."""
+        import os
+        from urllib.parse import urlsplit
+        import ipaddress
+        parts = self._compress_parts(fmt, body)
+        if not parts or not self._compress_available():
+            return False
+        base = os.environ["ZNYX_INFERENCE_URL"].rstrip("/")
+        host = (urlsplit(base).hostname or "").lower()
+        try:
+            private = host == "localhost" or ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            private = host.endswith((".internal", ".local", ".svc", ".cluster.local")) or "." not in host
+        if not private:
+            record.note("compress_refused")
+            return False
+        results = await self._compress_call(base, [p.text for p in parts])
+        if not isinstance(results, list) or len(results) != len(parts):
+            record.note("compress_unavailable")
+            return False
+        removed = 0
+        for part, result in zip(parts, results):
+            spans = _clean_spans(result.get("entity_spans") if isinstance(result, dict) else None, len(part.text))
+            if not spans:
+                continue
+            kept = " ".join(part.text[s:e] for s, e in spans)
+            if kept and len(kept) < len(part.text):
+                try:
+                    fmt.set_text(body, part, kept)
+                except (ValueError, TypeError):
+                    continue
+                removed += len(part.text) - len(kept)
+        if removed and live:
+            record.note("compressed")
+            plan.effect("compress", saved_input_tokens=removed // 4, estimated=True)
+        return removed > 0
+
+    @staticmethod
+    async def _compress_call(base: str, texts: List[str]) -> Optional[List[Any]]:
+        """The model server's ``compress`` task for these texts (its results), or None."""
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(f"{base}/v1/infer/compress", json={"texts": texts, "params": {"rate": 0.5}})
+            return response.json().get("results") if response.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    def _semantic_lookup(self, body: Dict[str, Any], key: GatewayKey, url: str, policy: Dict[str, Any], plan,
+                         record: CallRecord, similarity: Optional[int] = None):
+        """A stored answer to a near-identical question in the same context, or None. Never
+        for a call whose input checks found something."""
+        from znyx_runtime.gateway.optimise import rightsize, stage_c
+        if record.input_decision != "ALLOW" or record.rule_ids or rightsize.is_agent_step(body):
+            return None                       # never for findings, never inside an agent loop
+        cache = getattr(self, "_semantic", None)
+        if cache is None:
+            return None
+        context = stage_c.context_key(plan.caller, url, str(policy.get("policy_version") or ""), body,
+                                      getattr(record, "_cache_user", record.user))
+        if similarity is None:
+            tuned = plan.opts.tuned().get("semantic_cache") or {}
+            similarity = (tuned.get("similarity") if isinstance(tuned.get("similarity"), (int, float)) else None) \
+                or plan.opts.setting("semantic_similarity") or stage_c.DEFAULT_SIMILARITY
+        return cache.find(context, stage_c.question_of(body), similarity)
+
+    def _semantic_store(self, body: Dict[str, Any], url: str, policy: Dict[str, Any], plan, record: CallRecord,
+                        content: bytes, headers: Dict[str, str], upstream_ms: Optional[int]) -> None:
+        from znyx_runtime.gateway.optimise import rightsize, stage_c
+        if record.input_decision != "ALLOW" or record.rule_ids or rightsize.is_agent_step(body):
+            return
+        cache = getattr(self, "_semantic", None)
+        if cache is None:
+            cache = self._semantic = stage_c.SemanticCache()
+        context = stage_c.context_key(plan.caller, url, str(policy.get("policy_version") or ""), body,
+                                      getattr(record, "_cache_user", record.user))
+        cache.put(context, stage_c.question_of(body), content, headers, upstream_ms)
+
+    def _schedule(self, coroutine, record: Optional[CallRecord] = None) -> None:
+        """Run a background job (a shadow test). Its call is recorded even if the job is
+        cancelled before it ran (a shutdown)."""
+        tasks = getattr(self, "_background", None)
+        if tasks is None:
+            tasks = self._background = set()
+        task = asyncio.ensure_future(coroutine)
+        tasks.add(task)
+
+        def done(t, record=record) -> None:
+            tasks.discard(t)
+            if record is not None and t.cancelled() and not getattr(record, "_recorded", False):
+                record.note("shadow_cancelled")
+                self._record(record)
+
+        task.add_done_callback(done)
+
+    async def drain(self, timeout: float = 5.0) -> None:
+        """Let background jobs (shadow tests) finish before shutting down; cancel the rest."""
+        tasks = list(getattr(self, "_background", None) or [])
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+
+    async def _check_right_sized(self, fmt, provider: Provider, url: str, headers: Dict[str, str],
+                                 body: Dict[str, Any], payload: Dict[str, Any], plan, record: CallRecord,
+                                 key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify the smaller model's answer (contract, rules, computed claims, groundedness);
+        if it fails, ask the requested model and pay for it. The ledger gets the net saving."""
+        from znyx_runtime.gateway.optimise import verify
+        prices = self.prices_for(record.member)
+        small = record.response_model or body.get("model")
+        small_usage = fmts.Usage(record.input_tokens, record.output_tokens, record.cached_input_tokens,
+                                 record.cache_write_tokens)
+        effect = plan.effect("right_size")
+        effect.basis, effect.estimated = "fixed", True
+        text = verify.answer_text(fmt, payload)
+        faults = await self._faults(fmt, text, plan, scope, record, policy, force=True) if text is not None else None
+        if faults:
+            big = {**fmts.deep_copy(body), "model": plan.right_sized_from}
+            try:
+                await self._permit_egress(provider, policy, len(json.dumps(big)), scope, record)
+                response = await self.upstream.send(provider, url, headers, big)
+                answer = fmts.parse_response(response.content) if response.status_code == 200 else None
+            except (Denied, UpstreamError, ValueError, RecursionError):
+                answer = None
+            expected = "content" if fmt is fmts.AnthropicMessages else "choices"
+            if isinstance(answer, dict) and isinstance(answer.get(expected), list):
+                served = answer.get("model") if isinstance(answer.get("model"), str) else plan.right_sized_from
+                self._extra_call(plan, record, "right_size", served, fmt.usage(answer))
+                record.response_model = served
+                record.note("right_size_retried")
+                effect.verified = "fail"
+                payload = answer
+                plan.answer_changed = True
+            else:
+                # The smaller model's answer failed its checks and the requested model did not
+                # answer: an unverified answer is not passed on.
+                effect.verified = "fail"
+                raise Denied(502, "The answer could not be verified and the requested model did not answer",
+                             "right_size_unverified", outcome="error", error_type="api_error")
+        else:
+            effect.verified = "pass"
+        counterfactual = prices.cost(plan.right_sized_from, small_usage)
+        paid = prices.cost(small, small_usage)
+        if counterfactual is not None and paid is not None:
+            shape = plan.cache_shape
+            if shape is not None and shape.prefix_chars and plan.prefix_seen:
+                # The requested model would likely have read this prefix from its cache.
+                price = prices.lookup(plan.right_sized_from) or {}
+                cached = min(small_usage.input_tokens or 0, shape.prefix_chars // 4)
+                counterfactual -= cached * (price.get("input_per_mtok", 0) - price.get(
+                    "cached_input_per_mtok", price.get("input_per_mtok", 0))) / 1_000_000
+            effect.saved_usd = round((effect.saved_usd or 0.0) + counterfactual - paid, 8)
+        return payload
+
     @staticmethod
     def _sent_texts(fmt, body: Dict[str, Any]) -> List[Tuple[Any, str]]:
         return [(p.path, p.text) for p in fmt.input_parts(body, _ALL_ROLES)]
@@ -1288,6 +1943,15 @@ class Gateway:
                 hit = None if fresh else self.optimiser.cache.get(cache_key, plan.cache_ttl())
                 if hit is not None:
                     return await self._answer_from_cache(fmt, key, scope, policy, record, context, hit)
+        if (not votes and early is None and plan is not None and plan.on("semantic_cache")
+                and "no-cache" not in (request.headers.get("cache-control") or "").lower()):
+            found = self._semantic_lookup(body, key, url, policy, plan, record)
+            if found is not None:
+                from znyx_runtime.gateway.optimise.cache import CachedAnswer
+                content, stored_headers, upstream_ms, _score = found
+                return await self._answer_from_cache(fmt, key, scope, policy, record, context,
+                                                     CachedAnswer(content, stored_headers, upstream_ms, 0.0),
+                                                     technique="semantic_cache")
         # Technique 2: an identical deterministic call of this key already in flight is
         # joined instead of sent again. The provider bills it once: one caller pays.
         if early is not None:
@@ -1326,6 +1990,19 @@ class Gateway:
         if flight.task.cancelled():
             raise UpstreamError(502, f"provider {provider.name} call was cancelled")
         response = flight.task.result()
+        if response.status_code != 200 and plan is not None and plan.right_sized_from:
+            # The smaller model refused the request: the requested model answers it instead.
+            big = {**fmts.deep_copy(body), "model": plan.right_sized_from}
+            try:
+                await self._permit_egress(provider, policy, len(json.dumps(big)), scope, record)
+                retried = await self.upstream.send(provider, url, headers, big)
+            except (Denied, UpstreamError):
+                retried = None
+            if retried is not None:
+                response, body = retried, big
+                plan.right_sized_from = None
+                plan.effects.pop("right_size", None)
+                record.note("right_size_fell_back")
         record.upstream_ms = int((time.perf_counter() - t_up) * 1000)
         returned = self.upstream.returned_headers(response)
         returned.update(self.trace_headers(record))
@@ -1362,12 +2039,23 @@ class Gateway:
         else:
             self._coalesced(record, plan, usage, flight)
         stored = response.content
+        served_text: Optional[str] = None
+        served_usage: Optional[fmts.Usage] = None
         try:
             if pays and plan is not None and plan.verifies():
                 payload = await self._verify(fmt, provider, url, headers, body, payload, plan, record, key,
                                              scope, policy)
                 if plan.answer_changed:
                     stored = json.dumps(payload).encode()     # the answer that passed, before the guard
+            if pays and plan is not None and plan.right_sized_from:
+                payload = await self._check_right_sized(fmt, provider, url, headers, body, payload, plan, record,
+                                                        key, scope, policy)
+                if plan.answer_changed:
+                    stored = json.dumps(payload).encode()
+            if plan is not None and plan.shadow is not None:
+                from znyx_runtime.gateway.optimise.verify import answer_text
+                served_text = answer_text(fmt, payload)       # before restore and the guard, like the variant
+                served_usage = fmt.usage(payload)
             if pays and plan is not None:
                 self._add_extra_calls(record, plan)
             self._restore_pii(fmt, payload, plan, record)
@@ -1388,14 +2076,44 @@ class Gateway:
         returned["x-znyx-decision"] = _worst(record.input_decision, record.output_decision)
         if plan is not None and plan.escalated_from:
             returned["x-znyx-escalated-from"] = plan.escalated_from
+        if plan is not None and plan.right_sized_from:
+            returned["x-znyx-model-requested"] = plan.right_sized_from
+            returned["x-znyx-model-served"] = record.response_model or str(body.get("model") or "")
         if (cache_key is not None and record.outcome == "ok" and record.output_decision in ("ALLOW", "WARN")
                 and not record.techniques.get("output_rewritten")
                 and "no-store" not in (request.headers.get("cache-control") or "").lower()):
             # Stored before the output guard: every later hit is checked again.
             self.optimiser.cache.put(cache_key, stored, self.upstream.returned_headers(response),
                                      flight.upstream_ms)
+        if (plan is not None and early is None and not votes and record.outcome == "ok"
+                and record.output_decision in ("ALLOW", "WARN") and not record.techniques.get("output_rewritten")
+                and (plan.on("semantic_cache") or "semantic_cache" in plan.shadow_candidates)
+                and "no-store" not in (request.headers.get("cache-control") or "").lower()):
+            self._semantic_store(body, url, policy, plan, record, stored, self.upstream.returned_headers(response),
+                                 flight.upstream_ms)
+        if self._shadow_after(fmt, provider, url, headers, plan, record, key, scope, policy,
+                              served_text, served_usage):
+            return JSONResponse(payload, status_code=200, headers=returned)   # recorded when the test ends
         self._record(record)
         return JSONResponse(payload, status_code=200, headers=returned)
+
+    def _shadow_after(self, fmt, provider: Provider, url: str, headers: Dict[str, str], plan, record: CallRecord,
+                      key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any],
+                      served_text: Optional[str], served_usage: Optional[fmts.Usage]) -> bool:
+        """Start the call's shadow test, if it has one and its answer was served as it came.
+        True when the test will record the call."""
+        test = plan.shadow if plan is not None else None
+        if test is None or record.outcome != "ok" or served_text is None:
+            return False
+        if test["variant"] is None and test.get("answer") is None and not test.get("build"):
+            # A routing verdict only (the score kept the call where it was): nothing to send.
+            effect = plan.effect(test["technique"])
+            effect.shadow, effect.basis, effect.saved_usd = True, "fixed", 0.0
+            effect.routed, effect.features = test.get("routed"), test.get("features")
+            return False
+        self._schedule(self._run_shadow(fmt, provider, url, headers, plan, record, key, scope, policy,
+                                        served_text, served_usage or fmts.Usage()), record)
+        return True
 
     # -- verification and voting (stage B) -------------------------------------------
 
@@ -1403,18 +2121,24 @@ class Gateway:
                     "computed_claims": "computed_claims", "grounded_retry": "grounded_retry"}
 
     async def _faults(self, fmt, text: str, plan, scope: Dict[str, str], record: CallRecord,
-                      policy: Dict[str, Any]):
+                      policy: Dict[str, Any], force: bool = False):
+        """What is wrong with an answer. ``force``: every check that can run does (a
+        right-sized answer is always verified), whatever the key's techniques."""
         from znyx_runtime.gateway.optimise import verify
         faults = verify.Faults()
-        contract = plan.contract
+        contract = plan.contract if plan.contract is not None or not force else verify.contract_of(policy)
+
+        def on(technique: str) -> bool:
+            return force or plan.on(technique)
+
         # Parsing and scanning a long answer is CPU work: off the event loop.
-        if contract is not None and (plan.on("structured_output") or plan.on("repair")):
+        if contract is not None and (on("structured_output") or plan.on("repair")):
             faults.add("structured_output", await asyncio.to_thread(verify.check_contract, text, contract))
-        if contract is not None and contract.rules and plan.on("business_rules"):
+        if contract is not None and contract.rules and on("business_rules"):
             faults.add("business_rules", await asyncio.to_thread(verify.check_rules, text, contract.rules))
-        if plan.on("computed_claims"):
+        if on("computed_claims"):
             faults.add("computed_claims", await asyncio.to_thread(verify.check_claims, text))
-        if plan.on("grounded_retry") and plan.sources:
+        if on("grounded_retry") and plan.sources:
             nli = None
             config = plan.grounding_config or {}
             if isinstance(config.get("nli"), dict) and config["nli"].get("enabled"):
@@ -1457,7 +2181,7 @@ class Gateway:
         target = plan.opts.setting("escalate_to")
         if (faults and plan.on("escalate") and target and record.api != "azure"
                 and target != (record.response_model or record.model) and key.model_allowed(target)
-                and self._may_escalate(key, target, record)):
+                and self._model_gates_pass(key, target, record, "escalation_refused")):
             again = await self._ask_again(fmt, provider, url, headers, body, text, faults, plan, record, "escalate",
                                           model=target, policy=policy, scope=scope)
             if again is not None:
@@ -1479,18 +2203,19 @@ class Gateway:
                 plan.effects[technique].verified = "fail" if faults else "pass"
         return payload
 
-    def _may_escalate(self, key: GatewayKey, target: str, record: CallRecord) -> bool:
-        """The stronger model passes the same gates a request naming it would: a price where
-        the key's spend is limited, and the console's budgets (blocked, priced only)."""
-        if (key.limits.spend_usd_per_day and not key.instance_key
-                and self.prices_for(key.member).lookup(target) is None):
-            record.note("escalation_refused")
+    def _model_gates_pass(self, key: GatewayKey, target: str, record: CallRecord, note: str) -> bool:
+        """Another model (escalation, right-sizing, a summary) passes the same gates a request
+        naming it would: allowed for the key, a price where the key's spend is limited, and
+        the console's budgets (blocked, priced only)."""
+        if not key.model_allowed(target) or (key.limits.spend_usd_per_day and not key.instance_key
+                                             and self.prices_for(key.member).lookup(target) is None):
+            record.note(note)
             return False
         try:
             member = self.bundle_manager.member_by_key(key.member or None)
             self._check_spend_controls(key, member, target)
-        except Exception:  # noqa: BLE001 - Denied, or a member no longer served: no escalation
-            record.note("escalation_refused")
+        except Exception:  # noqa: BLE001 - Denied, or a member no longer served
+            record.note(note)
             return False
         return True
 
@@ -1520,6 +2245,12 @@ class Gateway:
         if cost is None:
             record.price_known = False
         plan.extra_calls.append((served, usage, cost))
+        # Charged to the key's day now: it was billed whatever happens to the call after.
+        tokens = (usage.input_tokens or 0) + (usage.output_tokens or 0)
+        if plan.key is not None:
+            self._charge_usage(plan.key, tokens, cost or 0.0)
+        plan.extra_tokens += tokens
+        plan.extra_cost += cost or 0.0
         if estimated:
             record.usage_estimated = True
             record.note("usage_estimated")
@@ -1647,19 +2378,25 @@ class Gateway:
                     setattr(record, name, (getattr(record, name) or 0) + value)
             if cost is not None and record.cost_usd is not None:
                 record.cost_usd = round(record.cost_usd + cost, 8)
+            elif cost is not None and record.input_tokens is not None:
+                record.cost_usd = round(cost, 8)        # the call itself cost nothing (a cache hit, a share)
+            plan.extra_tokens_added += (usage.input_tokens or 0) + (usage.output_tokens or 0)
+            plan.extra_cost_added += cost or 0.0
         plan.extra_calls = []
 
     async def _answer_from_cache(self, fmt, key: GatewayKey, scope: Dict[str, str], policy: Dict[str, Any],
-                                 record: CallRecord, context: Optional[Dict[str, Any]], hit) -> Response:
-        """Technique 5: the provider's stored answer to this exact request, checked again
-        under the current policy. It costs nothing and saves what the stored call cost."""
+                                 record: CallRecord, context: Optional[Dict[str, Any]], hit,
+                                 technique: str = "exact_cache") -> Response:
+        """Techniques 5 and 10: a stored provider answer (to this exact request, or to a
+        near-identical question), checked again under the current policy. It costs nothing
+        and saves what the stored call cost."""
         plan = record.plan
-        record.note("exact_cache_hit")
+        record.note(f"{technique}_hit")
         payload = fmts.parse_response(hit.content)
         record.response_model = payload.get("model") if isinstance(payload.get("model"), str) else None
         usage = fmt.usage(payload)
         plan.shared_usage = usage
-        effect = plan.effect("exact_cache", basis="call", saved_input_tokens=max(
+        effect = plan.effect(technique, basis="call", saved_input_tokens=max(
             0, (usage.input_tokens or 0) - (usage.cached_input_tokens or 0)))
         effect.saved_usd = self.prices_for(record.member).cost(record.response_model or record.model, usage)
         if hit.upstream_ms is not None:
@@ -1674,7 +2411,7 @@ class Gateway:
         record.status = 200
         returned = dict(hit.headers)
         returned.update(self.trace_headers(record))
-        returned["x-znyx-cache"] = "hit"
+        returned["x-znyx-cache"] = "hit" if technique == "exact_cache" else "similar"
         returned["x-znyx-decision"] = _worst(record.input_decision, record.output_decision)
         self._record(record)
         return JSONResponse(payload, status_code=200, headers=returned)
@@ -1709,9 +2446,14 @@ class Gateway:
         record.cost_usd = prices.cost(record.response_model or record.model, usage)
 
     def _record(self, record: CallRecord) -> None:
+        if getattr(record, "_recorded", False):
+            return                             # recorded once, whatever path got here first
+        record._recorded = True
         record.latency_ms = int((time.perf_counter() - record.started) * 1000)
         record.rule_ids = sorted(set(record.rule_ids))
         if record.plan is not None:
+            if record.plan.extra_calls:
+                self._add_extra_calls(record, record.plan)     # billed calls are never left out
             self._count_risk(record)
             try:
                 record.plan.settle(record, self.prices_for(record.member))

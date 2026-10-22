@@ -325,6 +325,15 @@ async def lifespan(app: FastAPI):
         await benchmark_worker.start()
     app.state.benchmark_worker = benchmark_worker
 
+    # Low-urgency gateway calls (technique 8): the leader submits them through the
+    # providers' batch APIs and checks the answers as they return.
+    batch_runner = None
+    if leader:
+        from znyx_runtime.gateway.batch import BatchRunner
+        batch_runner = BatchRunner(app.state.gateway)
+        batch_runner.start()
+    app.state.batch_runner = batch_runner
+
     # Liveness and metrics for the supervisor and the dashboard (znyx serve only).
     directory = worker_run_dir()
     if directory is not None:
@@ -369,6 +378,8 @@ async def lifespan(app: FastAPI):
     await telemetry.stop()
     if otlp_exporter is not None:
         await otlp_exporter.close()
+    if getattr(app.state, "batch_runner", None) is not None:
+        await app.state.batch_runner.stop()
     for shipper in getattr(app.state, "audit_shippers", []):
         await shipper.stop(final_attempt=True)
     await bundle_manager.stop()

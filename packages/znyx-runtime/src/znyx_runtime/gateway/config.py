@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from znyx_core import secret_refs
-from znyx_core.optimisation import clean_settings
+from znyx_core.optimisation import clean_settings, clean_tuning
 from znyx_runtime.gateway.optimise import PROFILES, KeyOptimisation
 
 logger = logging.getLogger(__name__)
@@ -406,7 +406,7 @@ def _optimisation(raw: Any, where: str) -> KeyOptimisation:
         return KeyOptimisation()
     _require(isinstance(raw, Mapping), where, "expected a mapping")
     lists = {}
-    for name in ("enable", "disable", "approved"):
+    for name in ("enable", "disable", "approved", "shadow"):
         value = raw.get(name)
         if value is None:
             value = []
@@ -421,7 +421,14 @@ def _optimisation(raw: Any, where: str) -> KeyOptimisation:
     settings, problems = clean_settings(raw.get("settings"))
     for problem in problems:
         logger.warning("gateway: %s.settings: %s; ignored", where, problem)
-    return KeyOptimisation(**lists, settings=tuple(sorted(settings.items())))
+    tuned = ""
+    clean = clean_tuning(raw.get("tuning"))        # checked once here; anything unsafe is dropped
+    if raw.get("tuning") is not None and not clean:
+        logger.warning("gateway: %s.tuning has nothing usable; the defaults apply", where)
+    if clean:
+        import json
+        tuned = json.dumps(clean, sort_keys=True, separators=(",", ":"))
+    return KeyOptimisation(**lists, settings=tuple(sorted(settings.items())), tuning=tuned)
 
 
 def _settings(raw: Any) -> GatewaySettings:

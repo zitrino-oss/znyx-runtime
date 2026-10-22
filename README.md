@@ -338,10 +338,33 @@ The others are switched on by a profile or by name:
   explicitly, starts the provider call while the input checks run, never where the policy can
   rewrite input, and releases nothing before they pass.
 
-Batch submission and continuous tuning come with the shadow tests in a later release; the ids
-of all techniques are in `znyx_core.optimisation`, and ids this runtime does not have yet are
-ignored. The request's documents, search results and tool results now reach the policy's own
-groundedness and citation checks on gateway calls too.
+- **Batch:** a call marked `X-Znyx-Urgency: low` (with the `batch` technique) is checked, queued
+  and answered `202` with a job id; the gateway sends it through the provider's batch API
+  (Anthropic, OpenAI) at half price, checks the answer when it returns, and the app reads it
+  from `GET /v1/znyx/batches/{id}` with the same key. A queued call counts against the key's
+  daily limits when it is queued, and the key and budgets are checked again when it is sent.
+  Requests are deleted once answered;
+  answers after `ZNYX_BATCH_RETENTION_DAYS` (7). Provider keys are never stored.
+
+Techniques that can change what an answer says (tool pruning, relevance filtering, context
+ordering, marking untrusted content, history summarisation, prompt compression, the semantic
+cache, model right-sizing) are first tried in **shadow**: list them in `optimisation.shadow` and
+the gateway, on a sample of calls (`shadow_percent`, at most `shadow_calls_per_day`), sends the
+variant after the client has its normal answer, compares the two answers (NLI both ways when the
+policy has an NLI endpoint, otherwise by their words or as JSON), and records only the verdict.
+The console allows switching one on (`approved`) only after at least 95% agreement over at least
+50 samples. Right-sizing (`right_size_to`) sends simple requests to the smaller model and says so
+in `X-Znyx-Model-Requested` and `X-Znyx-Model-Served`; every such answer is verified and retried on
+the requested model if it fails. The console fits the difficulty model and the semantic cache's
+cut-off on shadow results and delivers a version you promote in the signed bundle. Prompt
+compression needs a compression model on the model server (`znyx-inference`, task `compress`).
+The semantic cache answers only when everything except the wording of the latest question is the
+same (key, end user, policy, conversation, documents, tool results), and never inside agent loops
+or for calls whose input checks found something.
+
+The ids of all techniques are in `znyx_core.optimisation`, and ids this runtime does not have
+are ignored. The request's documents, search results and tool results also reach the policy's
+own groundedness and citation checks on gateway calls.
 
 Optimisation never weakens a check. Techniques that change the request run before the input
 guard, so it reads exactly what is sent; cache markers change no text; a shared answer is

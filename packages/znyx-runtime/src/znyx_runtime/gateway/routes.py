@@ -4,6 +4,7 @@
     POST /openai/deployments/{deployment}/chat/completions     Azure OpenAI
     POST /v1/messages                                          Anthropic
     GET  /v1/models                                            what this key may use
+    GET  /v1/znyx/batches/{id}                                 a low-urgency call's answer
 
 An application switches by changing its SDK's base URL to this instance (and its
 API key to a gateway key): ``OpenAI(base_url="http://znyx:8080/v1")``,
@@ -54,6 +55,16 @@ async def messages(request: Request) -> Response:
     if gw is None or not gw.config.enabled:
         return _unavailable("anthropic")
     return await gw.handle(request, "anthropic")
+
+
+@router.get("/v1/znyx/batches/{job_id}")
+async def batch_job(job_id: str, request: Request) -> Response:
+    """A queued low-urgency call (``X-Znyx-Urgency: low``): its state, and the checked
+    answer once the provider's batch returned it."""
+    gw = _gateway(request)
+    if gw is None or not gw.config.enabled:
+        return _unavailable("openai")
+    return await gw.batch_status(request, job_id)
 
 
 @router.get("/v1/models")

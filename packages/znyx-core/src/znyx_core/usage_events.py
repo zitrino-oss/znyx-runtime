@@ -219,8 +219,33 @@ def _effects(value: Any) -> Optional[List[Dict[str, Any]]]:
             entry["latency_ms"] = int(max(-86_400_000, min(int(latency), 86_400_000)))
         if item.get("verified") in ("pass", "fail"):
             entry["verified"] = item["verified"]
+        if item.get("shadow") is True:
+            _shadow_fields(item, entry)
         out.append(entry)
     return out
+
+
+def _shadow_fields(item: Dict[str, Any], entry: Dict[str, Any]) -> None:
+    """A shadow test's verdict: numbers and fixed words only."""
+    entry["shadow"] = True
+    agreement = _coerce("sfloat", item.get("agreement"))
+    if agreement is not None:
+        entry["agreement"] = max(0.0, min(1.0, agreement))
+    projected = _coerce("sfloat", item.get("projected_saved_usd"))
+    if projected is not None:
+        entry["projected_saved_usd"] = projected
+    if item.get("routed") in ("small", "stay"):
+        entry["routed"] = item["routed"]
+    if item.get("method") in ("nli", "lexical"):
+        entry["method"] = item["method"]
+    features = item.get("features")
+    if isinstance(features, list):
+        values = []
+        for v in features[:16]:
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                values.append(max(-1e6, min(1e6, float(v))))
+        if values:
+            entry["features"] = values
 
 
 def validate(event: Any) -> Optional[Dict[str, Any]]:

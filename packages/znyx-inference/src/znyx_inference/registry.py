@@ -50,6 +50,7 @@ _HEAVY_KIND_MODULES = {
     "guard_llm": "znyx_inference.runners.guard_llm",
     "ner": "znyx_inference.runners.ner",                # token-level PII NER (unstructured)
     "language": "znyx_inference.runners.language",       # language-ID + allow/block mapping
+    "compress": "znyx_inference.runners.compress",       # prompt compression (gateway technique 13)
 }
 
 

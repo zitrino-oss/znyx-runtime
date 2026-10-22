@@ -18,16 +18,17 @@ effect); C opt-in after a shadow test (can change answers).
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from znyx_core.optimisation import (  # noqa: F401 - the catalogue (shared with the control plane)
     CALLER_MAY_SKIP, DEFAULT_PROFILE, PROFILES, STAGE_C, TECHNIQUES, KeyOptimisation, Profile, Technique,
-    active_techniques,
+    active_techniques, shadow_techniques,
 )
 from znyx_runtime.gateway import formats as fmts
-from znyx_runtime.gateway.optimise import stage_a, stage_b, tokens, verify
+from znyx_runtime.gateway.optimise import stage_a, stage_b, stage_c, tokens, verify
 from znyx_runtime.gateway.optimise.cache import DEFAULT_TTL_SECONDS, ResponseCache
 from znyx_runtime.gateway.optimise.coalesce import Coalescer
 
@@ -42,7 +43,14 @@ class Effect:
     latency_ms: Optional[int] = None     # time added (positive) or saved (negative)
     verified: Optional[str] = None       # "pass" | "fail" when the result was checked
     estimated: bool = False              # the saving is the gateway's own count
-    basis: str = "tokens"                # how it is priced: tokens | cache | call
+    basis: str = "tokens"                # how it is priced: tokens | cache | call | fixed
+    # A shadow test's verdict (part 3): never acted on for this call.
+    shadow: bool = False
+    agreement: Optional[float] = None
+    projected_saved_usd: Optional[float] = None
+    routed: Optional[str] = None         # right-sizing: where the call would have gone
+    features: Optional[List[float]] = None
+    method: Optional[str] = None         # nli | lexical
 
     def entry(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"technique": self.technique, "stage": self.stage,
@@ -54,6 +62,12 @@ class Effect:
             out["latency_ms"] = int(self.latency_ms)
         if self.verified:
             out["verified"] = self.verified
+        if self.shadow:
+            out["shadow"] = True
+            for name in ("agreement", "projected_saved_usd", "routed", "features", "method"):
+                value = getattr(self, name)
+                if value is not None:
+                    out[name] = round(value, 8) if isinstance(value, float) else value
         return out
 
 
@@ -76,12 +90,25 @@ class Plan:
         self.grounding_config: Dict[str, Any] = {}
         self.sources: List[Dict[str, str]] = []
         self.extra_calls: List[Tuple[str, fmts.Usage, Optional[float]]] = []
+        self.key = None                                    # the gateway key (charges extra calls)
+        self.extra_tokens = 0                              # extra calls: charged to the day
+        self.extra_cost = 0.0
+        self.extra_tokens_added = 0                        # ... and added to the record
+        self.extra_cost_added = 0.0
         self.answer_changed = False
         self.escalated_from: Optional[str] = None
         # Security and latency (stage B): the call's PII placeholders, and whether its
         # session is checked more strictly.
         self.vault = stage_b.PiiVault()
         self.elevated = False
+        # Part 3: shadow tests and right-sizing.
+        self.shadow_candidates: List[str] = []
+        self.shadow: Optional[Dict[str, Any]] = None       # the test this call runs, if sampled
+        self.right_sized_from: Optional[str] = None        # the model the app asked for
+        self.prefix_seen = False                           # the stable prefix was sent recently
+        self.parallel = False                              # the parallel input check is in use
+        self.batch_requested = False                       # the app asked for the batch API
+        self.optimise_off = False                          # X-Znyx-Optimise: off
         self.effects: Dict[str, Effect] = {}
         self.cache_shape: Optional[stage_a.CacheShape] = None
         self.shared_usage: Optional[fmts.Usage] = None    # a coalesced call: the leader's
@@ -104,8 +131,28 @@ class Plan:
         def count(text: str) -> int:
             return tokens.count(text, self.family, self.model)
 
-        for technique, run in (("minify", lambda f, b: stage_a.minify(f, b, count)),
-                               ("dedupe", lambda f, b: stage_a.dedupe(f, b, check_roles, count))):
+        def removed_tokens(before: str, after: str) -> int:
+            return max(0, count(before) - count(after))
+
+        def prune(f, b):
+            before = json.dumps(b.get("tools") or [])
+            removed = stage_c.prune_tools(record.api, b, self.opts.setting("tool_keep"))
+            return removed, removed_tokens(before, json.dumps(b.get("tools") or [])) if removed else 0
+
+        def filter_(f, b):
+            before = sum(len(p.text) for p in stage_c.retrieved_parts(f, b))
+            replaced = stage_c.filter_irrelevant(f, b)
+            after = sum(len(p.text) for p in stage_c.retrieved_parts(f, b))
+            return replaced, max(0, before - after) // 4 if replaced else 0     # estimated
+
+        steps = [("minify", lambda f, b: stage_a.minify(f, b, count)),
+                 ("dedupe", lambda f, b: stage_a.dedupe(f, b, check_roles, count)),
+                 # Stage C, once approved after a shadow test:
+                 ("tool_pruning", prune),
+                 ("relevance_filter", filter_),
+                 ("context_order", lambda f, b: (stage_c.order_context(b) if f is fmts.AnthropicMessages else 0, 0)),
+                 ("mark_untrusted", lambda f, b: (stage_c.mark_untrusted(f, b), 0))]
+        for technique, run in steps:
             if not self.on(technique):
                 continue
             t0 = time.perf_counter()
@@ -123,6 +170,10 @@ class Plan:
         if self.on("structured_output") and verify.request_schema(provider, body, self.contract, record.model):
             record.note("schema_requested")
         shape = self.cache_shape
+        if shape is not None and shape.prefix_chars >= stage_a.min_cache_tokens(self.model or "") * 3.5:
+            # A prefix long enough to be cached, sent recently: right-sizing counts the cache
+            # discount the requested model would likely have had.
+            self.prefix_seen = seen.seen(f"{caller}:recent:{shape.prefix_hash[:40]}")
         if not self.on("prompt_cache") or shape is None:
             return
         if provider.format == "anthropic":
@@ -168,8 +219,10 @@ class Plan:
         return n is None or (isinstance(n, int) and not isinstance(n, bool) and n == 1)
 
     def coalescing_allowed(self, body: Dict[str, Any]) -> bool:
-        # A caller whose answer may be checked and asked again does not share a call.
-        return self.on("coalesce") and self.deterministic(body) and not self.verifies()
+        # A caller whose answer may be checked and asked again, or answered by a smaller model
+        # (verified for this caller only), does not share a call.
+        return (self.on("coalesce") and self.deterministic(body) and not self.verifies()
+                and self.right_sized_from is None)
 
     def wants_contract(self) -> bool:
         return any(self.on(t) for t in ("structured_output", "repair", "business_rules"))
@@ -261,7 +314,10 @@ class Optimiser:
         if off:
             active = [t for t in active if t not in CALLER_MAY_SKIP]
         plan = Plan(profile if chosen else None, active, provider.format, model, opts)
+        plan.optimise_off = off
+        plan.batch_requested = str(headers.get("x-znyx-urgency") or "").strip().lower() == "low" and "batch" in active
         plan.caller = caller
+        plan.shadow_candidates = shadow_techniques(opts)
         if plan.on("prompt_cache"):
             plan.cache_shape = stage_a.CacheShape(api, body, caller, model or "")
         return plan

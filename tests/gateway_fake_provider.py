@@ -25,6 +25,8 @@ scripted = None
 STREAM_PIECE = 7          # characters per streamed delta
 STREAM_DELAY = 0.0
 RESPONSE_DELAY = 0.0      # seconds before a non-streamed answer (calls in flight together)
+BATCH_DONE = False        # whether submitted batches have finished
+batches: Dict[str, List[Dict[str, Any]]] = {}
 
 
 def _last_user_text(body: Dict[str, Any]) -> str:
@@ -137,6 +139,62 @@ def build_app() -> FastAPI:
     async def azure(deployment: str, request: Request):
         return await openai(request, deployment)
 
+    # -- batch APIs ------------------------------------------------------------------
+
+    @app.post("/v1/messages/batches")
+    async def anthropic_batch(request: Request):
+        body = await request.json()
+        batch_id = f"msgbatch_{len(batches) + 1}"
+        batches[batch_id] = [{"custom_id": r["custom_id"], "body": r["params"], "api": "anthropic"}
+                             for r in body["requests"]]
+        received.append({"api": "anthropic-batch", "body": body, "headers": dict(request.headers)})
+        return JSONResponse({"id": batch_id, "type": "message_batch", "processing_status": "in_progress"})
+
+    @app.get("/v1/messages/batches/{batch_id}")
+    async def anthropic_batch_status(batch_id: str):
+        if not BATCH_DONE:
+            return JSONResponse({"id": batch_id, "processing_status": "in_progress"})
+        return JSONResponse({"id": batch_id, "processing_status": "ended",
+                             "results_url": f"https://api.anthropic.com/v1/messages/batches/{batch_id}/results"})
+
+    @app.get("/v1/messages/batches/{batch_id}/results")
+    async def anthropic_batch_results(batch_id: str):
+        lines = [json.dumps({"custom_id": item["custom_id"], "result": {
+            "type": "succeeded", "message": _batch_answer("anthropic", item["body"])}}) for item in batches[batch_id]]
+        return Response("\n".join(lines), media_type="application/jsonl")
+
+    @app.post("/v1/files")
+    async def openai_upload(request: Request):
+        form = await request.form()
+        content = (await form["file"].read()).decode()
+        file_id = f"file-{len(batches) + 1}"
+        batches[file_id] = [json.loads(line) for line in content.splitlines() if line.strip()]
+        received.append({"api": "openai-file", "body": {"purpose": form.get("purpose"), "lines": batches[file_id]},
+                         "headers": dict(request.headers)})
+        return JSONResponse({"id": file_id, "object": "file", "purpose": "batch"})
+
+    @app.post("/v1/batches")
+    async def openai_batch(request: Request):
+        body = await request.json()
+        batch_id = f"batch_{len(batches) + 1}"
+        batches[batch_id] = [{"custom_id": line["custom_id"], "body": line["body"], "api": "openai"}
+                             for line in batches[body["input_file_id"]]]
+        received.append({"api": "openai-batch", "body": body, "headers": dict(request.headers)})
+        return JSONResponse({"id": batch_id, "object": "batch", "status": "validating"})
+
+    @app.get("/v1/batches/{batch_id}")
+    async def openai_batch_status(batch_id: str):
+        if not BATCH_DONE:
+            return JSONResponse({"id": batch_id, "status": "in_progress"})
+        return JSONResponse({"id": batch_id, "status": "completed", "output_file_id": f"out-{batch_id}"})
+
+    @app.get("/v1/files/{file_id}/content")
+    async def openai_file_content(file_id: str):
+        items = batches[file_id.removeprefix("out-")]
+        lines = [json.dumps({"custom_id": item["custom_id"], "response": {
+            "status_code": 200, "body": _batch_answer("openai", item["body"])}}) for item in items]
+        return Response("\n".join(lines), media_type="application/jsonl")
+
     @app.post("/v1/messages")
     async def messages(request: Request):
         body = await request.json()
@@ -204,7 +262,26 @@ def build_app() -> FastAPI:
 
 
 def reset() -> None:
-    global scripted, RESPONSE_DELAY
+    global scripted, RESPONSE_DELAY, BATCH_DONE
     received.clear()
+    batches.clear()
     scripted = None
     RESPONSE_DELAY = 0.0
+    BATCH_DONE = False
+
+
+def _batch_answer(api: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """What a batch returns for one request: the scripted answer, else the SAY text."""
+    if scripted is not None:
+        out = scripted(body)
+        if isinstance(out, dict):
+            return out
+    kind, value = _script(body)
+    text = value if kind == "text" else "ok"
+    if api == "anthropic":
+        return {"id": "msg_b", "type": "message", "role": "assistant", "model": body.get("model"),
+                "content": [{"type": "text", "text": text}], "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 100, "output_tokens": 25}}
+    return {"id": "chatcmpl-b", "object": "chat.completion", "model": body.get("model"),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30}}

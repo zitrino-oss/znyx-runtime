@@ -16,6 +16,7 @@ switched on by a profile: the key has to name them.
 """
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
@@ -39,24 +40,28 @@ _CATALOGUE = (
     Technique("exact_cache", 5, "B", "Exact response cache", True),
     Technique("output_caps", 6, "B", "Output caps and runaway-loop stop", True),
     Technique("budget_degrade", 7, "B", "Budget-aware degradation", True),
-    Technique("batch", 8, "B", "Batch submission"),
-    Technique("tool_pruning", 9, "C", "Tool pruning"),
-    Technique("semantic_cache", 10, "C", "Semantic cache"),
-    Technique("relevance_filter", 11, "C", "Relevance filtering"),
-    Technique("summarise_history", 12, "C", "History summarisation"),
-    Technique("compress", 13, "C", "Prompt compression"),
-    Technique("right_size", 14, "C", "Model right-sizing"),
+    Technique("batch", 8, "B", "Batch submission", True),
+    Technique("tool_pruning", 9, "C", "Tool pruning", True),
+    Technique("semantic_cache", 10, "C", "Semantic cache", True),
+    Technique("relevance_filter", 11, "C", "Relevance filtering", True),
+    Technique("summarise_history", 12, "C", "History summarisation", True),
+    Technique("compress", 13, "C", "Prompt compression", True,
+              caution="Needs a compression model on the model server (task compress); without one it does "
+                      "nothing."),
+    Technique("right_size", 14, "C", "Model right-sizing", True,
+              caution="Simple requests are answered by the smaller model set for the key; every such answer is "
+                      "verified and retried on the requested model when it fails."),
     Technique("structured_output", 15, "B", "Structured output", True),
     Technique("repair", 16, "B", "Validate and repair", True),
     Technique("grounded_retry", 17, "B", "Groundedness retry", True),
     Technique("computed_claims", 18, "B", "Computable claims", True),
     Technique("business_rules", 19, "B", "Business-rule checks", True),
-    Technique("context_order", 20, "C", "Context ordering"),
+    Technique("context_order", 20, "C", "Context ordering", True),
     Technique("escalate", 21, "B", "Escalate on failure", True),
     Technique("voting", 22, "B", "Self-consistency voting", True),
     Technique("tuning", 23, "B", "Continuous tuning"),
     Technique("pii_tokenise", 30, "B", "PII tokenise and restore", True),
-    Technique("mark_untrusted", 31, "C", "Marking untrusted content"),
+    Technique("mark_untrusted", 31, "C", "Marking untrusted content", True),
     Technique("risk_adaptive", 32, "B", "Risk-adaptive checking", True),
     Technique("parallel_input", 40, "B", "Parallel input check", True, explicit_only=True,
               caution="The provider receives the request before the input checks finish; the answer is "
@@ -107,7 +112,22 @@ SETTINGS: Dict[str, Tuple[type, int, int]] = {
     "escalate_to": (str, 1, 200),                      # escalate: a model the key may use
     "vote_samples": (int, 2, 5),                       # voting (default 3)
     "risk_threshold": (int, 1, 100),                   # risk_adaptive (default 60)
+    # Part 3: shadow tests and stage C.
+    "shadow_percent": (int, 1, 100),                   # share of eligible calls sampled (default 5)
+    "shadow_calls_per_day": (int, 1, 100_000),         # shadow calls a key may make a day (default 200)
+    "right_size_to": (str, 1, 200),                    # right_size: a smaller model the key allows
+    "tool_keep": (int, 1, 128),                        # tool_pruning (default 8)
+    "summarise_after_turns": (int, 4, 1000),           # summarise_history (default 12)
+    "summary_model": (str, 1, 200),                    # summarise_history: a cheaper model the key allows
+    "semantic_similarity": (int, 50, 100),             # semantic_cache: percent of words the same (default 92)
 }
+SHADOWABLE = frozenset(t.id for t in _CATALOGUE if t.stage == "C")
+# The request features right-sizing scores, in the order shadow samples carry them.
+RIGHT_SIZE_FEATURES = ("user_chars", "prompt_chars", "questions", "code", "maths", "reasoning", "constraints",
+                       "turns", "answer_tokens", "structured")
+APPROVAL_MIN_AGREEMENT = 0.95                          # shadow agreement needed before switch-on
+APPROVAL_MIN_SAMPLES = 50
+APPROVAL_WINDOW_DAYS = 30
 
 
 def clean_settings(raw: Any) -> Tuple[Dict[str, Any], List[str]]:
@@ -148,12 +168,18 @@ class KeyOptimisation:
     disable: Tuple[str, ...] = ()
     approved: Tuple[str, ...] = ()
     settings: Tuple[Tuple[str, Any], ...] = ()
+    shadow: Tuple[str, ...] = ()                     # stage C techniques under a shadow test
+    tuning: str = ""                                 # tuned parameters (JSON), from the control plane
 
     def setting(self, name: str, default: Optional[Any] = None) -> Any:
         for key, value in self.settings:
             if key == name:
                 return value
         return default
+
+    def tuned(self) -> Dict[str, Any]:
+        """The tuned parameters (difficulty model, semantic cache cut-off), checked, or {}."""
+        return _parsed_tuning(self.tuning) if self.tuning else {}
 
 
 def active_techniques(profile: str, opts: KeyOptimisation, chosen: bool = True) -> List[str]:
@@ -176,6 +202,54 @@ def active_techniques(profile: str, opts: KeyOptimisation, chosen: bool = True) 
     return out
 
 
+
+
+def clean_tuning(raw: Any) -> Dict[str, Any]:
+    """Tuned parameters that are safe to use: finite numbers in range, known features only.
+    Anything else is left out (the defaults apply)."""
+    import math
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, Mapping):
+        return out
+
+    def number(value: Any, low: float, high: float) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+        return float(value) if low <= value <= high else None
+
+    model = raw.get("right_size")
+    if isinstance(model, Mapping):
+        bias, easy_at = number(model.get("bias"), -100, 100), number(model.get("easy_at"), 0.5, 0.999)
+        weights = model.get("weights") if isinstance(model.get("weights"), Mapping) else {}
+        # A weight for every feature (the control plane's fit always gives them all): a partial
+        # model would score the missing ones as zero.
+        clean = {name: number(weights.get(name), -100, 100) for name in RIGHT_SIZE_FEATURES}
+        if bias is not None and easy_at is not None and all(v is not None for v in clean.values()):
+            out["right_size"] = {"version": str(model.get("version") or "")[:40], "bias": bias,
+                                 "weights": clean, "easy_at": easy_at}
+    cache = raw.get("semantic_cache")
+    if isinstance(cache, Mapping):
+        similarity = number(cache.get("similarity"), 60, 100)
+        if similarity is not None:
+            out["semantic_cache"] = {"similarity": int(similarity)}
+    return out
+
+
+@functools.lru_cache(maxsize=1024)
+def _parsed_tuning(text: str) -> Dict[str, Any]:
+    import json
+    try:
+        return clean_tuning(json.loads(text))
+    except (ValueError, RecursionError):
+        return {}
+
+
+def shadow_techniques(opts: KeyOptimisation) -> List[str]:
+    """The built stage C techniques a key is shadow-testing: asked for, not approved yet and
+    not switched off."""
+    return [t.id for t in _CATALOGUE
+            if t.built and t.id in SHADOWABLE and t.id in opts.shadow
+            and t.id not in opts.approved and t.id not in opts.disable]
 
 
 def catalogue() -> List[Dict[str, object]]:
