@@ -14,6 +14,7 @@ bounds every string and list, and refuses events it cannot attribute.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import uuid
@@ -38,7 +39,7 @@ FIELDS: Dict[str, str] = {
     "agent_id": "str",
     "key_id": "str",                # the gateway key's id (never the key)
     "user": "str",                  # the end user, pseudonymised by default
-    "api": "str",                   # openai | azure | anthropic
+    "api": "str",                   # openai | azure | anthropic | mcp
     "provider": "str",              # the provider's configured name
     "provider_format": "str",       # openai | azure_openai | anthropic
     "model": "str",                 # as requested
@@ -71,6 +72,14 @@ FIELDS: Dict[str, str] = {
     # Phase 5: tool names (never arguments), for the AI inventory.
     "tools_offered": "strlist",     # the tools the model was offered
     "tools_called": "strlist",      # the tools it called in its answer
+    "mcp_tools_changed": "strlist",  # MCP tools held because their definition changed: "tool@sha256"
+    "mcp_tools_seen": "strlist",     # every tool an MCP server listed: "tool@sha256"
+    # Phase 5 part 3: the call ran for a person a delegated token names (``user`` is that person).
+    "delegated": "bool",
+    "identity_provider": "str",
+    # Phase 5 part 4: which version of the instructions ran (never the text).
+    "prompt_hash": "hex16",         # prompt_fingerprint of the system and developer instructions
+    "prompt_ref": "str",            # the caller's own name for them (X-Znyx-Prompt: name@version)
 }
 
 MAX_STR = 200
@@ -93,6 +102,33 @@ _UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
 OUTCOMES = ("ok", "blocked_input", "blocked_output", "denied", "error")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
+
+
+_PROMPT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}(@[A-Za-z0-9][A-Za-z0-9._+-]{0,39})?$")
+
+
+def prompt_fingerprint(texts: List[str], key: Optional[bytes] = None, scope: str = "") -> Optional[str]:
+    """The first 16 hex of a hash of the instructions, whitespace normalised (runs of whitespace
+    become one space, ends trimmed), so a reformatted prompt keeps its fingerprint and any change
+    of wording gets a new one. With ``key`` (the runtime's user-id key) it is an HMAC, so whoever
+    sees fingerprints cannot confirm a guessed prompt; replicas sharing the key agree. None when
+    there are no instructions."""
+    joined = " ".join(" ".join(t.split()) for t in texts if isinstance(t, str))
+    joined = " ".join(joined.split())
+    if not joined:
+        return None
+    data = joined.encode("utf-8", "surrogatepass")
+    if key:
+        import hmac
+        return hmac.new(key, scope.encode("utf-8", "surrogatepass") + b"\x1fprompt\x1f" + data,
+                        hashlib.sha256).hexdigest()[:16]
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def prompt_ref(value: Optional[str]) -> Optional[str]:
+    """The caller's name for its prompt (``name@version``), or None when it is not one."""
+    value = (value or "").strip()
+    return value if _PROMPT_REF.match(value) else None
 
 
 def new_trace_id() -> str:

@@ -191,3 +191,35 @@ def test_redis_backend_requires_a_url(monkeypatch):
             get_state_store()
     finally:
         set_state_store(None)
+
+
+# -- values and lists (Phase 5: approvals, MCP sessions and tool pins) ----------------------
+
+def test_values_are_stored_read_and_kept_first_on_request(store):
+    key = _key()
+    assert store.get_value(key) is None
+    assert store.set_value(key, '{"a": 1}', ttl_seconds=60)
+    assert store.get_value(key) == '{"a": 1}'
+    assert not store.set_value(key, "second", ttl_seconds=60, only_if_absent=True)   # the first writer wins
+    assert store.get_value(key) == '{"a": 1}'
+    assert store.set_value(key, "replaced", ttl_seconds=60)
+    assert store.get_value(key) == "replaced"
+    store.delete(key)
+    assert store.get_value(key) is None and store.set_value(key, "again", 60, only_if_absent=True)
+
+
+def test_lists_are_read_without_changing_them(store):
+    key = _key()
+    assert store.get_list(key) == []
+    store.push_capped(key, "a", max_len=2, ttl_seconds=60)
+    store.push_capped(key, "b", max_len=2, ttl_seconds=60)
+    store.push_capped(key, "c", max_len=2, ttl_seconds=60)
+    assert store.get_list(key) == ["b", "c"] and store.get_list(key) == ["b", "c"]
+
+
+def test_a_value_expires():
+    clock = FakeClock()
+    mem = MemoryStateStore(clock=clock)
+    mem.set_value("k", "v", ttl_seconds=10)
+    clock.t += 11
+    assert mem.get_value("k") is None and mem.set_value("k", "w", 10, only_if_absent=True)

@@ -1,7 +1,7 @@
 """Stops: the kill switch (AI gateway Phase 5).
 
 An administrator stops or quarantines an agent, app or key, or stops a model, provider, tool
-or everything in an org, project or environment. The control plane delivers the active stops
+an MCP server, or everything in an org, project or environment. The control plane delivers the active stops
 in the signed bundle set's controls (``controls.stops``), built from its database at every
 poll, so a stop reaches every runtime with its next poll and no publish. A runtime without a
 console reads the same list from its gateway file (``stops:``).
@@ -26,10 +26,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-TARGETS = ("everything", "app", "agent", "key", "model", "provider", "tool")
+TARGETS = ("everything", "app", "agent", "key", "model", "provider", "tool", "mcp_server", "user")
 MODES = ("stop", "quarantine")
 QUARANTINABLE = frozenset({"app", "agent", "key"})
-GLOB_TARGETS = frozenset({"model", "tool"})       # match is a glob pattern
+GLOB_TARGETS = frozenset({"model", "tool", "user"})       # match is a glob pattern
 MAX_MATCH = 200
 MAX_REASON = 200
 MAX_ID = 64
@@ -63,6 +63,8 @@ class Stop:
     def matches(self, value: Optional[str]) -> bool:
         if not value:
             return False
+        if self.target == "user":                     # people: emails differ only in case
+            return fnmatch.fnmatchcase(value.lower(), self.match.lower())
         if self.target in GLOB_TARGETS:
             return fnmatch.fnmatchcase(value, self.match)
         return value == self.match
@@ -70,7 +72,9 @@ class Stop:
     def message(self) -> str:
         what = {"everything": "All AI calls here", "app": f"App {self.match}", "agent": f"Agent {self.match}",
                 "key": f"Gateway key {self.match}", "model": f"Model {self.match}",
-                "provider": f"Provider {self.match}", "tool": f"Tool {self.match}"}.get(self.target, "This call")
+                "provider": f"Provider {self.match}", "tool": f"Tool {self.match}",
+                "mcp_server": f"MCP server {self.match}",
+                "user": f"Acting for {self.match}"}.get(self.target, "This call")
         verb = "quarantined (it may not use tools)" if self.mode == "quarantine" else "stopped"
         text = f"{what} {'are' if self.target == 'everything' else 'is'} {verb} by an administrator"
         return f"{text}: {self.reason}" if self.reason else text
@@ -187,12 +191,15 @@ class StopSet:
         return (s for s in self.stops if s.active(now) and s.in_scope(project_id, environment_id))
 
     def for_caller(self, *, project_id: Optional[str], environment_id: Optional[str], app_id: Optional[str],
-                   agent_id: Optional[str], key_id: Optional[str], now: Optional[datetime] = None) -> CallStops:
+                   agent_id: Optional[str], key_id: Optional[str], now: Optional[datetime] = None,
+                   user: Optional[str] = None) -> CallStops:
+        """``user``: the verified person a delegated token acts for (part 3); stops of target
+        ``user`` concern only such calls."""
         if not self.stops:
             return NO_STOPS
         stopped = quarantined = None
         tools: List[Stop] = []
-        values = {"app": app_id, "agent": agent_id, "key": key_id}
+        values = {"app": app_id, "agent": agent_id, "key": key_id, "user": user}
         for s in self._live(project_id, environment_id, now):
             if s.target == "everything":
                 stopped = stopped or s
@@ -220,6 +227,10 @@ class StopSet:
     def provider(self, name: Optional[str], project_id: Optional[str] = None,
                  environment_id: Optional[str] = None, now: Optional[datetime] = None) -> Optional[Stop]:
         return self._first("provider", name, project_id, environment_id, now)
+
+    def mcp_server(self, name: Optional[str], project_id: Optional[str] = None,
+                   environment_id: Optional[str] = None, now: Optional[datetime] = None) -> Optional[Stop]:
+        return self._first("mcp_server", name, project_id, environment_id, now)
 
 
 def to_document(stop: Stop) -> Dict[str, Any]:

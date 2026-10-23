@@ -549,6 +549,23 @@ class ToolPermissionAuditConfig(DetectorConfig):
     allowed_tools: Optional[List[str]] = None
 
 
+class ApprovalConfig(BaseModel):
+    """Human approval for risky tool calls through the gateway (Phase 5): see
+    ``znyx_core.approvals``."""
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = True
+    tools: List[str] = Field(default_factory=list)
+    mcp_destructive: bool = False
+    timeout_seconds: int = Field(120, ge=10, le=600)
+    share: Literal["redacted", "metadata"] = "redacted"
+
+
+class McpPolicyConfig(BaseModel):
+    """How the MCP gateway treats servers (Phase 5)."""
+    model_config = ConfigDict(extra="allow")
+    allow_sampling: bool = False
+
+
 class HumanApprovalGateConfig(DetectorConfig):
     """(LLM03): require human approval before irreversible or high-impact agent actions
     (``agent_plan`` / ``agent_loop``)."""
@@ -652,6 +669,8 @@ class PolicySchema(BaseModel):
     on_fail: Optional[str] = None
     # Top-level runtime/egress policy (lint + enforcement)
     runtime_policy: Optional[RuntimePolicyConfig] = None
+    approval: Optional[ApprovalConfig] = None
+    mcp: Optional[McpPolicyConfig] = None
 
 
 def validate_policy(policy_dict: dict) -> PolicySchema:

@@ -26,6 +26,7 @@ put raw prompt text in keys or values (use a hash).
 """
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -61,6 +62,16 @@ class StateStore(Protocol):
     def delete(self, key: str) -> None:
         """Forget ``key``."""
 
+    def get_list(self, key: str) -> List[str]:
+        """The list ``push_capped`` keeps under ``key``, oldest first (empty when none)."""
+
+    def get_value(self, key: str) -> Optional[str]:
+        """The text ``set_value`` stored under ``key`` (None when none or expired)."""
+
+    def set_value(self, key: str, value: str, ttl_seconds: float, only_if_absent: bool = False) -> bool:
+        """Store ``value`` under ``key`` for ``ttl_seconds``. With ``only_if_absent`` an existing
+        value is kept (atomically: the first writer wins). True when stored."""
+
 
 PINNED_PREFIX = "pin:"
 
@@ -79,6 +90,7 @@ class MemoryStateStore:
         self._lock = threading.Lock()
         self._max_keys = max_keys
         self._clock = clock
+        self._swept = float("-inf")
 
     def _entry(self, key: str, now: float, create: Optional[dict] = None) -> Optional[dict]:
         entry = self._data.get(key)
@@ -88,16 +100,27 @@ class MemoryStateStore:
         if entry is None and create is not None:
             entry = create
             self._data[key] = entry
-            self._evict()
+            self._evict(now, keep=key)
         if entry is not None:
             self._data.move_to_end(key)
         return entry
 
-    def _evict(self) -> None:
+    def _evict(self, now: float, keep: Optional[str] = None) -> None:
+        """Over the limit: expired entries go first, pinned ones included (they would otherwise
+        stay until read again; at most one sweep a second), then the least recently used unpinned
+        ones. The entry being created is never the one evicted; when only pinned entries are
+        left, the limit is exceeded rather than failing the caller."""
+        if len(self._data) <= self._max_keys:
+            return
+        if now - self._swept >= 1.0:
+            self._swept = now
+            for name in [k for k, e in self._data.items()
+                         if k != keep and e.get("expires") is not None and now >= e["expires"]]:
+                del self._data[name]
         skipped = 0          # pinned keys moved out of the way; all of them: nothing to evict
         while len(self._data) > self._max_keys and skipped < len(self._data):
             oldest = next(iter(self._data))
-            if oldest.startswith(PINNED_PREFIX):
+            if oldest.startswith(PINNED_PREFIX) or oldest == keep:
                 self._data.move_to_end(oldest)
                 skipped += 1
             else:
@@ -146,6 +169,32 @@ class MemoryStateStore:
     def delete(self, key):
         with self._lock:
             self._data.pop(key, None)
+
+    def get_list(self, key):
+        now = self._clock()
+        with self._lock:
+            entry = self._entry(key, now)
+            return list(entry.get("items", [])) if entry else []
+
+    def get_value(self, key):
+        now = self._clock()
+        with self._lock:
+            entry = self._entry(key, now)
+            value = entry.get("value") if entry else None
+            return value if isinstance(value, str) else None
+
+    def set_value(self, key, value, ttl_seconds, only_if_absent=False):
+        _check_ttl(ttl_seconds)
+        now = self._clock()
+        with self._lock:
+            entry = self._entry(key, now)
+            if only_if_absent and entry is not None and isinstance(entry.get("value"), str):
+                return False
+            if entry is None:
+                entry = self._entry(key, now, create={})
+            entry.clear()
+            entry.update(value=str(value), expires=now + ttl_seconds)
+            return True
 
 
 # Lua scripts: each operation is atomic on the Redis server.
@@ -288,6 +337,41 @@ class RedisStateStore:
             self._client.delete(_PREFIX + key)
         except Exception as exc:
             self._degraded("delete", exc).delete(key)
+
+    def get_list(self, key):
+        if not self._available():
+            return self._skip("get_list").get_list(key)
+        try:
+            return [_s(i) for i in self._client.lrange(_PREFIX + key, 0, -1)]
+        except StateUnavailable:
+            raise
+        except Exception as exc:
+            return self._degraded("get_list", exc).get_list(key)
+
+    def get_value(self, key):
+        if not self._available():
+            return self._skip("get_value").get_value(key)
+        try:
+            value = self._client.get(_PREFIX + key)
+            return None if value is None else _s(value)
+        except StateUnavailable:
+            raise
+        except Exception as exc:
+            return self._degraded("get_value", exc).get_value(key)
+
+    def set_value(self, key, value, ttl_seconds, only_if_absent=False):
+        _check_ttl(ttl_seconds)                  # a caller's mistake, never a Redis outage
+        if not self._available():
+            return self._skip("set_value").set_value(key, value, ttl_seconds, only_if_absent)
+        try:
+            stored = self._client.set(_PREFIX + key, str(value), px=max(1, int(ttl_seconds * 1000)),
+                                      nx=only_if_absent)
+            self._warned = False
+            return bool(stored)
+        except StateUnavailable:
+            raise
+        except Exception as exc:
+            return self._degraded("set_value", exc).set_value(key, value, ttl_seconds, only_if_absent)
 
 
 class SqliteStateStore:
@@ -472,6 +556,45 @@ class SqliteStateStore:
             return True
         if self._txn("delete", op) is None:
             self._fallback.delete(key)
+
+    def get_list(self, key):
+        def op(conn, now):
+            entry = self._load(conn, key, now)
+            return list(entry["items"]) if entry and isinstance(entry.get("items"), list) else []
+        result = self._txn("get_list", op)
+        if result is None:
+            return self._fallback.get_list(key)
+        return [str(i) for i in result]
+
+    def get_value(self, key):
+        def op(conn, now):
+            entry = self._load(conn, key, now)
+            value = entry.get("value") if entry else None
+            return [value if isinstance(value, str) else None]
+        result = self._txn("get_value", op)
+        if result is None:
+            return self._fallback.get_value(key)
+        return result[0]
+
+    def set_value(self, key, value, ttl_seconds, only_if_absent=False):
+        _check_ttl(ttl_seconds)
+        def op(conn, now):
+            if only_if_absent:
+                entry = self._load(conn, key, now)
+                if entry is not None and isinstance(entry.get("value"), str):
+                    return False
+            self._save(conn, key, {"value": str(value)}, now + ttl_seconds)
+            return True
+        result = self._txn("set_value", op)
+        if result is None:
+            return self._fallback.set_value(key, value, ttl_seconds, only_if_absent)
+        return result
+
+
+def _check_ttl(ttl_seconds) -> None:
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)) or not math.isfinite(ttl_seconds) \
+            or ttl_seconds <= 0:
+        raise ValueError(f"ttl_seconds must be a positive finite number, not {ttl_seconds!r}")
 
 
 def _s(value) -> str:

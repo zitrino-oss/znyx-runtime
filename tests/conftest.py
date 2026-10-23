@@ -11,6 +11,13 @@ import os
 # znyx module is imported; conftest runs first, so this covers every test.
 os.environ.setdefault("ZNYX_ENVIRONMENT", "development")
 
+# Governance audit records (Phase 5 part 4) go to a spool under the home directory by
+# default; keep the suite's records out of it.
+import tempfile
+
+os.environ.setdefault("ZNYX_GOVERNANCE_SPOOL_PATH",
+                      os.path.join(tempfile.mkdtemp(prefix="znyx-test-"), "governance-audit.spool"))
+
 import pytest
 
 

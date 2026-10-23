@@ -304,6 +304,9 @@ async def lifespan(app: FastAPI):
         if app.state.usage_spool:
             audit_shippers.append(SpoolShipper(app.state.usage_spool, f"{cp}/v1/runtime/llm-calls",
                                                sender, name="llm-calls"))
+        # Governance records (Phase 5 part 4): MCP tool calls, approvals, delegated tokens.
+        audit_shippers.append(SpoolShipper(str(app.state.gateway.governance.path),
+                                           f"{cp}/v1/runtime/audit/governance", sender, name="governance-audit"))
         for shipper in audit_shippers:
             shipper.start()
     app.state.audit_shippers = audit_shippers

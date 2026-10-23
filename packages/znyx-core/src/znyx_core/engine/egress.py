@@ -296,7 +296,7 @@ def prepare_and_audit_egress(
                 trace_id=getattr(request, "trace_id", None),
                 # payload TEXT bytes (post-redaction); excludes transport JSON framing
                 # + headers, which the gate is deliberately decoupled from.
-                bytes_out=len(call_text.encode("utf-8")),
+                bytes_out=len(call_text.encode("utf-8", "surrogatepass")),
                 redacted=redacted,
                 allowlisted=decision.allowlisted,
                 model_version=model_version,

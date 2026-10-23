@@ -222,6 +222,12 @@ class SpoolShipper:
                 with os.fdopen(fd, "a", encoding="utf-8") as fh:
                     for rec in tail:
                         fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            # A hash-chained spool: the next record continues the chain the shipped ones end.
+            from znyx_core.utils.spool import carry_chain_over
+            try:
+                carry_chain_over(self.path, shipped)
+            except OSError:
+                logger.warning("%s: the chain state could not be carried over the rotation", self.name)
             shipped.unlink(missing_ok=True)
             self._write_offset(0)
 

@@ -406,6 +406,105 @@ znyx discover /var/log/squid/access.log --exclude-source 10.0.4.20 \
   --upload --control-plane https://api.znyx.ai --org $ORG_ID --token $CONSOLE_TOKEN
 ```
 
+### MCP gateway and approvals
+
+Agents reach their MCP servers through the gateway: point the agent's MCP client at
+`http://znyx:8080/v1/mcp/<server>` (Streamable HTTP) with its gateway key as the bearer token.
+The gateway forwards to the server under the agent's policy: `tools/list` shows only allowed,
+unchanged tools (a tool's definition is pinned the first time it is seen; a changed one is held
+until accepted), arguments are checked like a model's tool call, results like a tool result
+(prompt injection, PII), and every call passes the egress gate and shows in usage and traces next
+to the agent's model calls.
+
+```yaml
+mcp_servers:
+  crm:
+    url: https://mcp.crm.example/mcp
+    auth: env:CRM_MCP_TOKEN          # or: client (the agent sends X-Znyx-Mcp-Authorization)
+    region: eu
+    accept: {}                       # tool -> sha256 of a changed definition you accept
+keys:
+  - id: refund-bot
+    key_sha256: ...
+    mcp_servers: [crm]               # empty: every MCP server
+```
+
+A policy can ask for a person's approval before risky tool calls run, on MCP calls, tool calls in
+model answers and `/v1/evaluate/tool` alike:
+
+```yaml
+approval:
+  tools: ["delete_*", "send_email"]
+  mcp_destructive: true      # MCP tools annotated destructiveHint
+  timeout_seconds: 120       # no decision in time: refused
+  share: redacted            # what the console shows: redacted arguments, or metadata
+```
+
+The call waits until someone decides: in the console's Approvals page, or without a console with
+the approver key you set as `ZNYX_APPROVER_KEY` (never the instance key, which agents hold), sent
+as `X-Znyx-Approver-Key`: `GET /v1/znyx/approvals?status=pending`, then
+`POST /v1/znyx/approvals/{id}/decide` with `{"decision": "approve"}`. One approval covers one call
+with exactly those arguments, and a stop issued meanwhile still applies. On `/v1/evaluate/tool`
+the answer comes at once: BLOCK with the request's id in `pending_review_id`; call again with
+`metadata: {"approval_id": "<id>"}` once someone approved it.
+
+### Agents acting for people
+
+An agent that works for a signed-in person can carry that person's identity. It sends the
+person's token from your identity provider (an OIDC JWT) with its own gateway key to
+`POST /v1/znyx/token` and gets a short-lived token (`zat_...`) to use instead of its key:
+
+```bash
+curl -s http://znyx:8080/v1/znyx/token -H "Authorization: Bearer $AGENT_KEY" \
+  -d subject_token="$PERSON_JWT" -d scope="search lookup_order"
+# {"access_token": "zat_...", "token_type": "Bearer", "expires_in": 600, "scope": "search lookup_order"}
+```
+
+Calls made with it run as the agent for that person, with only the tools the agent's rules give
+the person's groups; a person can be stopped from the kill switch (target `user`), and
+`DELETE /v1/znyx/token` revokes a token. The rules and the identity provider come from the console
+(Identity page), or without a console from the gateway file:
+
+```yaml
+identity_providers:
+  - id: corp
+    issuer: https://login.corp.example
+    audiences: [znyx-gateway]
+    jwks_file: /etc/znyx/corp-jwks.json     # or jwks: {keys: [...]}; public keys only
+agents:
+  - agent_id: support-agent
+    groups: {support: ["search", "lookup_*"], admins: ["delete_*"]}
+    all_users: [ping]
+    max_ttl_seconds: 600
+    require_delegation: true                # the key alone may not call
+```
+
+Tokens are verified with the provider's public keys only (RS, PS, ES and EdDSA; never `none` or
+shared secrets) and are never kept: the runtime stores a hash of each issued token. The person comes
+from the provider's user claim only (`email` by default; set `user_claim: sub` when tokens carry no
+email). On model calls the agent itself names the tools it offers, so the tool limit there guards
+against what the model does; on MCP servers, which the gateway brokers, it holds against the agent
+too.
+
+### Evidence: audit chain and prompt versions
+
+Every audit record the runtime writes is hash-chained: it carries `chain: {id, seq, prev, hash}`,
+where `hash` covers the previous hash and the record, so a record removed or changed afterwards
+shows. The egress audit spool is chained, and a governance spool
+(`ZNYX_GOVERNANCE_SPOOL_PATH`, default `~/.znyx/governance-audit.spool`) records what agents did
+and what people decided, as metadata only: MCP tool calls, changed MCP tools, approval requests
+and decisions, and delegated tokens issued, refused and revoked (a short reference, never the
+token). In managed mode both are shipped to the control plane, which checks each chain and
+anchors its head in its own audit log every hour; the console's Compliance page maps this and the
+rest of the evidence to the EU AI Act, the NIST AI RMF and ISO/IEC 42001.
+
+Each gateway call also records which instructions ran: `prompt_hash` is a fingerprint of the
+system and developer messages (whitespace does not count), keyed like user pseudonyms so it cannot
+be used to confirm a guessed prompt (set the same `ZNYX_USER_ID_KEY` on every replica so they
+agree), and a caller can name its prompt with `X-Znyx-Prompt: name@version`. Only the fingerprint
+and the name leave the runtime, never the text; the console's Prompt versions page compares
+versions by block rate, errors, cost and latency.
+
 ## Secure by default
 
 - **Auth on by default.** The evaluate endpoints require an API key. In
@@ -606,6 +705,8 @@ Key environment variables (each has a `znyx.yaml` equivalent; `znyx config` list
 | `ZNYX_ML` | `false` | Start the ML model server alongside |
 | `ZNYX_INFERENCE_URL` | (unset) | Use a model server you run elsewhere |
 | `ZNYX_STATE_BACKEND` | `auto` | `auto`, `memory`, `sqlite` or `redis` (shared across replicas) |
+| `ZNYX_APPROVER_KEY` | (unset) | Without a console: the key that decides approvals (at least 16 characters) |
+| `ZNYX_GOVERNANCE_SPOOL_PATH` | `~/.znyx/governance-audit.spool` | The hash-chained governance audit spool |
 | `ZNYX_AIRGAPPED` | `false` | No outbound calls at all |
 | `ZNYX_TELEMETRY` | `false` | Opt in to anonymous install heartbeats |
 | `ZNYX_TELEMETRY_URL` | `https://cp.znyx.ai/v1/install-telemetry` | Install-telemetry receiver. Only used when `ZNYX_TELEMETRY=true`; set to `""` to remove the destination |

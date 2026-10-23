@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from znyx_core.utils.spool import append_lines
+from znyx_core.utils.spool import append_chained
 
 logger = logging.getLogger(__name__)
 
@@ -114,23 +114,22 @@ class SpoolAuditSink(AuditSink):
         self.path = Path(spool_path) if spool_path else _DEFAULT_SPOOL
         self._lock = asyncio.Lock()
 
-    def _append_sync(self, line: str) -> None:
+    def _append_sync(self, record: dict) -> None:
         # Append + flush + fsync so the record is durable before we return, under the
         # spool's lock: several worker processes share this spool and one rotates it.
-        append_lines(self.path, [line], fsync=True)
+        # Hash-chained (Phase 5 part 4): each record carries the hash of the one before.
+        append_chained(self.path, [record], fsync=True)
 
     async def record(self, event: EgressAuditEvent) -> None:
-        line = json.dumps(event.to_dict(), separators=(",", ":"), sort_keys=True)
         try:
             async with self._lock:
-                await asyncio.to_thread(self._append_sync, line)
+                await asyncio.to_thread(self._append_sync, event.to_dict())
         except Exception as exc:  # noqa: BLE001 — any IO failure must hit the fail-mode gate
             self._handle_failure(exc)
 
     def record_sync(self, event: EgressAuditEvent) -> None:
-        line = json.dumps(event.to_dict(), separators=(",", ":"), sort_keys=True)
         try:
-            self._append_sync(line)
+            self._append_sync(event.to_dict())
         except Exception as exc:  # noqa: BLE001 — any IO failure must hit the fail-mode gate
             self._handle_failure(exc)
 

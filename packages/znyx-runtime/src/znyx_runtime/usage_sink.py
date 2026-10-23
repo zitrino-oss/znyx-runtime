@@ -58,7 +58,12 @@ class UsageSink:
             baseline_cost_usd=getattr(record, "baseline_cost_usd", None),
             optimisations=list(getattr(record, "optimisations", None) or []) or None,
             tools_offered=list(getattr(record, "tools_offered", None) or []) or None,
-            tools_called=list(getattr(record, "tools_called", None) or []) or None)
+            tools_called=list(getattr(record, "tools_called", None) or []) or None,
+            mcp_tools_changed=list(getattr(record, "mcp_tools_changed", None) or []) or None,
+            mcp_tools_seen=list(getattr(record, "mcp_tools_seen", None) or []) or None,
+            delegated=True if getattr(record, "delegated", False) else None,
+            identity_provider=getattr(record, "identity_provider", None),
+            prompt_hash=getattr(record, "prompt_hash", None), prompt_ref=getattr(record, "prompt_ref", None))
 
     def __call__(self, record) -> None:
         if not record.key_id:

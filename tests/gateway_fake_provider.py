@@ -258,7 +258,76 @@ def build_app() -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    @app.api_route("/mcp", methods=["POST", "DELETE"])
+    async def mcp_json(request: Request):
+        return await _mcp(request, sse=False)
+
+    @app.api_route("/mcp-sse", methods=["POST", "DELETE"])
+    async def mcp_sse(request: Request):
+        return await _mcp(request, sse=True)
+
     return app
+
+
+# -- a fake MCP server (Streamable HTTP) -------------------------------------------------------
+
+MCP_TOOLS: List[Dict[str, Any]] = []
+mcp_received: List[Dict[str, Any]] = []
+mcp_results: Dict[str, Any] = {}          # tool name -> the result to return (else an echo)
+mcp_errors: Dict[str, Any] = {}           # tool name -> a JSON-RPC error object to answer with
+mcp_extra: List[Dict[str, Any]] = []      # messages streamed (SSE) before the answer
+
+
+def default_mcp_tools() -> List[Dict[str, Any]]:
+    return [
+        {"name": "search", "description": "Search the CRM", "inputSchema": {"type": "object"}},
+        {"name": "delete_record", "description": "Delete a CRM record", "inputSchema": {"type": "object"},
+         "annotations": {"destructiveHint": True}},
+        {"name": "send_email", "description": "Send an email", "inputSchema": {"type": "object"}},
+    ]
+
+
+async def _mcp(request: Request, sse: bool):
+    if request.method == "DELETE":
+        mcp_received.append({"method": "DELETE", "headers": dict(request.headers)})
+        return Response(status_code=200)
+    body = await request.json()
+    mcp_received.append({"body": body, "headers": dict(request.headers)})
+    method, msg_id = body.get("method"), body.get("id")
+    if msg_id is None:
+        return Response(status_code=202)
+    headers = {}
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "fake-crm", "version": "1"}}
+        headers["mcp-session-id"] = "upstream-session-1"
+    elif method == "tools/list":
+        result = {"tools": [dict(t) for t in MCP_TOOLS]}
+    elif method == "tools/call":
+        name = body["params"]["name"]
+        if name in mcp_errors:
+            return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "error": mcp_errors[name]})
+        result = mcp_results.get(name) or {
+            "content": [{"type": "text", "text": f"{name} ran with {json.dumps(body['params'].get('arguments'))}"}]}
+    elif method == "resources/read":
+        result = {"contents": [{"uri": body["params"]["uri"], "text": mcp_results.get("resource", "a document")}]}
+    elif method == "prompts/get":
+        content = mcp_results.get("prompt", "hi")
+        content = content if isinstance(content, dict) else {"type": "text", "text": content}
+        result = {"messages": [{"role": "user", "content": content}]}
+    elif method == "tasks/result":
+        result = mcp_results.get("task") or {"content": [{"type": "text", "text": "task done"}]}
+    elif method in ("ping", "prompts/list", "completion/complete"):
+        result = {}
+    else:
+        answer = {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown method"}}
+        return JSONResponse(answer)
+    answer = {"jsonrpc": "2.0", "id": msg_id, "result": result}
+    if not sse:
+        return JSONResponse(answer, headers=headers)
+    progress = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1, "total": 2}}
+    stream = "".join(f"event: message\ndata: {json.dumps(m)}\n\n" for m in [progress, *mcp_extra, answer])
+    return Response(stream, media_type="text/event-stream", headers=headers)
 
 
 def reset() -> None:
@@ -268,6 +337,11 @@ def reset() -> None:
     scripted = None
     RESPONSE_DELAY = 0.0
     BATCH_DONE = False
+    mcp_received.clear()
+    mcp_results.clear()
+    mcp_errors.clear()
+    mcp_extra.clear()
+    MCP_TOOLS[:] = default_mcp_tools()
 
 
 def _batch_answer(api: str, body: Dict[str, Any]) -> Dict[str, Any]:

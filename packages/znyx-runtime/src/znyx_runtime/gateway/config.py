@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -113,6 +115,39 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class McpServer:
+    """An MCP server the gateway brokers (Phase 5): agents call ``/v1/mcp/{name}`` and the
+    gateway forwards to ``url`` (Streamable HTTP) after its checks."""
+    name: str
+    url: str
+    auth: Optional[str] = None             # a secret reference, CLIENT_KEY, or None (no credential)
+    auth_header: str = "Authorization"
+    headers: Tuple[Tuple[str, str], ...] = ()
+    region: Optional[str] = None
+    in_boundary: Optional[bool] = None
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    accept: Tuple[Tuple[str, str], ...] = ()   # gateway file only: (tool, sha256) changes accepted
+    blocked: Optional[str] = None          # managed mode: why this runtime refuses it
+    member: str = ""
+
+    @property
+    def uses_client_credential(self) -> bool:
+        return self.auth == CLIENT_KEY
+
+    def credential(self) -> Optional[str]:
+        if self.blocked:
+            raise secret_refs.SecretRefError(self.blocked)
+        if self.auth in (None, CLIENT_KEY):
+            return None
+        return secret_refs.resolve(self.auth, what=f"MCP server {self.name} auth")
+
+    # The egress gate reads providers' fields; an MCP server answers the same questions.
+    @property
+    def base_url(self) -> str:
+        return self.url
+
+
+@dataclass(frozen=True)
 class GatewayKey:
     id: str
     key_sha256: str
@@ -130,9 +165,13 @@ class GatewayKey:
     disabled: bool = False
     instance_key: bool = False               # the instance's RUNTIME_API_KEY
     member: str = ""                         # the environment (bundle set member) it belongs to
+    mcp_servers: Tuple[str, ...] = ()        # allowed MCP server names; empty = all
 
     def may_use(self, provider: str) -> bool:
         return not self.providers or provider in self.providers
+
+    def may_use_mcp(self, server: str) -> bool:
+        return not self.mcp_servers or server in self.mcp_servers
 
     def model_allowed(self, model: Optional[str]) -> bool:
         if not self.allowed_models:
@@ -187,6 +226,24 @@ class GatewayConfig:
     member_prices: Dict[str, Dict[str, Dict[str, float]]] = field(default_factory=dict)
     # Stops from the gateway file (no console); the console's arrive in the signed controls.
     stops: Tuple[Any, ...] = ()
+    # MCP servers (Phase 5), keyed like providers ("member/name" when several environments).
+    mcp_servers: Dict[str, McpServer] = field(default_factory=dict)
+    # Agent identity (Phase 5 part 3) from the gateway file; a console sends them in the controls.
+    identity_providers: Tuple[Any, ...] = ()
+    agents: Tuple[Any, ...] = ()
+
+    def mcp_server_for(self, key: GatewayKey, name: str) -> McpServer:
+        """The MCP server a key reaches by this name: one of its own environment, allowed for it."""
+        member = key.member
+        if not member:
+            if len(self.members) > 1 or self.shared:
+                raise LookupError("this runtime serves several projects: call it with an app key "
+                                  "from the console")
+            member = self.members[0] if self.members else ""
+        server = next((m for m in self.mcp_servers.values() if m.member == member and m.name == name), None)
+        if server is None or not key.may_use_mcp(name):
+            raise LookupError(f"MCP server {name!r} is not available to this key")
+        return server
 
     @property
     def enabled(self) -> bool:
@@ -271,7 +328,8 @@ def _host_matches(host: str, patterns) -> bool:
 
 
 def _managed_refusal(name: str, base_url: str, api_key: Optional[str]) -> Optional[str]:
-    """Why this runtime refuses a provider that came from a bundle (None: allowed)."""
+    """Why this runtime refuses a provider (or MCP server) that came from a bundle (None:
+    allowed). ``name`` says what it is, e.g. "provider openai"."""
     from urllib.parse import urlparse
     from znyx_core.engine.egress import in_network
 
@@ -279,13 +337,13 @@ def _managed_refusal(name: str, base_url: str, api_key: Optional[str]) -> Option
     if not in_network(host):
         extra = [h for h in (os.getenv("ZNYX_GATEWAY_ALLOWED_HOSTS") or "").split(",") if h.strip()]
         if not _host_matches(host, DEFAULT_MANAGED_HOSTS + tuple(extra)):
-            return (f"provider {name} sends to {host}, which this runtime does not allow "
+            return (f"{name} sends to {host}, which this runtime does not allow "
                     "(add it to ZNYX_GATEWAY_ALLOWED_HOSTS)")
     if isinstance(api_key, str) and api_key.lower().startswith("env:"):
         variable = api_key[4:].strip()
         bound = KEY_HOSTS.get(variable)
         if bound and not _host_matches(host, bound):
-            return f"provider {name} would send {variable} to {host}, which is not its provider"
+            return f"{name} would send {variable} to {host}, which is not its provider"
     return None
 
 
@@ -330,7 +388,7 @@ def _provider(name: str, raw: Mapping[str, Any], managed: bool = False) -> Provi
             logger.warning("Gateway: provider %s claims to be inside the network but %s is not; "
                            "treating it as external", name, urlparse(base_url).hostname)
             in_boundary = False
-        blocked = _managed_refusal(name, base_url, api_key)
+        blocked = _managed_refusal(f"provider {name}", base_url, api_key)
         if blocked:
             logger.error("Gateway: %s", blocked)
     return Provider(name=name, format=fmt, base_url=base_url.rstrip("/"), api_key=api_key,
@@ -352,12 +410,71 @@ def _limits(raw: Any, where: str) -> Limits:
                                              "spend_usd_per_day")})
 
 
-def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider]) -> GatewayKey:
+_MCP_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "x-api-key", "api-key",
+                                 "x-znyx-key"})
+
+
+def _mcp_server(name: str, raw: Mapping[str, Any], managed: bool = False) -> McpServer:
+    from urllib.parse import urlsplit
+    from znyx_core.engine.egress import in_network
+    where = f"mcp_servers.{name}"
+    _require(bool(_MCP_NAME.fullmatch(name)), where, "names are lower-case letters, digits, - and _")
+    _require(isinstance(raw, Mapping), where, "expected a mapping")
+    unknown = set(raw) - {"url", "auth", "auth_header", "headers", "region", "in_boundary", "timeout_seconds",
+                          "accept"}
+    _require(not unknown, where, f"unknown setting(s) {', '.join(sorted(unknown))}")
+    url = raw.get("url")
+    _require(isinstance(url, str) and url.startswith(("https://", "http://")), where, "url must be an http(s) URL")
+    parts = urlsplit(url)
+    _require(bool(parts.hostname) and not parts.username and not parts.password, where,
+             "url needs a host and no credentials (put them in auth)")
+    in_boundary = raw.get("in_boundary")
+    if url.startswith("http://"):
+        _require(in_network(parts.hostname), where, "plain http:// is only allowed for servers inside your network")
+    auth = raw.get("auth")
+    if auth in (None, "none"):
+        auth = None
+    elif auth != CLIENT_KEY:
+        _require(isinstance(auth, str) and secret_refs.is_reference(auth), where,
+                 "auth must be a reference (env:NAME, file:/path), `client`, `none` or omitted; never the secret")
+    auth_header = raw.get("auth_header") or "Authorization"
+    _require(isinstance(auth_header, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", auth_header) is not None, where,
+             "auth_header must be a header name")
+    headers = raw.get("headers") or {}
+    _require(isinstance(headers, Mapping), where, "headers must be a mapping")
+    for header in headers:
+        _require(str(header).lower() not in _CREDENTIAL_HEADERS, where, "credentials belong in auth, not headers")
+    timeout = raw.get("timeout_seconds", 60)
+    _require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and 0 < timeout <= 600, where,
+             "timeout_seconds must be from 1 to 600")
+    accept = raw.get("accept") or {}
+    _require(not managed or not accept, where, "accept is for the gateway file; the console sends accepted changes")
+    _require(isinstance(accept, Mapping) and all(
+        isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in accept.values()), where,
+        "accept maps tool names to the 64-character sha256 of their definition")
+    blocked = None
+    if managed:
+        if in_boundary and not in_network(parts.hostname):
+            logger.warning("Gateway: MCP server %s claims to be inside the network but %s is not; "
+                           "treating it as external", name, parts.hostname)
+            in_boundary = False
+        blocked = _managed_refusal(f"MCP server {name}", url, auth)
+        if blocked:
+            logger.error("Gateway: %s", blocked)
+    return McpServer(name=name, url=url, auth=auth, auth_header=auth_header,
+                     headers=tuple((str(k), str(v)) for k, v in headers.items()), region=raw.get("region"),
+                     in_boundary=in_boundary, timeout_seconds=float(timeout),
+                     accept=tuple((str(k), str(v)) for k, v in accept.items()), blocked=blocked)
+
+
+def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider],
+         mcp_servers: Optional[Mapping[str, McpServer]] = None) -> GatewayKey:
     where = f"keys[{index}]"
     _require(isinstance(raw, Mapping), where, "expected a mapping")
     allowed = {"id", "key", "key_sha256", "tenant_id", "app_id", "agent_id", "environment",
                "providers", "default_provider", "allowed_models", "limits", "profile", "optimisation",
-               "disabled"}
+               "disabled", "mcp_servers"}
     unknown = set(raw) - allowed
     _require(not unknown, where, f"unknown setting(s) {', '.join(sorted(unknown))}")
     key_id = raw.get("id")
@@ -380,6 +497,9 @@ def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider]) 
         _require(name in providers, where, f"unknown provider {name!r}")
     default = raw.get("default_provider")
     _require(default is None or default in providers, where, f"unknown default_provider {default!r}")
+    mcp_names = _str_list(raw.get("mcp_servers"), f"{where}.mcp_servers")
+    for name in mcp_names:
+        _require(name in (mcp_servers or {}), where, f"unknown MCP server {name!r}")
     profile = raw.get("profile") or "balanced"
     chosen = isinstance(profile, str) and profile in PROFILES and bool(raw.get("profile"))
     if not isinstance(profile, str) or profile not in PROFILES:
@@ -396,7 +516,7 @@ def _key(raw: Mapping[str, Any], index: int, providers: Mapping[str, Provider]) 
         limits=_limits(raw.get("limits"), f"{where}.limits"),
         profile=profile, profile_chosen=chosen,
         optimisation=_optimisation(raw.get("optimisation"), f"{where}.optimisation"),
-        disabled=bool(raw.get("disabled", False)))
+        disabled=bool(raw.get("disabled", False)), mcp_servers=mcp_names)
 
 
 def _optimisation(raw: Any, where: str) -> KeyOptimisation:
@@ -486,24 +606,68 @@ def from_document(doc: Mapping[str, Any], *, source: str = "document",
     provider hosts apply (see ``DEFAULT_MANAGED_HOSTS``)."""
     _require(isinstance(doc, Mapping), source, "expected a mapping at the top level")
     # Stops come from the gateway file only; a console sends them in the signed controls.
-    unknown = set(doc) - {"version", "providers", "keys", "settings", "prices"} - (set() if managed else {"stops"})
+    unknown = set(doc) - {"version", "providers", "keys", "settings", "prices", "mcp_servers"} \
+        - (set() if managed else {"stops", "identity_providers", "agents"})
     _require(not unknown, source, f"unknown section(s) {', '.join(sorted(unknown))}")
     raw_providers = doc.get("providers") or {}
     _require(isinstance(raw_providers, Mapping), "providers", "expected a mapping")
     providers = {str(name): _provider(str(name), raw, managed) for name, raw in raw_providers.items()}
+    raw_mcp = doc.get("mcp_servers") or {}
+    _require(isinstance(raw_mcp, Mapping), "mcp_servers", "expected a mapping")
+    mcp_servers = {str(name): _mcp_server(str(name), raw, managed) for name, raw in raw_mcp.items()}
     raw_keys = doc.get("keys") or []
     _require(isinstance(raw_keys, list), "keys", "expected a list")
     keys: Dict[str, GatewayKey] = {}
     ids = set()
     for i, raw in enumerate(raw_keys):
-        key = _key(raw, i, providers)
+        key = _key(raw, i, providers, mcp_servers)
         _require(key.id not in ids, f"keys.{key.id}", "duplicate id")
         _require(key.key_sha256 not in keys, f"keys.{key.id}", "the same key is configured twice")
         ids.add(key.id)
         keys[key.key_sha256] = key
     return GatewayConfig(providers=providers, keys_by_digest=keys,
                          settings=_settings(doc.get("settings")), prices=_prices(doc.get("prices")),
-                         source=source, stops=() if managed else _stops(doc.get("stops")))
+                         source=source, stops=() if managed else _stops(doc.get("stops")),
+                         mcp_servers=mcp_servers,
+                         identity_providers=() if managed else _identity_providers(doc.get("identity_providers")),
+                         agents=() if managed else _agents(doc.get("agents")))
+
+
+def _identity_providers(raw: Any) -> Tuple[Any, ...]:
+    """The gateway file's identity providers (no console), strictly: each with its public keys
+    inline (``jwks``) or in a file (``jwks_file``)."""
+    from znyx_core.identity import clean_provider
+    if raw is None:
+        return ()
+    _require(isinstance(raw, list), "identity_providers", "expected a list")
+    out = []
+    for i, entry in enumerate(raw):
+        _require(isinstance(entry, Mapping), f"identity_providers[{i}]", "expected a mapping")
+        entry = dict(entry)
+        if entry.get("jwks_file"):
+            try:
+                with open(str(entry.pop("jwks_file")), encoding="utf-8") as handle:
+                    entry["jwks"] = json.load(handle)
+            except (OSError, ValueError) as exc:
+                raise GatewayConfigError(f"identity_providers[{i}]: jwks_file cannot be read ({exc})") from None
+        entry.setdefault("id", entry.get("name") or f"provider-{i}")
+        provider, problem = clean_provider(entry)
+        _require(provider is not None, f"identity_providers[{i}]", problem or "unusable")
+        out.append(provider)
+    return tuple(out)
+
+
+def _agents(raw: Any) -> Tuple[Any, ...]:
+    from znyx_core.identity import clean_agent
+    if raw is None:
+        return ()
+    _require(isinstance(raw, list), "agents", "expected a list")
+    out = []
+    for i, entry in enumerate(raw):
+        rules, problem = clean_agent(entry)
+        _require(rules is not None, f"agents[{i}]", problem or "unusable")
+        out.append(rules)
+    return tuple(out)
 
 
 def _stops(raw: Any) -> Tuple[Any, ...]:
@@ -547,6 +711,7 @@ def from_bundle_members(documents: List[Tuple[str, Optional[Mapping[str, Any]]]]
     import dataclasses
 
     providers: Dict[str, Provider] = {}
+    mcp_servers: Dict[str, McpServer] = {}
     keys: Dict[str, GatewayKey] = {}
     clashes: set = set()
     prices: Dict[str, Dict[str, float]] = {}
@@ -568,6 +733,8 @@ def from_bundle_members(documents: List[Tuple[str, Optional[Mapping[str, Any]]]]
             continue
         for name, provider in part.providers.items():
             providers[f"{member}/{name}" if member else name] = dataclasses.replace(provider, member=member)
+        for name, server in part.mcp_servers.items():
+            mcp_servers[f"{member}/{name}" if member else name] = dataclasses.replace(server, member=member)
         for digest, key in part.keys_by_digest.items():
             if digest in keys or digest in clashes:
                 clashes.add(digest)
@@ -579,7 +746,7 @@ def from_bundle_members(documents: List[Tuple[str, Optional[Mapping[str, Any]]]]
         for model, entry in part.prices.items():
             prices.setdefault(model, entry)
     return GatewayConfig(providers=providers, keys_by_digest=keys, prices=prices, members=members,
-                         shared=shared, member_prices=member_prices,
+                         shared=shared, member_prices=member_prices, mcp_servers=mcp_servers,
                          source=f"bundle ({len(members)} environment(s))")
 
 

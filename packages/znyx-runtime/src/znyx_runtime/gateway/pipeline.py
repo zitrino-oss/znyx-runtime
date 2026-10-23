@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
+from znyx_core import identity, usage_events
 
 from znyx_runtime.gateway import formats as fmts
 from znyx_runtime.gateway.config import (
@@ -182,6 +183,15 @@ class CallRecord:
     # inventory.
     tools_offered: List[str] = field(default_factory=list)
     tools_called: List[str] = field(default_factory=list)
+    mcp_tools_changed: List[str] = field(default_factory=list)   # "tool@sha256" held by the MCP gateway
+    mcp_tools_seen: List[str] = field(default_factory=list)      # "tool@sha256" every allowed tool listed
+    # Phase 5 part 3: the call ran for a person a delegated token names (``user`` is that person).
+    delegated: bool = False
+    identity_provider: Optional[str] = None
+    # Phase 5 part 4: which instructions ran (usage_events.prompt_fingerprint) and the caller's
+    # name for them (X-Znyx-Prompt).
+    prompt_hash: Optional[str] = None
+    prompt_ref: Optional[str] = None
     plan: Any = None
 
     def note(self, technique: str, count: int = 1) -> None:
@@ -194,7 +204,7 @@ class CallRecord:
     def to_event(self) -> Dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items()
                 if k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan", "_recorded",
-                             "_cache_user", "_stops")}
+                             "_cache_user", "_stops", "_no_hold", "_delegated_tools", "_person")}
         data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return data
 
@@ -308,6 +318,14 @@ class Gateway:
         self._known_apps = self._app_labels(config)
         self._stops_memo: Optional[tuple] = None
         self._live_memo: Optional[tuple] = None
+        from znyx_runtime.gateway.approval import ApprovalBroker
+        from znyx_runtime.gateway.mcp import McpGateway
+        from znyx_runtime.gateway.identity import DelegationService
+        from znyx_runtime.governance_audit import GovernanceAudit
+        self.governance = GovernanceAudit()
+        self.approvals = ApprovalBroker(self)
+        self.mcp = McpGateway(self)
+        self.delegations = DelegationService(self)
 
     @staticmethod
     def _app_labels(config: GatewayConfig) -> set:
@@ -341,6 +359,8 @@ class Gateway:
 
     async def close(self) -> None:
         await self.drain()
+        await self.governance.drain()
+        await self.approvals.close()
         await self.upstream.close()
 
     def prices_for(self, member: str) -> PriceTable:
@@ -534,6 +554,10 @@ class Gateway:
                 return GatewayKey(id="anonymous", key_sha256="", instance_key=True), None
             raise Denied(401, "A gateway key is required (send it as the API key of your SDK)",
                          "invalid_api_key", error_type="authentication_error")
+        from znyx_runtime.gateway.identity import TOKEN_PREFIX
+        request.state.znyx_delegation = None
+        if presented.startswith(TOKEN_PREFIX):
+            return self._identify_delegated(request, presented), None
         digest = key_digest(presented)
         key = self.config.keys_by_digest.get(digest)
         if key is None and self._instance_key is not None and digest == self._instance_key.key_sha256:
@@ -542,6 +566,62 @@ class Gateway:
             raise Denied(401, "Invalid gateway key", "invalid_api_key", error_type="authentication_error")
         client_credential = standard if explicit and standard else None
         return key, client_credential
+
+    def _identify_delegated(self, request: Request, token: str) -> GatewayKey:
+        """A delegated token (part 3): the agent's key, which must still be usable, and what the
+        token may do now (``request.state.znyx_delegation``)."""
+        from znyx_runtime.bundle_manager import ScopeNotServed
+        from znyx_runtime.gateway.identity import TokenRefused
+        refused = Denied(401, "Invalid or expired delegated token", "invalid_api_key",
+                         error_type="authentication_error")
+        entry = self.delegations.resolve(token)
+        if entry is None:
+            raise refused
+        key = self.config.keys_by_digest.get(str(entry.get("key") or ""))
+        if key is None or key.disabled or not self.key_usable(key):
+            raise refused
+        try:
+            member = self.bundle_manager.member_by_key(key.member or None)
+            request.state.znyx_delegation = self.delegations.delegation_now(entry, key, member)
+        except (ScopeNotServed, TokenRefused):
+            raise refused from None
+        return key
+
+    def delegation_context(self, request: Request, key: GatewayKey, member):
+        """The call's delegation, or None; refused when the agent's rules say it acts only for a
+        signed-in person and the call came with the key alone."""
+        delegation = getattr(request.state, "znyx_delegation", None)
+        if delegation is None and not key.instance_key:
+            rules = self.delegations.agent_rules(key, member)
+            if rules is not None and rules.require_delegation:
+                raise Denied(403, "This agent acts only for a signed-in person: exchange the person's token at "
+                                  "/v1/znyx/token and call with the token it gives", "delegation_required",
+                             error_type="permission_error")
+        return delegation
+
+    def apply_delegation(self, record: CallRecord, delegation) -> None:
+        if delegation is None:
+            return
+        record.user = self._person_id(delegation.person)
+        record._cache_user = record.user or self._person_id(delegation.person, mode="hash")
+        record.delegated = True
+        record.identity_provider = delegation.provider
+        record._delegated_tools = delegation.tools
+        record._person = delegation.person                 # the raw id, for stops only; never recorded
+        record.note("delegated")
+
+    def _person_id(self, raw: str, mode: Optional[str] = None) -> Optional[str]:
+        """A verified person's id as usage records keep it (``settings.user_ids``)."""
+        mode = mode or self.config.settings.user_ids
+        if mode == "off" or not raw:
+            return None
+        if mode == "plain":
+            return raw[:200]
+        import hmac
+        from znyx_runtime.install_state import user_id_key
+        scope = self.bundle_manager.members[0].bundle.org_id if getattr(self.bundle_manager, "members", None) else ""
+        digest = hmac.new(user_id_key(), f"{scope}\x1f{raw[:200]}".encode("utf-8", "surrogatepass"), hashlib.sha256)
+        return "u_" + digest.hexdigest()[:16]
 
     def _scope(self, key: GatewayKey, request: Request, member=None) -> Dict[str, str]:
         """Who the call is for. The environment is the key's own: on a runtime serving
@@ -772,6 +852,18 @@ class Gateway:
                 return True
         return False
 
+    def _note_prompt(self, fmt, body: Dict[str, Any], request: Request, record: CallRecord) -> None:
+        """The prompt version (part 4), from the caller's instructions before the gateway adds
+        anything of its own; keyed like user pseudonyms (same key and scope)."""
+        try:
+            from znyx_runtime.install_state import user_id_key
+            scope = self.bundle_manager.members[0].bundle.org_id if getattr(self.bundle_manager, "members", None) else ""
+            record.prompt_hash = usage_events.prompt_fingerprint(fmt.hidden_context(body), key=user_id_key(),
+                                                                 scope=scope or "")
+        except Exception:  # noqa: BLE001 - a fingerprint never fails a call
+            record.prompt_hash = None
+        record.prompt_ref = usage_events.prompt_ref(request.headers.get("x-znyx-prompt"))
+
     @staticmethod
     def _note_offered(body: Dict[str, Any], record: CallRecord, name_of, fname) -> None:
         tools = body.get("tools")
@@ -793,11 +885,16 @@ class Gateway:
         allowed = set(tools_policy.get("allowed") or tools_policy.get("allowed_tools") or [])
         denied = set(tools_policy.get("denied") or tools_policy.get("blocked_tools") or [])
         stops = getattr(record, "_stops", None)
-        restricted = stops is not None and stops.restricts_tools
+        delegated = getattr(record, "_delegated_tools", None)
+        restricted = (stops is not None and stops.restricts_tools) or delegated is not None
 
         def permitted(name: str) -> bool:
-            # Under a stop, a tool whose name cannot be read is removed too (fail closed).
-            if restricted and (stops.quarantined is not None or not name or stops.tool_stop(name) is not None):
+            # Under a stop or a delegated token, a tool whose name cannot be read is removed too.
+            if restricted and not name:
+                return False
+            if stops is not None and (stops.quarantined is not None or stops.tool_stop(name) is not None):
+                return False
+            if delegated is not None and not identity.tool_granted(delegated, name):
                 return False
             return (not allowed or name in allowed) and name not in denied
 
@@ -914,7 +1011,8 @@ class Gateway:
         self._stops_memo = (raw, self.config, stops)
         return stops
 
-    def stops_for(self, key: GatewayKey, member, app_id: Optional[str] = None, agent_id: Optional[str] = None):
+    def stops_for(self, key: GatewayKey, member, app_id: Optional[str] = None, agent_id: Optional[str] = None,
+                  person: Optional[str] = None):
         from znyx_core.governance import NO_STOPS
         stops = self.stop_set()
         if not stops:
@@ -922,10 +1020,10 @@ class Gateway:
         return stops.for_caller(project_id=member.project_id if member is not None else "",
                                 environment_id=member.environment_id if member is not None else "",
                                 app_id=app_id or key.app_id, agent_id=agent_id or key.agent_id,
-                                key_id=None if key.instance_key else key.id)
+                                key_id=None if key.instance_key else key.id, user=person)
 
     def _check_controls(self, key: GatewayKey, member, model: Optional[str] = None, provider=None,
-                        deployment: Optional[str] = None):
+                        deployment: Optional[str] = None, person: Optional[str] = None):
         """The console's controls for a call: stops (the caller, the model, the provider),
         then budgets. Returns the caller's stops (quarantine, stopped tools). On Azure the
         deployment is what runs, so a model stop is checked against it as well."""
@@ -935,7 +1033,7 @@ class Gateway:
         if stops:
             project = member.project_id if member is not None else ""
             environment = member.environment_id if member is not None else ""
-            call = self.stops_for(key, member)
+            call = self.stops_for(key, member, person=person)
             hit = (call.stopped or stops.model(model, project, environment)
                    or (stops.model(deployment, project, environment) if deployment else None)
                    or (stops.provider(provider.name, project, environment) if provider is not None else None))
@@ -1011,6 +1109,12 @@ class Gateway:
 
         if kind == "tool_call":
             record.saw_tool_call(tool_name)
+            delegated = getattr(record, "_delegated_tools", None)
+            if delegated is not None and not identity.tool_granted(delegated, tool_name):
+                record.note("tool_call_not_delegated")
+                return _Verdict("BLOCK", [identity.RULE_NOT_DELEGATED],
+                                user_message="This tool is not among those granted for the person this call is for",
+                                hits=1)
             stops = getattr(record, "_stops", None)
             hit = (stops.quarantined or stops.tool_stop(tool_name)) if stops is not None and stops.restricts_tools \
                 else None
@@ -1027,6 +1131,15 @@ class Gateway:
                     args = parsed if isinstance(parsed, dict) else {"value": parsed}
                 except ValueError:
                     args = {"raw": text}
+            content_block = None
+            if kind == "tool_call" and text:
+                # What the call would send (a secret, say) under the policy's content checks; only
+                # a block counts: a tool needs the values it is given, so nothing is redacted.
+                content_req = self._request(scope, record, label + "c", text, role, None)
+                content = await self.evaluator.evaluate(content_req, context="output", policy=policy,
+                                                        judge_ctx=runtime_judge_ctx(policy, content_req))
+                if content.decision.value == "BLOCK":
+                    content_block = _Verdict.of(content)
             tool_req = ToolEvaluationRequest(
                 request_id=f"{record.request_id}-{label}", tenant_id=scope["tenant_id"],
                 app_id=scope["app_id"], agent_id=scope["agent_id"], env=scope["env"],
@@ -1037,7 +1150,8 @@ class Gateway:
                 metadata={"source": "gateway", "api": record.api, "stage": stage})
             result = await self.evaluator.evaluate_tool(tool_req, policy=policy,
                                                         judge_ctx=runtime_judge_ctx(policy, tool_req))
-            return _Verdict.of(result)
+            verdict = _Verdict.of(result)
+            return verdict.merge(content_block) if content_block is not None else verdict
         req = self._request(scope, record, label, text, role, context)
         result = await self.evaluator.evaluate(req, context=stage, policy=policy,
                                                judge_ctx=runtime_judge_ctx(policy, req))
@@ -1046,17 +1160,62 @@ class Gateway:
     async def _check_text(self, text: str, kind: str, role: str, tool_name: Optional[str], stage: str,
                           scope: Dict[str, str], record: CallRecord, policy: Dict[str, Any],
                           quiet: Dict[str, Any], label: str,
-                          context: Optional[Dict[str, Any]] = None) -> _Verdict:
+                          context: Optional[Dict[str, Any]] = None, approve: bool = True) -> _Verdict:
         """A check of ``text``, and of its detection copy when invisible characters
-        could be hiding something from it."""
+        could be hiding something from it. A tool call in a model's answer that the policy
+        marks for approval then waits for a person (``approve``: False where the caller asks
+        itself, as the MCP gateway does)."""
         verdict = await self._check_one(text, kind, role, tool_name, stage, scope, record, policy,
                                         label, context)
         probe = detection_copy(text)
-        if probe == text:
+        if probe != text:
+            record.note("checked_without_invisible")
+            verdict = verdict.merge(await self._check_one(probe, kind, role, tool_name, stage, scope, record,
+                                                          quiet, label + "n", context))
+        if kind == "tool_call" and approve and verdict.decision != "BLOCK":
+            verdict = await self._approved(text, tool_name, policy, record, verdict)
+        return verdict
+
+    async def _approved(self, text: str, tool_name: Optional[str], policy: Dict[str, Any], record: CallRecord,
+                        verdict: _Verdict) -> _Verdict:
+        """Technique 33 on a tool call in a model's answer: the answer waits while a person
+        decides; not approved (or in a batch, where nobody can wait), the call is withheld."""
+        from znyx_core import approvals
+        rules = approvals.rules_of(policy)
+        reason = rules.reason(tool_name) if rules is not None else None
+        if reason is None:
             return verdict
-        record.note("checked_without_invisible")
-        return verdict.merge(await self._check_one(probe, kind, role, tool_name, stage, scope, record,
-                                                   quiet, label + "n", context))
+        if getattr(record, "_no_hold", False):
+            record.note("approval_not_possible")
+            return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_BATCH],
+                            user_message="This tool call needs a person's approval, which a batch call cannot wait for",
+                            hits=verdict.hits + 1)
+        member = None
+        try:
+            member = self.bundle_manager.member_by_key(record.member or None)
+        except Exception:  # noqa: BLE001 - the request names no environment then
+            member = None
+        arguments = verdict.sanitized_tool_args if verdict.sanitized_tool_args is not None else text
+        try:
+            approvals.parse_arguments(arguments)
+        except approvals.AmbiguousArguments as exc:
+            return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_AMBIGUOUS],
+                            user_message=f"This tool call's arguments are ambiguous ({exc})", hits=verdict.hits + 1)
+        approved, why = await self.approvals.ask(rules=rules, reason=reason, tool=tool_name or "tool",
+                                                 arguments=arguments, server=None, record=record, member=member)
+        if approved:
+            # A stop that came in while the call waited still applies.
+            key = next((k for k in self.config.keys_by_digest.values()
+                        if k.id == record.key_id and k.member == record.member), None)
+            stops = (self.stops_for(key, member, person=getattr(record, "_person", None))
+                     if key is not None else None)
+            hit = (stops.stopped or stops.quarantined or stops.tool_stop(tool_name)) if stops is not None else None
+            if hit is not None:
+                return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_NOT_APPROVED],
+                                user_message=f"Approved, but stopped meanwhile: {hit.message()}", hits=verdict.hits + 1)
+            return verdict
+        return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_NOT_APPROVED],
+                        user_message=f"This tool call was not approved: {why}", hits=verdict.hits + 1)
 
     def _normalise(self, fmt, body: Dict[str, Any], record: Optional[CallRecord],
                    parts: Optional[List[fmts.Part]] = None) -> None:
@@ -1257,8 +1416,11 @@ class Gateway:
             member = self.bundle_manager.member_by_key(key.member or None)
         except ScopeNotServed as exc:
             raise Denied(403, str(exc), "project_not_served", error_type="permission_error") from None
+        delegation = self.delegation_context(request, key, member)
+        self.apply_delegation(record, delegation)
         record._stops = self._check_controls(key, member, record.model, provider,
-                                             deployment if api == "azure" else None)
+                                             deployment if api == "azure" else None,
+                                             person=delegation.person if delegation is not None else None)
         scope = self._scope(key, request, member)
         try:
             policy = self.bundle_manager.get_policy(tenant_id=scope["tenant_id"], app_id=scope["app_id"],
@@ -1268,6 +1430,7 @@ class Gateway:
             raise Denied(503, "Policy unavailable (fail-closed)", "policy_unavailable",
                          outcome="error", error_type="api_error") from None
         self._check_provider_side_calls(api, body)
+        self._note_prompt(fmt, body, request, record)
         self._filter_tools(api, body, policy, record)
         plan = record.plan = self.optimiser.plan(key, api, provider, body, request.headers,
                                                  self._caller_id(key), record.model)
@@ -1434,6 +1597,10 @@ class Gateway:
         from znyx_runtime.gateway.batch import supports_batch
         if str(request.headers.get("x-znyx-urgency") or "").strip().lower() != "low":
             return False
+        if getattr(request.state, "znyx_delegation", None) is not None:
+            # A call for a person runs live: its tools and the person's stops are checked when
+            # it runs, which a queued job could not keep up with.
+            return False
         if not plan.on("batch") or fmt.is_stream(body) or len(plan.vault) or plan.shadow is not None:
             return False
         return supports_batch(provider)
@@ -1562,6 +1729,7 @@ class Gateway:
                              outcome="error", error_type="api_error")
             member = self.bundle_manager.member_by_key(key.member or None)
             record._stops = self.stops_for(key, member)            # tool calls a stop concerns are withheld
+            record._no_hold = True                                 # nobody can wait for an approval here
             if record._stops.stopped is not None:
                 raise Denied(403, record._stops.stopped.message(), "stopped", error_type="permission_error")
             policy = self.bundle_manager.get_policy(tenant_id=scope.get("tenant_id", key.tenant_id),
@@ -1594,7 +1762,8 @@ class Gateway:
                 member = self.bundle_manager.member_by_key(key.member or None)
             except ScopeNotServed:
                 member = None
-            caller_stops = self.stops_for(key, member)
+            delegation = self.delegation_context(request, key, member)
+            caller_stops = self.stops_for(key, member, person=delegation.person if delegation is not None else None)
             if caller_stops.stopped is not None:
                 raise Denied(403, caller_stops.stopped.message(), "stopped", error_type="permission_error")
         except Denied as denied:
@@ -2628,3 +2797,29 @@ class Gateway:
                 self.on_call(record)
             except Exception:  # noqa: BLE001
                 logger.debug("gateway: on_call failed", exc_info=True)
+        if record.api == "mcp" and (record.tools_called or record.mcp_tools_changed):
+            self._audit_mcp(record)
+
+    def _member_of(self, record: CallRecord):
+        try:
+            return self.bundle_manager.member_by_key(record.member or None)
+        except Exception:  # noqa: BLE001 - a call the runtime refused belongs to no member
+            return None
+
+    def _audit_mcp(self, record: CallRecord) -> None:
+        """The governance record of an MCP tool call (part 4): which agent called which
+        server's tool, for whom, and what the gateway did; metadata only."""
+        from znyx_runtime.governance_audit import call_fields
+        try:
+            fields = call_fields(record, self._member_of(record))
+            if record.tools_called:
+                self.governance.record(
+                    "mcp.tool_call", **fields, server=record.provider, tool=record.tools_called[0],
+                    outcome=record.outcome, reason=record.reason, rule_ids=list(record.rule_ids)[:20],
+                    approved=True if record.techniques.get("approval_granted") else None,
+                    identity_provider=record.identity_provider)
+            if record.mcp_tools_changed:
+                self.governance.record("mcp.tool_changed", **fields, server=record.provider,
+                                       tools=list(record.mcp_tools_changed)[:50])
+        except Exception:  # noqa: BLE001 - the audit never fails a call
+            logger.debug("gateway: governance record failed", exc_info=True)

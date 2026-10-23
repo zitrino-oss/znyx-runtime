@@ -2,6 +2,7 @@
 Runtime API routes - evaluation endpoints only.
 No DB dependency, no admin routes.
 """
+import contextvars
 import logging
 import os
 from typing import Optional
@@ -80,6 +81,16 @@ async def _caller_key(
     if not token and authorization and authorization.startswith("Bearer "):
         token = authorization[7:]
     gateway = getattr(request.app.state, "gateway", None)
+    _delegation.set(None)
+    if token and gateway is not None and token.startswith("zat_"):
+        # A delegated token (part 3): the agent's key, acting for the person it names.
+        from znyx_runtime.gateway.pipeline import Denied
+        try:
+            key, _ = gateway._identify(request)
+        except Denied:
+            raise HTTPException(status_code=401, detail="Invalid or expired delegated token")
+        _delegation.set(getattr(request.state, "znyx_delegation", None))
+        return key
     if token and gateway is not None:
         from znyx_runtime.gateway.config import key_digest
         key = gateway.config.keys_by_digest.get(key_digest(token))
@@ -122,6 +133,8 @@ from znyx_runtime.bundle_manager import ScopeNotServed  # noqa: E402
 
 # Checks of what an agent does (not what it says): refused for a quarantined caller.
 _ACTING_STAGES = frozenset({"tool", "agent_plan", "agent_step", "memory_write"})
+# The delegation of the call being served (part 3), set by ``_caller_key``.
+_delegation: "contextvars.ContextVar" = contextvars.ContextVar("znyx_delegation", default=None)
 
 
 def _get_gateway():
@@ -134,19 +147,31 @@ def _stop_decision(body, key, stage: str) -> Optional[EvaluationResponse]:
     an action, or a stopped tool) gets a BLOCK decision rather than an error, so an SDK set
     to fail open still stops."""
     gateway = _get_gateway()
-    stops = gateway.stop_set() if gateway is not None else None
-    if not stops:
+    if gateway is None:
         return None
-    from znyx_core.governance import RULE_QUARANTINED, RULE_STOPPED, RULE_TOOL_STOPPED
+    from znyx_core import identity
+    from znyx_core.governance import RULE_QUARANTINED, RULE_STOPPED, RULE_TOOL_STOPPED, NO_STOPS
     try:
         member = _get_bundle_manager().member_for(getattr(key, "member", "") or None,
                                                   getattr(body, "app_id", None), getattr(body, "env", None))
     except ScopeNotServed:
         return None                          # the evaluation itself refuses the call
+    delegation = _delegation.get()
+    if delegation is None and key is not None and not key.instance_key:
+        rules = gateway.delegations.agent_rules(key, member)
+        if rules is not None and rules.require_delegation:
+            return _blocked(body, "identity.delegation_required",
+                            "This agent acts only for a signed-in person: call with a delegated token")
+    if delegation is not None and stage == "tool" and not identity.tool_granted(delegation.tools,
+                                                                                  getattr(body, "tool_name", None)):
+        return _blocked(body, identity.RULE_NOT_DELEGATED,
+                        "This tool is not among those granted for the person this call is for")
+    stops = gateway.stop_set()
     call = stops.for_caller(project_id=member.project_id if member is not None else "",
                             environment_id=member.environment_id if member is not None else "",
                             app_id=getattr(body, "app_id", None), agent_id=getattr(body, "agent_id", None),
-                            key_id=key.id if key is not None and not key.instance_key else None)
+                            key_id=key.id if key is not None and not key.instance_key else None,
+                            user=delegation.person if delegation is not None else None) if stops else NO_STOPS
     hit, rule = call.stopped, RULE_STOPPED
     if hit is None and stage in _ACTING_STAGES:
         hit, rule = call.quarantined, RULE_QUARANTINED
@@ -154,12 +179,16 @@ def _stop_decision(body, key, stage: str) -> Optional[EvaluationResponse]:
         hit, rule = call.tool_stop(getattr(body, "tool_name", None)), RULE_TOOL_STOPPED
     if hit is None:
         return None
-    from znyx_core.core.models import Decision, RuleHit, Severity
     logger.info("Evaluate %s refused by stop %s (%s %s)", stage, hit.id or "-", hit.target, hit.match or "")
+    return _blocked(body, rule, hit.message(), f"Refused by stop {hit.id}" if hit.id else "Refused by a stop")
+
+
+def _blocked(body, rule: str, message: str, developer: Optional[str] = None) -> EvaluationResponse:
+    from znyx_core.core.models import Decision, RuleHit, Severity
     return EvaluationResponse(
         request_id=str(getattr(body, "request_id", "") or ""), decision=Decision.BLOCK, risk_score=100,
-        policy_version="kill_switch", rule_hits=[RuleHit(rule_id=rule, severity=Severity.HIGH, message=hit.message())],
-        user_message=hit.message(), developer_message=f"Refused by stop {hit.id}" if hit.id else "Refused by a stop",
+        policy_version="gateway", rule_hits=[RuleHit(rule_id=rule, severity=Severity.HIGH, message=message)],
+        user_message=message, developer_message=developer or message,
         trace_id=getattr(body, "trace_id", None), session_id=getattr(body, "session_id", None),
         span_id=getattr(body, "span_id", None))
 
@@ -309,6 +338,7 @@ async def evaluate_tool(request: ToolEvaluationRequest, key=Depends(_caller_key)
         ev = _get_evaluator()
         result = await ev.evaluate_tool(request, policy=policy,
                                         judge_ctx=_runtime_judge_ctx(policy, request))
+        result = await _approval_of(request, key, policy, result)
         hb = _get_heartbeat()
         if hb:
             hb.increment_eval_count()
@@ -324,6 +354,58 @@ async def evaluate_tool(request: ToolEvaluationRequest, key=Depends(_caller_key)
     except Exception:
         logger.exception("Tool evaluation failed")
         raise HTTPException(status_code=500, detail="Tool evaluation failed")
+
+
+async def _approval_of(request, key, policy, result: EvaluationResponse) -> EvaluationResponse:
+    """Technique 33 on the evaluate API. A tool call the policy marks for approval is answered
+    at once with BLOCK and the approval's id (``pending_review_id``): the SDK calls again with
+    ``metadata.approval_id`` set to it, and gets the tool's own decision once a person approved
+    this exact call (an approval is used once)."""
+    from znyx_core import approvals
+    from znyx_core.core.models import Decision, RuleHit, Severity
+    rules = approvals.rules_of(policy)
+    reason = rules.reason(request.tool_name) if rules is not None else None
+    gateway = _get_gateway()
+    if reason is None or gateway is None or result.decision == Decision.BLOCK:
+        return result
+    from znyx_runtime.gateway.pipeline import CallRecord
+    record = CallRecord(request_id=request.request_id, key_id=key.id if key is not None and not key.instance_key else "",
+                        tenant_id=request.tenant_id, app_id=request.app_id, agent_id=request.agent_id,
+                        api="evaluate", trace_id=request.trace_id or "")
+    record.member = getattr(key, "member", "") or ""
+    member = None
+    try:
+        member = _get_bundle_manager().member_for(record.member or None, request.app_id, request.env)
+    except ScopeNotServed:
+        member = None
+    given = (request.metadata or {}).get("approval_id") if isinstance(request.metadata, dict) else None
+    pending_id = None
+    try:
+        if isinstance(given, str) and given:
+            status = await gateway.approvals.check(given, request.tool_name, request.tool_args, record.key_id)
+            if status == "approved":
+                return result
+            if status == "pending":
+                pending_id = given
+                message = f"Still waiting for a person's approval ({given}); call again once it is decided"
+            else:
+                message = f"This tool call was not approved ({status})"
+        else:
+            pending_id = await gateway.approvals.request(rules=rules, reason=reason, tool=request.tool_name,
+                                                         arguments=request.tool_args, server=None, record=record,
+                                                         member=member)
+            message = (f"This tool call needs a person's approval ({reason}); call again with "
+                       f"metadata.approval_id = {pending_id} once it is approved")
+    except approvals.AmbiguousArguments as exc:
+        message = f"This tool call's arguments are ambiguous ({exc})"
+    except Exception as exc:  # noqa: BLE001 - when in doubt the tool does not run
+        logger.warning("Approval for %s could not be asked: %s", request.tool_name, exc)
+        message = "This tool call needs a person's approval, which could not be asked (refused)"
+    return result.model_copy(update={
+        "decision": Decision.BLOCK, "risk_score": max(result.risk_score, 80), "user_message": message,
+        "pending_review_id": pending_id,
+        "rule_hits": list(result.rule_hits) + [RuleHit(rule_id=approvals.RULE_NOT_APPROVED, severity=Severity.HIGH,
+                                                       message=message)]})
 
 
 # ── New-stage evaluate endpoints (generalized stage dispatch) ──────
