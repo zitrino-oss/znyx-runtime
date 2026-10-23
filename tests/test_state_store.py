@@ -78,6 +78,31 @@ def test_delete(store):
     assert store.get(key) == {}
 
 
+def test_reservation_is_atomic_across_counters_and_can_be_settled(store):
+    key = _key()
+    assert store.reserve(key, {"tokens": 70, "cost": 0.5}, {"tokens": 100, "cost": 1.0}, 60)
+    assert not store.reserve(key, {"tokens": 40, "cost": 0.1}, {"tokens": 100, "cost": 1.0}, 60)
+    assert store.get(key) == {"tokens": 70, "cost": 0.5}
+    assert not store.reserve(key, {"tokens": 1, "cost": 0.6}, {"tokens": 100, "cost": 1.0}, 60)
+    store.incr(key, {"tokens": -50, "cost": -0.4}, 60)
+    assert store.reserve(key, {"tokens": 80, "cost": 0.1}, {"tokens": 100, "cost": 1.0}, 60)
+    assert store.get(key)["tokens"] == 100
+
+
+def test_concurrent_reservations_never_over_admit(store):
+    from concurrent.futures import ThreadPoolExecutor
+    key = _key()
+    with ThreadPoolExecutor(12) as pool:
+        results = list(pool.map(lambda _: store.reserve(key, {"tokens": 10}, {"tokens": 50}, 60), range(30)))
+    assert sum(results) == 5 and store.get(key)["tokens"] == 50
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, True])
+def test_invalid_reservations_are_refused_before_reaching_the_store(store, value):
+    with pytest.raises(ValueError):
+        store.reserve(_key(), {"tokens": value}, {"tokens": 100}, 60)
+
+
 def test_memory_window_resets_after_ttl():
     clock = FakeClock()
     store = MemoryStateStore(clock=clock)

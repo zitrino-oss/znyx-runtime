@@ -183,8 +183,8 @@ What happens to each call:
   parts of one message are read together. History already checked is skipped, and
   invisible characters cannot hide words from the checks. Personal data is redacted
   before it leaves; a blocked request comes back as the provider's own error (HTTP
-  400, code `content_filter`). Images, audio and files cannot be read: they are
-  counted, or refused with `settings.uncheckable_content: block`.
+  400, code `content_filter`). Images, audio and documents are inspected from their
+  bytes by an in-network OCR/speech service. Missing or incomplete extraction is refused.
 - **Forward.** To the provider and model in the request, with the provider key held
   by the gateway. Everything the gateway does not change passes through untouched.
 - **Guard output.** Text, refusals and reasoning are checked before the application
@@ -225,8 +225,9 @@ listed in `ZNYX_GATEWAY_ALLOWED_HOSTS` (comma-separated, `*.example.com` for
 subdomains); `OPENAI_API_KEY` and the other standard key variables only ever go to their
 own provider.
 
-Settings (`settings:` in `gateway.yaml`): `check_roles`, `uncheckable_content`
-(`allow` or `block`), `allow_provider_mcp` (Anthropic's MCP connector, off: the provider
+Settings (`settings:` in `gateway.yaml`): `check_roles`, `media_inspection` (on),
+`uncheckable_content` (`allow` or `block`, used when media inspection is explicitly off),
+`allow_provider_mcp` (Anthropic's MCP connector, off: the provider
 would call MCP servers outside the tool policy), `max_parallel_checks` (8),
 `body_timeout_seconds` (30), `max_request_bytes`, `max_concurrent` (a stream holds its
 slot until it ends). The gateway reads a request only after its key is checked; the
@@ -346,6 +347,17 @@ The others are switched on by a profile or by name:
   Requests are deleted once answered;
   answers after `ZNYX_BATCH_RETENTION_DAYS` (7). Provider keys are never stored.
 
+Keys with daily token or spend limits reserve capacity atomically before provider calls,
+including retries, shadow calls, voting and queued batches. Reservations use an input-token
+estimate and the requested answer cap, then settle against reported usage. Without a supplied
+cap, the answer is capped at the remaining allowance or 1,000 tokens, whichever is smaller.
+Shared-store outages refuse new reservations. Provider tokenisation or missing usage can
+still make the final charge differ from the estimate.
+
+A blocking `output_contract` refuses `stream: true` with HTTP 400
+(`streaming_contract_not_supported`) before sending to the provider. Use a non-streamed call
+when the complete answer must pass a schema or business rule before any text is released.
+
 Techniques that can change what an answer says (tool pruning, relevance filtering, context
 ordering, marking untrusted content, history summarisation, prompt compression, the semantic
 cache, model right-sizing) are first tried in **shadow**: list them in `optimisation.shadow` and
@@ -353,7 +365,9 @@ the gateway, on a sample of calls (`shadow_percent`, at most `shadow_calls_per_d
 variant after the client has its normal answer, compares the two answers (NLI both ways when the
 policy has an NLI endpoint, otherwise by their words or as JSON), and records only the verdict.
 The console allows switching one on (`approved`) only after at least 95% agreement over at least
-50 samples. Right-sizing (`right_size_to`) sends simple requests to the smaller model and says so
+50 NLI samples for the key's current settings and model permissions. Lexical comparisons remain
+diagnostic; changing tested settings requires fresh matching evidence. Right-sizing (`right_size_to`)
+sends simple requests to the smaller model and says so
 in `X-Znyx-Model-Requested` and `X-Znyx-Model-Served`; every such answer is verified and retried on
 the requested model if it fails. The console fits the difficulty model and the semantic cache's
 cut-off on shadow results and delivers a version you promote in the signed bundle. Prompt
@@ -710,6 +724,30 @@ Key environment variables (each has a `znyx.yaml` equivalent; `znyx config` list
 | `ZNYX_AIRGAPPED` | `false` | No outbound calls at all |
 | `ZNYX_TELEMETRY` | `false` | Opt in to anonymous install heartbeats |
 | `ZNYX_TELEMETRY_URL` | `https://cp.znyx.ai/v1/install-telemetry` | Install-telemetry receiver. Only used when `ZNYX_TELEMETRY=true`; set to `""` to remove the destination |
+
+## Media, voice and shared defence
+
+The gateway also serves embeddings, Responses, image generation/editing, speech,
+transcription/translation and OpenAI Realtime WebSocket. New channels reuse gateway
+identity, delegation, egress, stops and budget controls. Responses and media streams
+are buffered until inspection finishes; realtime uses complete, manually committed turns.
+See [CHANNELS.md](CHANNELS.md) for endpoints, formats, limits and configuration.
+
+Build the offline OCR/PDF/speech image with `docker build --target znyx-media`.
+Mount an approved speech model and its SHA-256 digest; weights are never downloaded
+by an extraction request. Media inspection is enabled by default, so deployments
+that previously forwarded unchecked media must configure this service before upgrading.
+
+Shared defence is optional and off by default. An organization administrator enables it
+under Inventory > Shared defence. Only versioned SHA-256 fingerprints and fixed attack
+categories are contributed. Customers can inspect the complete local outbound history,
+report false positives and disable participation. Reviewed fingerprints arrive through
+signed controls; operators can withdraw them. No prompt or response text is shared.
+
+The [operated deployment kit](deploy/operated/README.md) targets Azure first: private AKS,
+Entra/PIM access, audit templates, revocation and native marketplace packaging inputs.
+AWS access is retained as a secondary option.
+Live deployment and marketplace submission require the customer's actual accounts.
 
 ## Upgrading from znyx-runtime and znyx-inference
 

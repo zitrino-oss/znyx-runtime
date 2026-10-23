@@ -72,6 +72,7 @@ DETECTOR_META: Dict[str, DetectorMeta] = {
     # landed. All eight are built and registered now, which is what takes the
     # requirement ceiling to 100; the mechanism stays in place for the next edition.
     "multimodal_injection":  DetectorMeta(["input"], ["*"]),
+    "shared_defence": DetectorMeta(["input", "output", "tool", "retrieval"], ["*"]),
     "reasoning_trace_disclosure":  DetectorMeta(["output"], ["*"]),
     "tool_permission_audit":     DetectorMeta(["tool_registration"], ["*"]),
     "human_approval_gate":       DetectorMeta(["agent_plan", "agent_loop"], ["*"]),

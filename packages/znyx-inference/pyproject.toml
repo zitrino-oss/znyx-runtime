@@ -38,6 +38,8 @@ dependencies = [
 # the app with fastapi's TestClient need httpx in the TEST environment only.
 
 [project.optional-dependencies]
+# Whisper 1.2.x uses av.open(metadata_errors=...), removed in PyAV 19.
+media = ["Pillow>=10.4", "pytesseract>=0.3.13", "pypdfium2>=4.30,<6", "faster-whisper>=1.2.1,<1.3", "av>=14,<19", "defusedxml>=0.7.1"]
 # --- [onnx] — the DEFAULT serving extra. CPU-only, torch-free. This is what the
 # inference Docker image installs. Serves sha256-pinned local ONNX artifacts via
 # onnxruntime + the standalone Rust `tokenizers` (no transformers, no torch, no CUDA).

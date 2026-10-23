@@ -305,7 +305,13 @@ class BundleManager:
                 agent_id=agent_id,
                 env=bundle.environment or env,
             )
-            return {**policy, "policy_version": bundle.bundle_id or bundle.policy_hash}
+            resolved = {**policy, "policy_version": bundle.bundle_id or bundle.policy_hash}
+            feed = self.controls.get("shared_defence") or {}
+            if feed.get("enabled") is True:
+                resolved["shared_defence"] = feed
+            else:
+                resolved.pop("shared_defence", None)
+            return resolved
 
         # No policy available - apply fail mode
         if self.config.fail_mode == "open":

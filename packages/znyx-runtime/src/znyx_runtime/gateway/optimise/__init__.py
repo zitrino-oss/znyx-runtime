@@ -51,6 +51,7 @@ class Effect:
     routed: Optional[str] = None         # right-sizing: where the call would have gone
     features: Optional[List[float]] = None
     method: Optional[str] = None         # nli | lexical
+    config_hash: Optional[str] = None    # the tested key settings, not prompt text
 
     def entry(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"technique": self.technique, "stage": self.stage,
@@ -64,7 +65,7 @@ class Effect:
             out["verified"] = self.verified
         if self.shadow:
             out["shadow"] = True
-            for name in ("agreement", "projected_saved_usd", "routed", "features", "method"):
+            for name in ("agreement", "projected_saved_usd", "routed", "features", "method", "config_hash"):
                 value = getattr(self, name)
                 if value is not None:
                     out[name] = round(value, 8) if isinstance(value, float) else value

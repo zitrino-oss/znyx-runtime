@@ -35,6 +35,7 @@ dependencies = [
   # resolved only because znyx-core happens to depend on it, so the install would have broken
   # silently the day znyx-core dropped it.
   "httpx>=0.26.0",
+  "websockets>=14,<17",
   # Same reason: `benchmark.py` imports yaml DIRECTLY to read a policy file and write the
   # scorecard stamp back into it.
   "PyYAML>=6.0",
@@ -42,6 +43,9 @@ dependencies = [
 
 [project.scripts]
 znyx-runtime = "znyx_runtime.cli:main"
+
+[project.optional-dependencies]
+tokens = ["tiktoken>=0.7,<1"]
 
 [project.urls]
 Homepage = "https://github.com/zitrino-oss/znyx-runtime"

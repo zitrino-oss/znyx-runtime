@@ -47,6 +47,8 @@ from znyx_runtime.api.routes import router
 from znyx_runtime.api.stream_routes import router as stream_router
 from znyx_runtime.api.dashboard_routes import router as dashboard_router
 from znyx_runtime.gateway.routes import router as gateway_router
+from znyx_runtime.gateway.channels import router as channel_router
+from znyx_runtime.gateway.realtime import router as realtime_router
 from znyx_runtime.workers import (
     RecentDecisions, WorkerReporter, instance_snapshot, is_leader, run_dir as worker_run_dir,
     worker_count, worker_index,
@@ -307,6 +309,8 @@ async def lifespan(app: FastAPI):
         # Governance records (Phase 5 part 4): MCP tool calls, approvals, delegated tokens.
         audit_shippers.append(SpoolShipper(str(app.state.gateway.governance.path),
                                            f"{cp}/v1/runtime/audit/governance", sender, name="governance-audit"))
+        audit_shippers.append(SpoolShipper(str(app.state.gateway.defence.path), f"{cp}/v1/runtime/defence",
+            app.state.gateway.defence.sender(app.state.gateway, sender), name="shared-defence"))
         for shipper in audit_shippers:
             shipper.start()
     app.state.audit_shippers = audit_shippers
@@ -561,6 +565,8 @@ app.include_router(router)
 app.include_router(stream_router)
 app.include_router(dashboard_router)
 app.include_router(gateway_router)
+app.include_router(channel_router)
+app.include_router(realtime_router)
 
 
 @app.get("/")

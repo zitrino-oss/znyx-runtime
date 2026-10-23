@@ -97,6 +97,16 @@ variable "image_repository" {
   default     = "znyx/znyx"
 }
 
+variable "image_digest" {
+  description = "Immutable image sha256 digest; takes precedence over image_tag when set."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.image_digest == "" || can(regex("^sha256:[0-9a-f]{64}$", var.image_digest))
+    error_message = "image_digest must be empty or a sha256 digest with 64 lowercase hex characters."
+  }
+}
+
 variable "image_tag" {
   description = "Image tag. Empty: the chart's appVersion. The chart appends -ml when ml_enabled."
   type        = string

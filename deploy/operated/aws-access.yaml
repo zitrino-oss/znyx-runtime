@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Customer-owned, expiring Znyx operator access to an existing EKS cluster
+Parameters:
+  ClusterName:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9][A-Za-z0-9_-]{0,99}'
+  OperatorRoleArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:role/.+'
+    Description: The specific Znyx operator role approved by the customer
+  ExternalId:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    MaxLength: 256
+    Description: Customer-generated random external ID, exchanged through a secure channel
+  AccessExpiresAt:
+    Type: String
+    AllowedPattern: '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+    Description: Customer-approved access expiry in UTC, renewed explicitly
+Resources:
+  OperatorAccess:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      Description: Expiring customer-approved Znyx diagnostics access; Kubernetes RBAC grants no secret access
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref OperatorRoleArn
+            Action: ['sts:AssumeRole', 'sts:SetSourceIdentity']
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+              StringLike:
+                sts:SourceIdentity: 'znyx-*'
+              DateLessThan:
+                aws:CurrentTime: !Ref AccessExpiresAt
+      Policies:
+        - PolicyName: DescribeApprovedCluster
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['eks:DescribeCluster']
+                Resource: !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+  AccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref ClusterName
+      PrincipalArn: !GetAtt OperatorAccess.Arn
+      Type: STANDARD
+      KubernetesGroups: ['znyx-operated-diagnostics']
+Outputs:
+  OperatorRoleArn:
+    Value: !GetAtt OperatorAccess.Arn
+  AccessExpiresAt:
+    Value: !Ref AccessExpiresAt

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "clusterResourceId": {"type": "string", "metadata": {"description": "Existing customer AKS resource ID in this deployment resource group."}},
+    "extensionResourceName": {"type": "string", "minLength": 6, "maxLength": 30},
+    "extensionVersion": {"type": "string"},
+    "controlPlaneUrl": {"type": "string", "minLength": 9},
+    "existingSecret": {"type": "string", "minLength": 1},
+    "dataClaim": {"type": "string", "minLength": 1},
+    "redisPrivateIp": {"type": "string", "minLength": 7, "maxLength": 15},
+    "redisPort": {"type": "int", "minValue": 1, "maxValue": 65535},
+    "mediaEnabled": {"type": "bool", "defaultValue": true},
+    "modelClaim": {"type": "string", "minLength": 1}
+  },
+  "variables": {
+    "plan-name": "DONOTMODIFY",
+    "plan-publisher": "DONOTMODIFY",
+    "plan-offerID": "DONOTMODIFY",
+    "releaseTrain": "DONOTMODIFY",
+    "clusterExtensionTypeName": "DONOTMODIFY"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.KubernetesConfiguration/extensions",
+      "apiVersion": "2024-11-01",
+      "name": "[parameters('extensionResourceName')]",
+      "scope": "[parameters('clusterResourceId')]",
+      "properties": {
+        "extensionType": "[variables('clusterExtensionTypeName')]",
+        "autoUpgradeMinorVersion": false,
+        "version": "[parameters('extensionVersion')]",
+        "releaseTrain": "[variables('releaseTrain')]",
+        "configurationSettings": {
+          "config.control_plane.url": "[parameters('controlPlaneUrl')]",
+          "existingSecret": "[parameters('existingSecret')]",
+          "persistence.existingClaim": "[parameters('dataClaim')]",
+          "networkPolicy.extraEgress[0].to[0].ipBlock.cidr": "[concat(parameters('redisPrivateIp'), '/32')]",
+          "networkPolicy.extraEgress[0].ports[0].port": "[string(parameters('redisPort'))]",
+          "ml.enabled": "[string(parameters('mediaEnabled'))]",
+          "config.ml.enabled": "[string(parameters('mediaEnabled'))]",
+          "ml.models.existingClaim": "[parameters('modelClaim')]",
+          "extraEnv[1].valueFrom.secretKeyRef.name": "[parameters('existingSecret')]"
+        },
+        "configurationProtectedSettings": {}
+      },
+      "plan": {
+        "name": "[variables('plan-name')]",
+        "publisher": "[variables('plan-publisher')]",
+        "product": "[variables('plan-offerID')]"
+      }
+    }
+  ],
+  "outputs": {}
+}

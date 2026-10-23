@@ -14,6 +14,7 @@ comparison: JSON answers compared as data, text by the share of content words in
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import time
@@ -25,7 +26,7 @@ NLI_AGREES_AT = 0.5
 LEXICAL_AGREES_AT = 0.6
 _WORD = re.compile(r"[a-z0-9]{2,}")
 _STOP = frozenset("""the a an and or of to in on for is are was were be been it this that with as by at from
-your you we our they their he she his her its not no yes can will would should could do does did have has
+your you we our they their he she his her its can will would should could do does did have has
 had so if then than but there here which who what when where how about into over under more most less""".split())
 
 
@@ -62,6 +63,11 @@ def lexical_agreement(a: str, b: str) -> float:
             return sum(1 for k in keys if ja.get(k) == jb.get(k)) / len(keys)
         return 0.0
     wa, wb = _words(a), _words(b)
+    # Lexical scores are diagnostic only, but must not label negated answers as
+    # identical. Keep polarity even when the rest of the wording is the same.
+    polarity = {"not", "no", "never", "neither", "without", "yes"}
+    if wa & polarity != wb & polarity:
+        return 0.0
     if not wa and not wb:
         return 1.0 if a.strip() == b.strip() else 0.0
     return len(wa & wb) / len(wa | wb)
@@ -73,6 +79,8 @@ def compare(served: str, variant: str, nli: Optional[Callable] = None) -> Tuple[
         try:
             forward = float(nli(served, [variant])[0])
             backward = float(nli(variant, [served])[0])
+            if not all(math.isfinite(s) and 0 <= s <= 1 for s in (forward, backward)):
+                raise ValueError("NLI scores must be finite probabilities")
             score = min(forward, backward)
             return score >= NLI_AGREES_AT, round(score, 4), "nli"
         except Exception:  # noqa: BLE001 - the endpoint failed: fall back, and say so

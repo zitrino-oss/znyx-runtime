@@ -37,6 +37,7 @@ from znyx_inference.contract import (
 )
 from znyx_inference.install import InstallManager
 from znyx_inference.registry import RunnerRegistry
+from znyx_inference.media import router as media_router
 
 # Nothing in this package configured a level/handler before, so every INFO-level log
 # (pin-sync's fetch/load progress, registry's successful-load line) was silently dropped —
@@ -74,10 +75,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if hasattr(app.state, "media_pool"):
+            app.state.media_pool.shutdown(wait=False, cancel_futures=True)
         await registry.stop_all()
 
 
 app = FastAPI(title="ZNYX Inference Service", version=__version__, lifespan=lifespan)
+app.include_router(media_router)
 
 # This service has no authentication by design and must only be reachable from the
 # runtime beside it. When ZNYX_INFERENCE_TRUSTED_HOSTS is set (znyx serve sets it to

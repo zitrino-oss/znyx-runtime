@@ -655,6 +655,7 @@ class PolicySchema(BaseModel):
     reasoning_trace_disclosure: Optional[ReasoningTraceDisclosureConfig] = None
     output_control_char_sanitizer: Optional[OutputControlCharSanitizerConfig] = None
     multimodal_injection: Optional[MultimodalInjectionConfig] = None
+    shared_defence: Optional[Dict[str, Any]] = None
     corpus_poisoning_monitor: Optional[CorpusPoisoningMonitorConfig] = None
     semantic_cache_integrity: Optional[SemanticCacheIntegrityConfig] = None
     numerical_consistency: Optional[NumericalConsistencyConfig] = None

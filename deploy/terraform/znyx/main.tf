@@ -28,6 +28,7 @@ locals {
       registry   = var.image_registry
       repository = var.image_repository
       tag        = var.image_tag
+      digest     = var.image_digest
     }
     imagePullSecrets = [for name in var.image_pull_secrets : { name = name }]
     config           = local.config

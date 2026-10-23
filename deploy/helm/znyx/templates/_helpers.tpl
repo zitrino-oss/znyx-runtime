@@ -58,6 +58,16 @@ Names of the ConfigMap and the Secret in use.
 Container image: [registry/]repository:tag, with an "-ml" suffix on the tag when ml.enabled.
 */}}
 {{- define "znyx.image" -}}
+{{- $azure := dig "azure" "images" "runtime" dict .Values.global -}}
+{{- if $azure -}}
+{{- $registry := required "global.azure.images.runtime.registry is required" $azure.registry -}}
+{{- $image := required "global.azure.images.runtime.image is required" $azure.image -}}
+{{- if $azure.digest -}}
+{{- printf "%s/%s@%s" (trimSuffix "/" $registry) (trimPrefix "/" $image) $azure.digest -}}
+{{- else -}}
+{{- printf "%s/%s:%s" (trimSuffix "/" $registry) (trimPrefix "/" $image) (required "Azure image needs a tag or digest" $azure.tag) -}}
+{{- end -}}
+{{- else -}}
 {{- $tag := toString (default .Chart.AppVersion .Values.image.tag) -}}
 {{- if and .Values.ml.enabled (not (hasSuffix "-ml" $tag)) -}}
 {{- $tag = printf "%s-ml" $tag -}}
@@ -66,7 +76,12 @@ Container image: [registry/]repository:tag, with an "-ml" suffix on the tag when
 {{- if .Values.image.registry -}}
 {{- $repo = printf "%s/%s" (trimSuffix "/" .Values.image.registry) (trimPrefix "/" $repo) -}}
 {{- end -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" $repo .Values.image.digest -}}
+{{- else -}}
 {{- printf "%s:%s" $repo $tag -}}
+{{- end -}}
+{{- end }}
 {{- end }}
 
 {{/*

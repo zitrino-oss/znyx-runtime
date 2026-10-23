@@ -461,7 +461,8 @@ def test_no_profile_or_technique_lets_a_jailbreak_through(client, key):
 
 
 @pytest.mark.parametrize("key", DEFAULT_POLICY_KEYS)
-def test_no_profile_or_technique_sends_pii_unredacted(client, key):
+def test_no_profile_or_technique_sends_pii_unredacted(client, key, monkeypatch):
+    _floor_budget(client, monkeypatch, key)
     record = {"customer": {"name": "Jane", "email": EMAIL, "notes": "x" * 120}, "orders": list(range(30))}
     pretty = json.dumps(record, indent=4)                         # minified on the way
     repeated = ("Order history for the account. " * 12) + f"Contact: {EMAIL}."   # deduplicated
@@ -483,7 +484,8 @@ def test_no_profile_or_technique_releases_a_secret_in_the_answer(client, key):
 
 
 @pytest.mark.parametrize("key", DEFAULT_POLICY_KEYS)
-def test_cache_markers_never_carry_unchecked_text(client, key):
+def test_cache_markers_never_carry_unchecked_text(client, key, monkeypatch):
+    _floor_budget(client, monkeypatch, key)
     system = "You are the support assistant for Acme. " * 120
     for _ in range(2):                                             # the second call is marked
         resp = anthropic_call(client, [user(f"SAY:ok, mail {EMAIL}")], key=key, system=system)
@@ -491,7 +493,18 @@ def test_cache_markers_never_carry_unchecked_text(client, key):
         assert EMAIL not in json.dumps(sent()) and EMAIL not in json.dumps(resp.json())
 
 
-def test_the_guards_run_on_every_call_whatever_the_profile(client):
+def _floor_budget(client, monkeypatch, name, tokens=100_000):
+    """The floor tests exercise large inputs on every profile. Give their budgeted
+    keys room to reserve those inputs; budget admission has separate regressions."""
+    from dataclasses import replace
+    from znyx_runtime.gateway.config import Limits
+    key = next(k for k in client.gateway.config.keys_by_digest.values() if k.id == f"k-{name}")
+    if key.limits.tokens_per_day or key.limits.spend_usd_per_day:
+        monkeypatch.setitem(client.gateway.config.keys_by_digest, key.key_sha256,
+                            replace(key, limits=Limits(tokens_per_day=tokens)))
+
+
+def test_the_guards_run_on_every_call_whatever_the_profile(client, monkeypatch):
     gw = client.gateway
     counts = {"input": 0, "output": 0}
     real_in, real_out = gw._guard_input, gw._guard_output
@@ -508,6 +521,7 @@ def test_the_guards_run_on_every_call_whatever_the_profile(client):
     try:
         doc = json.dumps({"rows": list(range(200))}, indent=2)
         for key in KEYS:
+            _floor_budget(client, monkeypatch, key)
             for headers in ({}, {"x-znyx-optimise": "off"}):
                 resp = openai_call(client, [user("SAY:ok"), *tool_turn([doc, doc])], key=key,
                                    headers=headers, temperature=0)
@@ -820,7 +834,8 @@ def _day_usage(client, name):
     return get_state_store().get(client.gateway._day_key(key))
 
 
-def test_a_shared_call_is_paid_in_full_when_its_starter_leaves(client):
+def test_a_shared_call_is_paid_in_full_when_its_starter_leaves(client, monkeypatch):
+    _floor_budget(client, monkeypatch, "budgeted", tokens=5000)
     fake.RESPONSE_DELAY = 1.2
     fake.scripted = _big_answer
     messages = [user("SAY:tell me everything")]
@@ -1887,7 +1902,8 @@ def test_queued_batch_calls_count_against_the_keys_daily_limit(client):
     codes = [_batch_post(client, "/v1/chat/completions", {"model": "gpt-4o-mini", "max_tokens": 100,
                                                           "messages": [user(f"SAY:q{i}")]}, key="thinbatch").status_code
              for i in range(5)]
-    assert codes[:2] == [202, 202] and 429 in codes                          # reserved when queued
+    assert codes[0] == 202 and 429 in codes                                # the full request envelope is reserved
+    assert _day_usage(client, "thinbatch")["tokens"] <= 300
 
 
 def test_batch_calls_are_never_right_sized_and_parallel_calls_never_rerouted(client):

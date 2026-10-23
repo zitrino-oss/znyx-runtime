@@ -71,11 +71,14 @@ class _TextGuard:
         from znyx_runtime.api.routes import runtime_judge_ctx
 
         self.gw, self.policy, self.record = gw, policy, record
+        from znyx_runtime.gateway.defence import active
+        self.defence_text = ""
+        self.defence_buffered = active(gw._controls().get("shared_defence") or {})
         self.request = gw._request(scope, record, f"stream-{label}", "", "assistant", context)
         self.ev = StreamingEvaluator(
             policy=policy, context="output", request=self.request,
             orchestrator=gw.evaluator.orchestrator, judge_ctx=runtime_judge_ctx(policy, self.request),
-            remediation=gw.evaluator.remediation)
+            remediation=gw.evaluator.remediation, mode="buffered" if self.defence_buffered else "incremental")
         self.t0 = time.perf_counter()
         self.recorded = False
 
@@ -96,9 +99,16 @@ class _TextGuard:
         return [e["data"]["text"] for e in events if e.get("event") == "chunk" and e["data"].get("text")]
 
     async def push(self, text: str) -> List[str]:
+        if self.defence_buffered:
+            self.defence_text += text
         return await self._run(self.ev.push, text)
 
     async def finish(self) -> List[str]:
+        if self.defence_buffered:
+            from znyx_core.defence import match
+            if match(self.defence_text, self.gw._controls().get("shared_defence") or {}):
+                self.record.rule_ids.append("shared_defence.attack_fingerprint")
+                return await self._run(self.ev.fail_closed, "Reviewed attack fingerprint")
         return await self._run(self.ev.flush)
 
     def close(self) -> None:
@@ -149,12 +159,14 @@ async def stream_call(gw, request: Request, api: str, fmt, provider, url: str, h
     from znyx_runtime.gateway.pipeline import quiet_policy
     policy = quiet_policy(policy)
     t_up = time.perf_counter()
+    record._upstream_started = True
     client, upstream = await gw.upstream.open_stream(provider, url, headers, body)
     if upstream.status_code != 200:
         content = await upstream.aread()
         await upstream.aclose()
         record.upstream_ms = int((time.perf_counter() - t_up) * 1000)
         record.status, record.outcome, record.reason = upstream.status_code, "error", "provider_error"
+        gw._charge(key, record)
         gw._record(record)
         returned = gw.upstream.returned_headers(upstream)
         returned.update(gw.trace_headers(record))
@@ -266,6 +278,22 @@ async def _openai(gw, upstream, fmt, scope, policy, record, added_usage: bool, t
                     return out + withhold(index)
         held = audio.get(index)
         if held is not None:
+            if gw.config.settings.media_inspection:
+                from znyx_runtime.gateway import media
+                from znyx_runtime.gateway.pipeline import Denied
+                try:
+                    raw = bytearray()
+                    for delta in held["deltas"]:
+                        if delta.get("data"):
+                            decoded, _ = media.decode(delta["data"])
+                            raw.extend(decoded)
+                            if len(raw) > media.MAX_BYTES:
+                                raise Denied(413, "Audio exceeds the inspection limit", "media_too_large")
+                    if raw:
+                        await media.check(gw, bytes(raw), "audio/wav", scope, policy, record, "output")
+                except Denied:
+                    record.note("audio_withheld")
+                    return out + withhold(index)
             verdict = await _check_held(gw, held["transcript"], "text", None, scope, policy, record,
                                         f"a{index}", context)
             if not _clean(verdict, held["transcript"]):
@@ -412,8 +440,17 @@ async def _anthropic(gw, upstream, scope, policy, record, t_up: float,
     thinking: Dict[int, Dict[str, Any]] = {}
     passthrough: set = set()
     usage = state.usage
+    # Consecutive text blocks are one logical answer. Keep the evaluator's holdback
+    # across their boundaries and emit one text block, so a secret cannot be split
+    # into separately flushed blocks. Remap later indices for SDKs that index a list.
+    indices: Dict[int, int] = {}
+    next_index = 0
+    pending_text: Optional[int] = None
+    answer_guard: Optional[_TextGuard] = None
 
     def ev(name: str, data: Dict[str, Any]) -> bytes:
+        if "index" in data:
+            data = {**data, "index": indices.get(data["index"], data["index"])}
         return fmts.sse(data, event=name)
 
     def text_delta(index: int, text: str) -> bytes:
@@ -442,7 +479,19 @@ async def _anthropic(gw, upstream, scope, policy, record, t_up: float,
             return out + refusal(index), True
         return out, False
 
+    async def finish_text() -> Tuple[List[bytes], bool]:
+        nonlocal pending_text
+        if pending_text is None:
+            return [], False
+        index, pending_text = pending_text, None
+        guard = guards[index]
+        out = [text_delta(index, t) for t in await guard.finish()]
+        if guard.blocked:
+            return out + refusal(index), True
+        return out + [ev("content_block_stop", {"type": "content_block_stop", "index": index})], False
+
     async def process(name: Optional[str], data: str) -> Tuple[List[bytes], bool]:
+        nonlocal pending_text, next_index, answer_guard
         try:
             obj = json.loads(data)
         except ValueError:
@@ -461,10 +510,30 @@ async def _anthropic(gw, upstream, scope, policy, record, t_up: float,
             index = obj.get("index", 0)
             block = obj.get("content_block") if isinstance(obj.get("content_block"), dict) else {}
             btype = block.get("type")
+            prefix: List[bytes] = []
+            if btype != "text":
+                prefix, stopped = await finish_text()
+                if stopped:
+                    return prefix, True
+            merging = btype == "text" and pending_text is not None
+            if merging:
+                indices[index] = indices[pending_text]
+            else:
+                indices[index] = next_index
+                next_index += 1
             if btype == "text":
-                guards[index] = _TextGuard(gw, scope, policy, record, f"b{index}", context)
-                state.guards.append(guards[index])
-                out = [ev("content_block_start", {**obj, "content_block": {**block, "text": ""}})]
+                if merging:
+                    guards[index] = guards[pending_text]
+                    out = []
+                else:
+                    pending_text = index
+                    if answer_guard is None:
+                        answer_guard = _TextGuard(gw, scope, policy, record, f"b{index}", context)
+                        state.guards.append(answer_guard)
+                    # A tool/thinking block ends the emitted text block, but the
+                    # next text keeps the preceding detector context.
+                    guards[index] = answer_guard
+                    out = [ev("content_block_start", {**obj, "content_block": {**block, "text": ""}})]
                 initial = block.get("text")
                 if isinstance(initial, str) and initial:
                     more, stop = await push(index, initial)
@@ -478,8 +547,8 @@ async def _anthropic(gw, upstream, scope, policy, record, t_up: float,
                                    "text": str(block.get("thinking") or "")}
             else:
                 passthrough.add(index)
-                return [ev("content_block_start", obj)], False
-            return [], False
+                return prefix + [ev("content_block_start", obj)], False
+            return prefix, False
         if kind == "content_block_delta":
             index = obj.get("index", 0)
             delta = obj.get("delta") if isinstance(obj.get("delta"), dict) else {}
@@ -528,12 +597,7 @@ async def _anthropic(gw, upstream, scope, policy, record, t_up: float,
             if index in passthrough:
                 return [ev("content_block_stop", obj)], False
             if index in guards:
-                guard = guards[index]
-                out = [text_delta(index, t) for t in await guard.finish()]
-                guard.close()
-                if guard.blocked:
-                    return out + refusal(index), True
-                return out + [ev("content_block_stop", obj)], False
+                return [], False               # flushed at the next non-text block or message end
             if index in tools:
                 call = tools.pop(index)
                 verdict = await _check_held(gw, call["json"], "tool_call", call["name"], scope, policy,
@@ -553,13 +617,17 @@ async def _anthropic(gw, upstream, scope, policy, record, t_up: float,
                         ev("content_block_stop", {"type": "content_block_stop", "index": index})], False
             return [], False
         if kind == "message_delta":
+            prefix, stopped = await finish_text()
+            if stopped:
+                return prefix, True
             if isinstance(obj.get("usage"), dict):
                 out_tokens = obj["usage"].get("output_tokens")
                 if out_tokens is not None:
                     usage.output_tokens = out_tokens
-            return [ev("message_delta", obj)], False
+            return prefix + [ev("message_delta", obj)], False
         if kind == "message_stop":
-            return [ev("message_stop", obj)], True
+            prefix, stopped = await finish_text()
+            return prefix if stopped else prefix + [ev("message_stop", obj)], True
         if kind == "ping":
             return [ev("ping", obj)], False
         if kind == "error":

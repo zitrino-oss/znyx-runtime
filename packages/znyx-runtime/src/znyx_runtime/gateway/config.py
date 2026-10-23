@@ -31,6 +31,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -197,6 +198,9 @@ class GatewaySettings:
     # Content the gateway cannot read (images, audio, files): "allow" forwards it
     # (counted), "block" refuses the request.
     uncheckable_content: str = "allow"
+    # Phase 7: inspect actual media through the offline sidecar. Disabling this
+    # explicitly restores the legacy uncheckable_content behaviour.
+    media_inspection: bool = True
     # Anthropic's MCP connector makes the provider call MCP servers itself, outside the
     # gateway's tool policy and egress gate: refused unless allowed here.
     allow_provider_mcp: bool = False
@@ -561,6 +565,8 @@ def _settings(raw: Any) -> GatewaySettings:
     unknown = set(raw) - set(fields)
     _require(not unknown, "settings", f"unknown setting(s) {', '.join(sorted(unknown))}")
     values = dict(raw)
+    if "media_inspection" in values:
+        _require(type(values["media_inspection"]) is bool, "settings", "media_inspection must be boolean")
     if "check_roles" in values:
         values["check_roles"] = _str_list(values["check_roles"], "settings.check_roles")
     for name in ("max_request_bytes", "max_concurrent", "max_parallel_checks"):
@@ -588,10 +594,15 @@ def _prices(raw: Any) -> Dict[str, Dict[str, float]]:
     for model, entry in raw.items():
         _require(isinstance(entry, Mapping), f"prices.{model}", "expected a mapping")
         unknown = set(entry) - {"input_per_mtok", "output_per_mtok", "cached_input_per_mtok",
-                                "cache_write_per_mtok"}
+                                "cache_write_per_mtok", "per_image", "per_audio_minute", "per_million_characters",
+                                "audio_input_per_mtok", "audio_output_per_mtok", "cached_audio_input_per_mtok"}
         _require(not unknown, f"prices.{model}", f"unknown field(s) {', '.join(sorted(unknown))}")
         for name, value in entry.items():
-            _require(isinstance(value, (int, float)) and value >= 0, f"prices.{model}",
+            try:
+                valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+            except OverflowError:
+                valid = False
+            _require(valid, f"prices.{model}",
                      f"{name} must be a non-negative number")
         _require("input_per_mtok" in entry and "output_per_mtok" in entry, f"prices.{model}",
                  "needs input_per_mtok and output_per_mtok")

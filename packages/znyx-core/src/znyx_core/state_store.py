@@ -20,6 +20,8 @@ is unreachable the Redis store falls back to a local memory store for that call
 (``ZNYX_STATE_FAIL_MODE=local``, the default), so limits stay enforced per replica
 rather than switching off; ``ZNYX_STATE_FAIL_MODE=closed`` raises instead, and
 callers fail closed.
+Daily gateway budget reservations always fail closed when shared state is unavailable,
+including when other operations permit local fallback.
 
 All keys are namespaced (``znyx:``). Values are caller-chosen; detectors must not
 put raw prompt text in keys or values (use a hash).
@@ -54,6 +56,10 @@ class StateStore(Protocol):
 
     def get(self, key: str) -> Dict[str, float]:
         """The current counters under ``key`` (empty when none or expired)."""
+
+    def reserve(self, key: str, amounts: Dict[str, float], limits: Dict[str, float], ttl_seconds: float) -> bool:
+        """Atomically add nonnegative amounts only if every bounded counter fits.
+        Shared stores fail closed: a reservation must never move to a local fallback."""
 
     def push_capped(self, key: str, item: str, max_len: int, ttl_seconds: float) -> List[str]:
         """Append ``item`` to the list under ``key``, keep the newest ``max_len``,
@@ -155,6 +161,20 @@ class MemoryStateStore:
             entry = self._entry(key, now)
             return dict(entry.get("fields", {})) if entry else {}
 
+    def reserve(self, key, amounts, limits, ttl_seconds):
+        _check_reservation(amounts, limits, ttl_seconds)
+        now = self._clock()
+        with self._lock:
+            entry = self._entry(key, now)
+            fields = entry.get("fields", {}) if entry else {}
+            if any(fields.get(name, 0) + amounts.get(name, 0) > limit for name, limit in limits.items()):
+                return False
+            if entry is None:
+                entry = self._entry(key, now, create={"fields": {}, "expires": now + ttl_seconds})
+            for name, amount in amounts.items():
+                entry["fields"][name] = fields.get(name, 0.0) + amount
+            return True
+
     def push_capped(self, key, item, max_len, ttl_seconds):
         now = self._clock()
         with self._lock:
@@ -231,6 +251,21 @@ if created then redis.call('PEXPIRE', key, math.ceil(ttl * 1000)) end
 return redis.call('HGETALL', key)
 """
 
+_RESERVE = """
+local key = KEYS[1]
+local created = redis.call('EXISTS', key) == 0
+for i = 2, #ARGV, 3 do
+  local limit = tonumber(ARGV[i + 2])
+  local used = tonumber(redis.call('HGET', key, ARGV[i])) or 0
+  if limit and used + tonumber(ARGV[i + 1]) > limit then return 0 end
+end
+for i = 2, #ARGV, 3 do
+  redis.call('HINCRBYFLOAT', key, ARGV[i], ARGV[i + 1])
+end
+if created then redis.call('PEXPIRE', key, math.ceil(tonumber(ARGV[1]) * 1000)) end
+return 1
+"""
+
 _PUSH_CAPPED = """
 local key = KEYS[1]
 local max_len = tonumber(ARGV[2])
@@ -256,7 +291,8 @@ class RedisStateStore:
         self._fallback = fallback or MemoryStateStore()
         self._scripts = {
             name: client.register_script(src)
-            for name, src in (("bucket", _TOKEN_BUCKET), ("incr", _INCR), ("push", _PUSH_CAPPED))
+            for name, src in (("bucket", _TOKEN_BUCKET), ("incr", _INCR), ("push", _PUSH_CAPPED),
+                              ("reserve", _RESERVE))
         }
         self._warned = False
         self._down_until = 0.0
@@ -316,6 +352,18 @@ class RedisStateStore:
             return {_s(k): float(_s(v)) for k, v in self._client.hgetall(_PREFIX + key).items()}
         except Exception as exc:
             return self._degraded("get", exc).get(key)
+
+    def reserve(self, key, amounts, limits, ttl_seconds):
+        _check_reservation(amounts, limits, ttl_seconds)
+        if not self._available():
+            raise StateUnavailable("shared state store unavailable during reserve")
+        args: List = [ttl_seconds]
+        for name in sorted(set(amounts) | set(limits)):
+            args += [name, float(amounts.get(name, 0)), limits.get(name, "")]
+        try:
+            return bool(int(self._scripts["reserve"](keys=[_PREFIX + key], args=args)))
+        except Exception as exc:
+            raise StateUnavailable("shared state store unavailable during reserve") from exc
 
     def push_capped(self, key, item, max_len, ttl_seconds):
         if not self._available():
@@ -536,6 +584,24 @@ class SqliteStateStore:
             return self._fallback.get(key)
         return {k: float(v) for k, v in result.items() if isinstance(v, (int, float))}
 
+    def reserve(self, key, amounts, limits, ttl_seconds):
+        _check_reservation(amounts, limits, ttl_seconds)
+        def op(conn, now):
+            row = conn.execute("SELECT value, expires FROM kv WHERE key = ?", (_PREFIX + key,)).fetchone()
+            fields = self._load(conn, key, now) or {}
+            fields = {k: v for k, v in fields.items() if isinstance(v, (int, float))}
+            if any(fields.get(name, 0) + amounts.get(name, 0) > limit for name, limit in limits.items()):
+                return False
+            expires = row[1] if row and (row[1] is None or row[1] > now) else now + ttl_seconds
+            for name, amount in amounts.items():
+                fields[name] = fields.get(name, 0.0) + amount
+            self._save(conn, key, fields, expires)
+            return True
+        result = self._txn("reserve", op)
+        if result is None:
+            raise StateUnavailable("shared state store unavailable during reserve")
+        return result
+
     def push_capped(self, key, item, max_len, ttl_seconds):
         def op(conn, now):
             entry = self._load(conn, key, now)
@@ -589,6 +655,14 @@ class SqliteStateStore:
         if result is None:
             return self._fallback.set_value(key, value, ttl_seconds, only_if_absent)
         return result
+
+
+def _check_reservation(amounts, limits, ttl_seconds) -> None:
+    _check_ttl(ttl_seconds)
+    for values in (amounts, limits):
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
+               for v in values.values()):
+            raise ValueError("reservation amounts and limits must be finite nonnegative numbers")
 
 
 def _check_ttl(ttl_seconds) -> None:

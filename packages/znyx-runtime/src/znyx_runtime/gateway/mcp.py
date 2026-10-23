@@ -201,6 +201,7 @@ class McpGateway:
         record.key_id, record.tenant_id, record.app_id, record.agent_id = (
             key.id, key.tenant_id, key.app_id, key.agent_id)
         record.member = key.member
+        record._reauthorize = lambda: self.gw.current_identity(request)
         try:
             member = self.gw.bundle_manager.member_by_key(key.member or None)
         except ScopeNotServed as exc:
@@ -455,8 +456,32 @@ class McpGateway:
         return message
 
     async def _checked_items(self, ctx, record, items: List[Any], name: str, label: str) -> Tuple[List[Any], bool, bool]:
-        """Content items checked one by one: ``(items, blocked, changed)``."""
+        """Check content and its metadata: ``(items, blocked, changed)``."""
+        metadata = []
+        for item in items:
+            if not isinstance(item, dict):
+                metadata.append(item)
+                continue
+            extra = {k: v for k, v in item.items() if k not in ("text", "data", "resource")}
+            if isinstance(item.get("resource"), dict):
+                extra["resource"] = {k: v for k, v in item["resource"].items() if k not in ("text", "blob")}
+            metadata.append(extra)
+        checked = await self._checked_data(ctx, record, {"result": metadata}, label + "-metadata")
+        if "error" in checked:
+            return [], True, False
+        if items and all(isinstance(i, dict) and i.get("type") == "text"
+                         and isinstance(i.get("text"), str) for i in items):
+            text = "".join(i["text"] for i in items)
+            verdict = await self._check(ctx, record, text, label, name)
+            if verdict.decision == "BLOCK":
+                return [], True, False
+            if verdict.sanitized_text is not None and verdict.sanitized_text != text:
+                # A rewrite may span blocks. Preserve the first block's metadata and
+                # put the checked text there; no fragment of the original survives.
+                return [{**items[0], "text": verdict.sanitized_text}], False, True
+            return items, verdict.wants_change, False
         out: List[Any] = []
+        combined: List[str] = []
         changed = False
         for i, item in enumerate(items):
             if not isinstance(item, dict):
@@ -473,23 +498,44 @@ class McpGateway:
                     texts.append(("resource.text", resource["text"]))
                 elif isinstance(resource.get("blob"), str) and _TEXT_MIME.match(str(resource.get("mimeType") or "")):
                     try:
-                        decoded = base64.b64decode(resource["blob"][:MAX_BLOB_CHECK * 2], validate=False)
-                        texts.append(("resource.blob", decoded.decode("utf-8", "replace")))
-                    except ValueError:
+                        if len(resource["blob"]) > 4 * ((MAX_BLOB_CHECK + 2) // 3):
+                            return out, True, changed
+                        decoded = base64.b64decode(resource["blob"], validate=True)
+                        if len(decoded) > MAX_BLOB_CHECK:
+                            return out, True, changed
+                        texts.append(("resource.blob", decoded.decode("utf-8")))
+                    except (ValueError, UnicodeError):
                         return out, True, changed
                 elif isinstance(resource.get("blob"), str):
-                    record.note("mcp_binary_unchecked")
+                    if self.gw.config.settings.media_inspection:
+                        from znyx_runtime.gateway import media
+                        data, _ = media.decode(resource["blob"])
+                        text = await media.check(self.gw, data, resource.get("mimeType") or "application/octet-stream",
+                                                 ctx["scope"], ctx["policy"], record, "output")
+                        texts.append(("resource.media", text))
+                    else:
+                        record.note("mcp_binary_unchecked")
             elif kind == "resource_link":
                 link = " ".join(str(item.get(k) or "") for k in ("name", "title", "description", "uri"))
                 texts.append(("link", link))
             elif kind in ("image", "audio"):
-                record.note("mcp_binary_unchecked")
+                if self.gw.config.settings.media_inspection:
+                    from znyx_runtime.gateway import media
+                    data, _ = media.decode(item.get("data"))
+                    text = await media.check(self.gw, data, item.get("mimeType") or kind + "/unknown",
+                                             ctx["scope"], ctx["policy"], record, "output")
+                    texts.append(("media", text))
+                else:
+                    record.note("mcp_binary_unchecked")
             elif kind not in (None,):
                 texts.append(("other", json.dumps(item, ensure_ascii=False, default=str)))
             for where, text in texts:
                 verdict = await self._check(ctx, record, text, f"{label}{i}", name)
                 if verdict.decision == "BLOCK":
                     return out, True, changed
+                if verdict.wants_change and verdict.sanitized_text is None:
+                    return out, True, changed
+                combined.append(verdict.sanitized_text if verdict.sanitized_text is not None else text)
                 if verdict.sanitized_text is not None and verdict.sanitized_text != text:
                     changed = True
                     if where == "text":
@@ -504,7 +550,38 @@ class McpGateway:
                         break
             if item is not None:
                 out.append(item)
+        if len(combined) > 1:
+            text = "".join(combined)
+            verdict = await self._check(ctx, record, text, label + "-combined", name)
+            if (verdict.decision == "BLOCK" or verdict.wants_change
+                    or verdict.sanitized_text not in (None, text)):
+                # Mixed resources/links have different schemas. When a cross-item
+                # rewrite cannot preserve them, withhold the result as a whole.
+                return [], True, changed
         return out, False, changed
+
+    async def _checked_data(self, ctx, record, answer: Dict[str, Any], label: str) -> Dict[str, Any]:
+        """Guard text in protocol results (lists, completions, initialize, task metadata).
+        Identifiers and schemas cannot safely be rewritten: any required change withholds
+        the result. Text content with an editable schema uses _checked_items instead."""
+        if "error" in answer:
+            return await self._checked_error(ctx, record, answer, label)
+        texts: List[str] = []
+        pending = [answer.get("result")]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                texts.append(value)
+            elif isinstance(value, dict):
+                pending.extend(reversed(list(value.values())))
+            elif isinstance(value, list):
+                pending.extend(reversed(value))
+        for text in texts + (["".join(texts)] if len(texts) > 1 else []):
+            verdict = await self._check(ctx, record, text, label)
+            if (verdict.decision == "BLOCK" or verdict.wants_change
+                    or verdict.sanitized_text not in (None, text)):
+                return self._blocked_answer(record, answer.get("id"), as_error=True)
+        return answer
 
     def _blocked_answer(self, record, msg_id: Any, as_error: bool) -> Dict[str, Any]:
         record.outcome, record.reason = "blocked_output", "blocked_output"
@@ -521,7 +598,7 @@ class McpGateway:
         if not text:
             return answer
         verdict = await self._check(ctx, record, text, "mcp-error", name)
-        if verdict.decision == "BLOCK":
+        if verdict.decision == "BLOCK" or (verdict.wants_change and verdict.sanitized_text is None):
             return self._blocked_answer(record, answer.get("id"), as_error=True)
         if verdict.sanitized_text is not None and verdict.sanitized_text != text:
             return _rpc_error(answer.get("id"), int(error.get("code") or SERVER_ERROR)
@@ -543,10 +620,13 @@ class McpGateway:
         if blocked:
             return self._blocked_answer(record, answer.get("id"), as_error=False)
         out = {**result, "content": items}
+        metadata = {k: v for k, v in result.items() if k not in ("content", "structuredContent")}
+        if "error" in await self._checked_data(ctx, record, {"result": metadata}, "mcp-result-metadata"):
+            return self._blocked_answer(record, answer.get("id"), as_error=False)
         if result.get("structuredContent") is not None:
             text = json.dumps(result["structuredContent"], ensure_ascii=False, default=str)
             verdict = await self._check(ctx, record, text, "mcp-structured", name)
-            if verdict.decision == "BLOCK":
+            if verdict.decision == "BLOCK" or (verdict.wants_change and verdict.sanitized_text is None):
                 return self._blocked_answer(record, answer.get("id"), as_error=False)
             if verdict.sanitized_text is not None and verdict.sanitized_text != text:
                 changed = True
@@ -635,8 +715,8 @@ class McpGateway:
         relay: List[Dict[str, Any]] = []
         answer = await self._answer_of(await self._send(request, ctx, body), body.get("id"), relay,
                                        lambda m: self._keep_relayed(ctx, record, m))
-        if isinstance(answer, dict) and "error" in answer:
-            answer = await self._checked_error(ctx, record, answer, "mcp")
+        if isinstance(answer, dict):
+            answer = await self._checked_data(ctx, record, answer, "mcp")
         return self._reply(request, record, answer, relay)
 
     async def _initialize(self, request: Request, ctx, record, body: Dict[str, Any]) -> Response:
@@ -653,6 +733,8 @@ class McpGateway:
         upstream = response.headers.get(SESSION_HEADER) or ""
         relay: List[Dict[str, Any]] = []
         answer = await self._answer_of(response, body.get("id"), relay, lambda m: self._keep_relayed(ctx, record, m))
+        if isinstance(answer, dict):
+            answer = await self._checked_data(ctx, record, answer, "mcp-initialize")
         extra = {SESSION_HEADER: self._new_session(ctx, upstream)}
         return self._reply(request, record, answer, relay, extra)
 
@@ -859,12 +941,34 @@ class McpGateway:
             if not approved:
                 return self._approval_refused(request, record, message.get("id"), why)
             try:
+                key, member, delegation = self.gw.current_caller(record)
+                scope = self.gw._scope(key, request, member)
+                policy = self.gw.bundle_manager.get_policy(
+                    tenant_id=scope["tenant_id"], app_id=scope["app_id"], agent_id=scope["agent_id"],
+                    env=scope["env"], member=member)
+                server = self.gw.config.mcp_server_for(key, ctx["server"].name)
+                if server.blocked:
+                    raise McpRefusal(403, server.blocked, "mcp_server_not_allowed_here")
+                ctx.update(key=key, member=member, delegation=delegation, scope=scope, policy=policy, server=server)
+                self.gw.apply_delegation(record, delegation)
                 stops = self._stops_or_refuse(ctx)
+                ctx["stops"] = record._stops = stops
             except McpRefusal as refusal:
                 return self._approval_refused(request, record, message.get("id"), f"stopped meanwhile: {refusal.message}")
+            except Exception:
+                return self._approval_refused(request, record, message.get("id"), "the caller or server is no longer authorized")
             hit = stops.quarantined or stops.tool_stop(name)
             if hit is not None:
                 return self._approval_refused(request, record, message.get("id"), f"stopped meanwhile: {hit.message()}")
+            if not self._allowed(ctx, name):
+                return self._approval_refused(request, record, message.get("id"), "this tool is no longer allowed")
+            from znyx_runtime.gateway.pipeline import quiet_policy
+            verdict = await self.gw._check_text(json.dumps(arguments), "tool_call", "assistant", name,
+                                                "output", scope, record, quiet_policy(policy), quiet_policy(policy),
+                                                "mcp-approved", approve=False)
+            if (verdict.decision == "BLOCK" or verdict.wants_change
+                    or verdict.sanitized_tool_args not in (None, arguments)):
+                return self._approval_refused(request, record, message.get("id"), "the current policy refuses these arguments")
             return await self._call(request, ctx, record, message, name)
 
         if "text/event-stream" not in (request.headers.get("accept") or ""):
@@ -928,18 +1032,18 @@ class McpGateway:
                 return self._reply(request, record, self._blocked_answer(record, msg_id, as_error=True), relay)
             result = {**result, "contents": [i["resource"] for i in items]}
         else:                                                       # prompts/get
-            messages = []
-            for i, m in enumerate(result.get("messages") or []):
-                if not isinstance(m, dict):
-                    continue
-                items, blocked, changed = await self._checked_items(ctx, record, [m.get("content")], label,
-                                                                    f"mcp-prompt{i}.")
-                if blocked or not items:
-                    return self._reply(request, record, self._blocked_answer(record, msg_id, as_error=True), relay)
-                messages.append({**m, "content": items[0]})
+            original = [m for m in result.get("messages") or [] if isinstance(m, dict)]
+            items, blocked, changed = await self._checked_items(
+                ctx, record, [m.get("content") for m in original], label, "mcp-prompt")
+            # A rewrite spanning messages cannot safely be assigned to their roles.
+            if blocked or len(items) != len(original):
+                return self._reply(request, record, self._blocked_answer(record, msg_id, as_error=True), relay)
+            messages = [{**m, "content": item} for m, item in zip(original, items)]
             if result.get("description"):
                 verdict = await self._check(ctx, record, str(result["description"]), "mcp-prompt-description", label)
                 if verdict.decision == "BLOCK":
                     return self._reply(request, record, self._blocked_answer(record, msg_id, as_error=True), relay)
+                if verdict.sanitized_text is not None:
+                    result = {**result, "description": verdict.sanitized_text}
             result = {**result, "messages": messages}
         return self._reply(request, record, {**answer, "result": result}, relay)

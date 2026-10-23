@@ -90,6 +90,32 @@ async def list_models(request: Request) -> Response:
     return JSONResponse({"object": "list", "data": data})
 
 
+@router.get("/v1/znyx/channels")
+async def channels(request: Request) -> Response:
+    """Capabilities for this key; configured extraction is distinct from service health."""
+    import os
+    from znyx_runtime.gateway.pipeline import Denied
+    from znyx_runtime.gateway.channels import CHANNELS
+    from znyx_runtime.gateway.defence import active
+    gw = _gateway(request)
+    if gw is None or not gw.config.enabled:
+        return _unavailable("openai")
+    try:
+        key, _ = gw._identify(request)
+    except Denied as exc:
+        return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=exc.status)
+    providers = [provider for name, provider in gw.config._providers_of(key).items()
+                 if key.may_use(name) and not provider.blocked]
+    openai = any(provider.format in ("openai", "azure_openai") for provider in providers)
+    return JSONResponse({"http_channels": (["chat/completions", *CHANNELS] if openai else []) +
+        (["messages"] if any(p.format == "anthropic" for p in providers) else []),
+        "realtime": "websocket-buffered-turns" if any(p.format == "openai" for p in providers) else None,
+        "responses_streaming": "buffered" if openai else None,
+        "media_inspection": gw.config.settings.media_inspection,
+        "media_extractor_configured": bool(os.getenv("ZNYX_MEDIA_EXTRACT_URL") or os.getenv("ZNYX_INFERENCE_URL")),
+        "shared_defence": active(gw._controls().get("shared_defence") or {})})
+
+
 @router.api_route("/v1/mcp/{server}", methods=["POST", "GET", "DELETE"])
 async def mcp(server: str, request: Request) -> Response:
     """An MCP server, brokered: agents connect here with their gateway key (see
@@ -130,6 +156,22 @@ async def approvals_list(request: Request, status: str = "") -> Response:
         return refused
     entries = await asyncio.to_thread(gw.approvals.local_list, status or None)
     return JSONResponse({"approvals": entries})
+
+
+@router.get("/v1/znyx/defence/contributions")
+async def defence_contributions(request: Request) -> Response:
+    import asyncio
+    gw, refused = _approver_only(request)
+    if refused is not None:
+        return refused
+    try:
+        cursor = int(request.query_params.get("cursor", "0"))
+        if not 0 <= cursor < 2**63:
+            raise ValueError()
+        page = await asyncio.to_thread(gw.defence.inspect_page, cursor)
+    except ValueError:
+        return JSONResponse({"error": "cursor must be a valid record byte offset"}, status_code=400)
+    return JSONResponse(page)
 
 
 @router.get("/v1/znyx/approvals/{approval_id}")

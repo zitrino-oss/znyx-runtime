@@ -240,10 +240,15 @@ class OpenAIChat:
                     parts.append(Part(("messages", i, "refusal"), role, msg["refusal"], message=i))
                 for k, call in enumerate(msg.get("tool_calls") or []):
                     fn = call.get("function") if isinstance(call, dict) else None
+                    custom = call.get("custom") if isinstance(call, dict) else None
                     if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
                         parts.append(Part(("messages", i, "tool_calls", k, "function", "arguments"), role,
                                           fn["arguments"], "history_tool_call",
                                           str(fn.get("name") or "tool"), message=i))
+                    elif isinstance(custom, dict) and isinstance(custom.get("input"), str):
+                        parts.append(Part(("messages", i, "tool_calls", k, "custom", "input"), role,
+                                          custom["input"], "history_tool_call",
+                                          str(custom.get("name") or "tool"), message=i))
                 fc = msg.get("function_call")
                 if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
                     parts.append(Part(("messages", i, "function_call", "arguments"), role, fc["arguments"],

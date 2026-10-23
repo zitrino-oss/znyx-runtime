@@ -28,6 +28,7 @@
   },
   "properties": {
     "global": { "type": "object" },
+    "envFromExistingSecret": { "type": "boolean" },
     "nameOverride": { "type": "string" },
     "fullnameOverride": { "type": "string", "maxLength": 63 },
     "image": {
@@ -37,6 +38,7 @@
         "registry": { "type": "string" },
         "repository": { "type": "string", "minLength": 1 },
         "tag": { "type": ["string", "number"] },
+        "digest": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$" },
         "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
       }
     },
@@ -298,6 +300,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "useRuntimeImage": { "type": "boolean" },
         "image": {
           "type": "object",
           "additionalProperties": false,

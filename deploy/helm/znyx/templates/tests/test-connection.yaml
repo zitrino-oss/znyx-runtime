@@ -26,10 +26,19 @@ spec:
     seccompProfile:
       type: RuntimeDefault
   containers:
-    - name: curl
+    - name: health
+      {{- if .Values.test.useRuntimeImage }}
+      image: {{ include "znyx.image" . | quote }}
+      {{- else }}
       image: "{{ .Values.test.image.repository }}:{{ .Values.test.image.tag }}"
+      {{- end }}
       imagePullPolicy: {{ .Values.test.image.pullPolicy }}
       command:
+        {{- if .Values.test.useRuntimeImage }}
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://{{ include "znyx.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/healthz', timeout=10)"
+        {{- else }}
         - curl
         - --fail
         - --silent
@@ -37,6 +46,7 @@ spec:
         - --max-time
         - "10"
         - "http://{{ include "znyx.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/healthz"
+        {{- end }}
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true

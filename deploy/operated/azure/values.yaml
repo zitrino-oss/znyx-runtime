@@ -1,0 +1,42 @@
+# Overlay after operated/values.yaml. Existing customer RWX volumes support two replicas.
+envFromExistingSecret: true
+persistence:
+  existingClaim: znyx-data
+ml:
+  enabled: true
+  models:
+    existingClaim: znyx-models
+    readOnly: true
+config:
+  ml:
+    enabled: true
+  control_plane:
+    # Packaging-only default. The marketplace UI requires the real customer URL.
+    url: https://configure-control-plane.invalid
+networkPolicy:
+  ingressFrom:
+    - podSelector: {}
+    - namespaceSelector:
+        matchLabels:
+          znyx.ai/gateway-client: 'true'
+  extraEgress:
+    # Marketplace deployment replaces both this /32 and port with the required customer inputs.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.1/32
+      ports:
+        - protocol: TCP
+          port: 10000
+extraEnv:
+  - name: ZNYX_STATE_FAIL_MODE
+    value: closed
+  - name: ZNYX_SPEECH_MODEL_SHA256
+    valueFrom:
+      secretKeyRef:
+        name: znyx-runtime-secrets
+        key: ZNYX_SPEECH_MODEL_SHA256
+        # Text-only installations may disable media. Speech still refuses an absent digest.
+        optional: true
+nodeSelector:
+  kubernetes.io/os: linux
+  kubernetes.io/arch: amd64

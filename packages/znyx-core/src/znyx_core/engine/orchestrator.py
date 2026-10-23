@@ -126,6 +126,7 @@ _DETECTOR_PIPELINE: List[tuple] = [
     # terminal, where the input path stops an attacker hiding from the detectors.
     ("output_control_char_sanitizer", False, "output",                      True),
     ("multimodal_injection",      False, "input",                           False),
+    ("shared_defence",           False, None,                              True),
     # A semantic cache is consulted on the way IN and can also be reported alongside the
     # answer, so it runs in both directions; the detector no-ops without a cache block.
     ("semantic_cache_integrity",  False, ("input", "output", "retrieval"),  False),

@@ -53,6 +53,7 @@ from znyx_core.detectors.retrieval_jamming import RetrievalJammingDetector
 from znyx_core.detectors.reasoning_trace_disclosure import ReasoningTraceDisclosureDetector
 from znyx_core.detectors.output_control_char_sanitizer import OutputControlCharSanitizerDetector
 from znyx_core.detectors.multimodal_injection import MultimodalInjectionDetector
+from znyx_core.detectors.shared_defence import SharedDefenceDetector
 from znyx_core.detectors.corpus_poisoning_monitor import CorpusPoisoningMonitorDetector
 from znyx_core.detectors.semantic_cache_integrity import SemanticCacheIntegrityDetector
 from znyx_core.detectors.numerical_consistency import NumericalConsistencyDetector
@@ -165,6 +166,7 @@ def _build_default_registry() -> DetectorRegistry:
     registry.register("reasoning_trace_disclosure", ReasoningTraceDisclosureDetector)
     registry.register("output_control_char_sanitizer", OutputControlCharSanitizerDetector)
     registry.register("multimodal_injection", MultimodalInjectionDetector)
+    registry.register("shared_defence", SharedDefenceDetector)
     registry.register("corpus_poisoning_monitor", CorpusPoisoningMonitorDetector)
     registry.register("semantic_cache_integrity", SemanticCacheIntegrityDetector)
     registry.register("numerical_consistency", NumericalConsistencyDetector)

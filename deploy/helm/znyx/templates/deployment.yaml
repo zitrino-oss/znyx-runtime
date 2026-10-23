@@ -57,6 +57,11 @@ spec:
             - name: http
               containerPort: {{ $port }}
               protocol: TCP
+          {{- if .Values.envFromExistingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ $secretName }}
+          {{- end }}
           env:
             # znyx.yaml (the ConfigMap) is authoritative: the image's own defaults sit below
             # it (ZNYX_DEFAULTS), so only the switches the chart owns are variables here.

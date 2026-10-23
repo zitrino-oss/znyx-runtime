@@ -1,0 +1,26 @@
+# Customer provides the actual signed release tag/registry and existing secret.
+fullnameOverride: znyx
+replicaCount: 2
+existingSecret: znyx-runtime-secrets
+config:
+  mode: managed
+  server:
+    workers: 2
+state:
+  redis:
+    enabled: true
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+networkPolicy:
+  enabled: true
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ['ALL']
+extraEnv:
+  - name: ZNYX_STATE_FAIL_MODE
+    value: closed
+# Supply ZNYX_INFERENCE_URL for an in-network media service with offline OCR/STT.
+# Supply control_plane.url and only non-secret configuration through a customer values file.

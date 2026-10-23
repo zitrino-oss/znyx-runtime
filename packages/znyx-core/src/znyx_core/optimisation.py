@@ -130,6 +130,25 @@ APPROVAL_MIN_SAMPLES = 50
 APPROVAL_WINDOW_DAYS = 30
 
 
+def shadow_config_hash(technique: str, *, choices: Mapping[str, Any], profile=None,
+                       providers=(), default_provider=None, allowed_models=(),
+                       app_id="default", agent_id="default") -> str:
+    """Bind shadow evidence to the key configuration that produced it. Technique
+    switches are excluded so tested candidates can be activated independently;
+    identity, profile, model permissions and semantic settings must match.
+    Sampling frequency/allowance affect how much evidence is collected, not its meaning."""
+    import hashlib
+    import json
+    settings = {k: v for k, v in (choices.get("settings") or {}).items()
+                if k not in ("shadow_percent", "shadow_calls_per_day")}
+    material = {"v": 1, "technique": technique, "profile": profile or None,
+                "providers": sorted(providers or ()), "default_provider": default_provider or None,
+                "allowed_models": sorted(allowed_models or ()), "app_id": app_id, "agent_id": agent_id,
+                "settings": settings}
+    return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode()).hexdigest()
+
+
 def clean_settings(raw: Any) -> Tuple[Dict[str, Any], List[str]]:
     """The settings that are known and in range, and a description of each one that is
     not (the control plane refuses those; the runtime ignores them)."""

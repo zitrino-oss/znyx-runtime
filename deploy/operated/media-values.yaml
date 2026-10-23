@@ -1,0 +1,22 @@
+# Overlay on operated/values.yaml when the pinned image is built with --target znyx-media.
+# Mount pre-approved offline speech artifacts and set ZNYX_SPEECH_MODEL_SHA256 in the existing Secret.
+ml:
+  enabled: true
+  models:
+    existingClaim: znyx-models
+    readOnly: true
+extraEnv:
+  - name: ZNYX_STATE_FAIL_MODE
+    value: closed
+  - name: ZNYX_SPEECH_MODEL_SHA256
+    valueFrom:
+      secretKeyRef:
+        name: znyx-runtime-secrets
+        key: ZNYX_SPEECH_MODEL_SHA256
+resources:
+  requests:
+    cpu: '1'
+    memory: 1Gi
+  limits:
+    cpu: '4'
+    memory: 4Gi

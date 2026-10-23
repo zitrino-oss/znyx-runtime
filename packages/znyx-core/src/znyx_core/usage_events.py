@@ -277,6 +277,9 @@ def _shadow_fields(item: Dict[str, Any], entry: Dict[str, Any]) -> None:
         entry["routed"] = item["routed"]
     if item.get("method") in ("nli", "lexical"):
         entry["method"] = item["method"]
+    digest = item.get("config_hash")
+    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+        entry["config_hash"] = digest
     features = item.get("features")
     if isinstance(features, list):
         values = []

@@ -173,10 +173,12 @@ def test_text_split_across_parts_is_read_as_one(client):
     assert resp.status_code == 400
 
 
-def test_split_parts_keep_the_images_between_them(client):
+def test_split_parts_keep_the_images_between_them(client, monkeypatch):
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr("znyx_runtime.gateway.media.extract", AsyncMock(return_value="a cat"))
     resp = oai(client, [{"role": "user", "content": [
         {"type": "text", "text": f"mail {EMAIL.split('@')[0]}"},
-        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,Y2F0"}},
         {"type": "text", "text": f"@{EMAIL.split('@')[1]} please"}]}])
     assert resp.status_code == 200
     parts = sent()["messages"][0]["content"]
@@ -193,10 +195,12 @@ def test_uncheckable_content_can_be_refused(client):
     gw = client.app.state.gateway
     image = {"role": "user", "content": [{"type": "text", "text": "what is this"},
                                          {"type": "image_url", "image_url": {"url": "https://x/y.png"}}]}
-    assert oai(client, [image]).status_code == 200
+    assert oai(client, [image]).status_code == 400  # Phase 7 refuses uninspectable URLs by default
     settings = gw.config.settings
     try:
-        gw.config.settings = dataclasses.replace(settings, uncheckable_content="block")
+        gw.config.settings = dataclasses.replace(settings, media_inspection=False, uncheckable_content="allow")
+        assert oai(client, [image]).status_code == 200  # explicit legacy compatibility
+        gw.config.settings = dataclasses.replace(settings, media_inspection=False, uncheckable_content="block")
         resp = oai(client, [image])
         assert resp.status_code == 400 and resp.json()["error"]["code"] == "uncheckable_content"
     finally:

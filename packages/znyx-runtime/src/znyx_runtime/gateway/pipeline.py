@@ -203,7 +203,7 @@ class CallRecord:
 
     def to_event(self) -> Dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items()
-                if k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan", "_recorded",
+                if not k.startswith("_") and k not in ("started", "estimated_input_tokens", "member", "started_ns", "plan", "_recorded",
                              "_cache_user", "_stops", "_no_hold", "_delegated_tools", "_person")}
         data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return data
@@ -323,6 +323,8 @@ class Gateway:
         from znyx_runtime.gateway.identity import DelegationService
         from znyx_runtime.governance_audit import GovernanceAudit
         self.governance = GovernanceAudit()
+        from znyx_runtime.gateway.defence import DefenceOutbox
+        self.defence = DefenceOutbox(self.governance.path.with_name("shared-defence.spool"))
         self.approvals = ApprovalBroker(self)
         self.mcp = McpGateway(self)
         self.delegations = DelegationService(self)
@@ -400,6 +402,7 @@ class Gateway:
         record.key_id, record.tenant_id, record.app_id, record.agent_id = (
             key.id, key.tenant_id, key.app_id, key.agent_id)
         record.member = key.member
+        record._reauthorize = lambda: self.current_identity(request)
         slots = self._slots
         if slots.locked():
             return self._finish(record, fmt, Denied(429, "Too many concurrent requests to the gateway; "
@@ -439,6 +442,11 @@ class Gateway:
         finally:
             if not handed_off:
                 release()
+                if getattr(record, "_reservation", None) is not None:
+                    # Includes cancellation and errors before _forward can settle.
+                    if getattr(record, "_upstream_started", False):
+                        self.estimate_missing_usage(record, 0)
+                    self._charge(key, record)
 
     @staticmethod
     def _trace(record: CallRecord, request: Request) -> None:
@@ -496,6 +504,10 @@ class Gateway:
         headers = self.trace_headers(record)
         if denied.retry_after:
             headers["retry-after"] = str(denied.retry_after)
+        if getattr(record, "_reservation", None) is not None and record.plan is not None:
+            if getattr(record, "_upstream_started", False):
+                self.estimate_missing_usage(record, 0)
+            self._charge(record.plan.key, record)
         self._record(record)
         return JSONResponse(body, status_code=status, headers=headers)
 
@@ -598,6 +610,25 @@ class Gateway:
                                   "/v1/znyx/token and call with the token it gives", "delegation_required",
                              error_type="permission_error")
         return delegation
+
+    def current_identity(self, request: Request):
+        """Authenticate again after a long wait, including revocation, token expiry,
+        changed delegation rules and an agent newly requiring delegation."""
+        key, _ = self._identify(request)
+        member = self.bundle_manager.member_by_key(key.member or None)
+        return key, member, self.delegation_context(request, key, member)
+
+    def current_caller(self, record: CallRecord):
+        refresh = getattr(record, "_reauthorize", None)
+        if refresh is not None:
+            return refresh()
+        # Internal callers without an HTTP request may use a static key, but may
+        # never manufacture or extend a delegated identity.
+        key = next((k for k in self.config.keys_by_digest.values()
+                    if k.id == record.key_id and k.member == record.member), None)
+        if key is None or key.disabled or not self.key_usable(key) or record.delegated:
+            raise Denied(401, "The caller is no longer authorized", "invalid_api_key")
+        return key, self.bundle_manager.member_by_key(key.member or None), None
 
     def apply_delegation(self, record: CallRecord, delegation) -> None:
         if delegation is None:
@@ -770,7 +801,82 @@ class Gateway:
         added_cost = plan.extra_cost_added if plan is not None else 0.0
         tokens = max(0, (record.input_tokens or 0) + (record.output_tokens or 0) - added_tokens)
         self._count_loop(key, record, tokens + added_tokens)
-        self._charge_usage(key, tokens, max(0.0, (record.cost_usd or 0.0) - added_cost), requests=1)
+        cost = max(0.0, (record.cost_usd or 0.0) - added_cost)
+        reserved = getattr(record, "_reservation", None)
+        if reserved is not None:
+            record._reservation = None
+            from znyx_core.state_store import get_state_store
+            try:
+                # Settle on the day reserved, even when a stream crosses midnight.
+                get_state_store().incr(reserved[0], {"tokens": tokens - reserved[1],
+                                                     "cost": cost - reserved[2], "requests": 1}, 2 * 86400)
+            except Exception:
+                # Keep the reservation when settlement cannot reach the store.
+                logger.warning("gateway: could not settle usage for key %s", key.id)
+        else:
+            self._charge_usage(key, tokens, cost, requests=1)
+
+    def _reserve_call(self, key: GatewayKey, record: CallRecord, body: Dict[str, Any], provider,
+                      *, factor: int = 1, discount: float = 1.0, price_override=None) -> None:
+        """Reserve the request and its maximum answer atomically before sending.
+        When no answer cap was supplied, bound it to the remaining allowance. Token
+        counts are estimates unless a tokenizer is installed; provider usage settles them."""
+        limits = key.limits
+        if key.instance_key or not (limits.tokens_per_day or limits.spend_usd_per_day):
+            return
+        from znyx_core.state_store import StateUnavailable, get_state_store
+        store = get_state_store()
+        day = self._day_key(key)
+        old = getattr(record, "_reservation", None)
+        if old is not None:
+            # Re-preparing after a discarded parallel call: its usage was charged
+            # by _bill_early, and this is a different provider request.
+            store.incr(old[0], {"tokens": -old[1], "cost": -old[2]}, 2 * 86400)
+            record._reservation = None
+        model = body.get("model") or record.model
+        price = price_override or self.prices_for(record.member).lookup(model)
+        if limits.spend_usd_per_day and price is None:
+            raise Denied(403, "The model has no price for reserving its spend", "price_unknown")
+        # Include the message envelope and a margin, not just the visible text.
+        from znyx_runtime.gateway.optimise import tokens as token_counts
+        input_tokens = max(record.estimated_input_tokens,
+                           token_counts.count(json.dumps(body, ensure_ascii=False), provider.format, model) + 32)
+        record.estimated_input_tokens = input_tokens
+        asked = body.get("max_completion_tokens") or body.get("max_tokens")
+        explicit = isinstance(asked, int) and not isinstance(asked, bool) and asked > 0
+        output_tokens = asked if explicit else 1000
+        try:
+            used = store.get(day)
+            if not explicit:
+                if limits.tokens_per_day:
+                    output_tokens = min(output_tokens, math.floor(
+                        (limits.tokens_per_day - used.get("tokens", 0)) / factor - input_tokens))
+                if limits.spend_usd_per_day and price and price["output_per_mtok"] > 0:
+                    available = (limits.spend_usd_per_day - used.get("cost", 0)) / (factor * discount)
+                    output_tokens = min(output_tokens, math.floor(
+                        (available * 1_000_000 - input_tokens * price["input_per_mtok"]) / price["output_per_mtok"]))
+            if output_tokens < 1:
+                raise Denied(429, "The remaining daily budget cannot cover this request", "insufficient_quota",
+                             error_type="rate_limit_error")
+            reserved_tokens = factor * (input_tokens + output_tokens)
+            reserved_cost = factor * discount * (
+                input_tokens * price["input_per_mtok"] + output_tokens * price["output_per_mtok"]
+            ) / 1_000_000 if price else 0.0
+            bounds = {}
+            if limits.tokens_per_day:
+                bounds["tokens"] = limits.tokens_per_day
+            if limits.spend_usd_per_day:
+                bounds["cost"] = limits.spend_usd_per_day
+            if not store.reserve(day, {"tokens": reserved_tokens, "cost": reserved_cost}, bounds, 2 * 86400):
+                raise Denied(429, "Daily budget is spent or reserved by other calls; retry after they finish",
+                             "insufficient_quota", error_type="rate_limit_error")
+        except StateUnavailable:
+            raise Denied(503, "Budgets cannot be reserved right now (fail-closed)", "limits_unavailable",
+                         outcome="error", retry_after=1) from None
+        record._reservation = (day, reserved_tokens, reserved_cost)
+        if not explicit:
+            from znyx_runtime.gateway.optimise.stage_b import apply_output_cap
+            apply_output_cap(record.api, provider, body, output_tokens)
 
     def _charge_usage(self, key: GatewayKey, tokens: int, cost: float, requests: int = 0) -> None:
         """Add usage to the key's day (its daily limits)."""
@@ -1165,6 +1271,11 @@ class Gateway:
         could be hiding something from it. A tool call in a model's answer that the policy
         marks for approval then waits for a person (``approve``: False where the caller asks
         itself, as the MCP gateway does)."""
+        from znyx_core.defence import match
+        feed = self._controls().get("shared_defence") or {}
+        if match(text, feed):
+            return _Verdict("BLOCK", ["shared_defence.attack_fingerprint"],
+                            user_message="This content matches a reviewed attack fingerprint", hits=1)
         verdict = await self._check_one(text, kind, role, tool_name, stage, scope, record, policy,
                                         label, context)
         probe = detection_copy(text)
@@ -1174,6 +1285,11 @@ class Gateway:
                                                           quiet, label + "n", context))
         if kind == "tool_call" and approve and verdict.decision != "BLOCK":
             verdict = await self._approved(text, tool_name, policy, record, verdict)
+        if verdict.decision == "BLOCK":
+            try:
+                await asyncio.to_thread(self.defence.record, text, verdict.rule_ids, feed)
+            except Exception:
+                logger.warning("Shared defence contribution could not be recorded")
         return verdict
 
     async def _approved(self, text: str, tool_name: Optional[str], policy: Dict[str, Any], record: CallRecord,
@@ -1204,16 +1320,33 @@ class Gateway:
         approved, why = await self.approvals.ask(rules=rules, reason=reason, tool=tool_name or "tool",
                                                  arguments=arguments, server=None, record=record, member=member)
         if approved:
-            # A stop that came in while the call waited still applies.
-            key = next((k for k in self.config.keys_by_digest.values()
-                        if k.id == record.key_id and k.member == record.member), None)
-            stops = (self.stops_for(key, member, person=getattr(record, "_person", None))
-                     if key is not None else None)
-            hit = (stops.stopped or stops.quarantined or stops.tool_stop(tool_name)) if stops is not None else None
+            try:
+                key, member, delegation = self.current_caller(record)
+                self.apply_delegation(record, delegation)
+                stops = self.stops_for(key, member, person=delegation.person if delegation else None)
+                record._stops = stops
+                current_scope = {"tenant_id": key.tenant_id, "app_id": key.app_id, "agent_id": key.agent_id,
+                                 "env": self.bundle_manager.environment_for(member) or key.environment or "prod",
+                                 "session_id": ""}
+                current_policy = self.bundle_manager.get_policy(
+                    tenant_id=key.tenant_id, app_id=key.app_id, agent_id=key.agent_id,
+                    env=current_scope["env"], member=member)
+            except Exception:  # authentication, shared state or policy unavailable: refuse
+                return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_NOT_APPROVED],
+                                user_message="Approved, but the caller is no longer authorized", hits=verdict.hits + 1)
+            hit = stops.stopped or stops.quarantined or stops.tool_stop(tool_name)
             if hit is not None:
                 return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_NOT_APPROVED],
                                 user_message=f"Approved, but stopped meanwhile: {hit.message()}", hits=verdict.hits + 1)
-            return verdict
+            # Permissions and argument rules may have changed during the wait too.
+            quiet = quiet_policy(current_policy)
+            checked = await self._check_text(text, "tool_call", "assistant", tool_name, "output",
+                                              current_scope, record, quiet, quiet, "approved", approve=False)
+            if checked.sanitized_tool_args is not None and checked.sanitized_tool_args != approvals.parse_arguments(arguments):
+                return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_NOT_APPROVED],
+                                user_message="The current policy changed the approved arguments; request approval again",
+                                hits=verdict.hits + 1)
+            return verdict.merge(checked)
         return _Verdict("BLOCK", verdict.rule_ids + [approvals.RULE_NOT_APPROVED],
                         user_message=f"This tool call was not approved: {why}", hits=verdict.hits + 1)
 
@@ -1240,6 +1373,11 @@ class Gateway:
         settings = self.config.settings
         parts = fmt.input_parts(body, settings.check_roles)
         opaque = [p for p in parts if p.kind == "opaque"]
+        if opaque and settings.media_inspection:
+            from znyx_runtime.gateway.media import inspect_body
+            if await inspect_body(self, body, scope, policy, record) < len(opaque):
+                raise Denied(400, "Some media could not be inspected", "uncheckable_content", outcome="blocked_input")
+            opaque = []
         if opaque:
             record.note("uncheckable_parts", len(opaque))
             if settings.uncheckable_content == "block":
@@ -1263,7 +1401,10 @@ class Gateway:
                  and u.first.message is not None and u.first.message > last_assistant]
         charged = fresh[-1] if fresh else None
         version = str(policy.get("policy_version") or "")
-        scope_key = (scope["tenant_id"], scope["app_id"], scope["agent_id"], version)
+        feed = self._controls().get("shared_defence") or {}
+        from znyx_runtime.gateway.defence import feed_state
+        feed_version = feed_state(feed)
+        scope_key = (scope["tenant_id"], scope["app_id"], scope["agent_id"], version, feed_version)
         quiet = quiet_policy(policy)
         gate = asyncio.Semaphore(settings.max_parallel_checks)
         # A session checked more strictly (technique 32) has its whole history read again.
@@ -1322,24 +1463,40 @@ class Gateway:
                             context: Optional[Dict[str, Any]] = None) -> None:
         parts = fmt.output_parts(response)
         if not parts:
+            await self._guard_media_output(fmt, response, scope, policy, record)
             return
+        # Content blocks of one answer are one text, just as multipart input is. A
+        # secret or PII value may span blocks; checking each independently loses it.
+        units: List[_Unit] = []
+        text_units: Dict[int, _Unit] = {}
+        for part in parts:
+            if part.kind == "text":
+                unit = text_units.get(part.choice)
+                if unit is None:
+                    unit = text_units[part.choice] = _Unit([])
+                    units.append(unit)
+                unit.parts.append(part)
+            else:
+                units.append(_Unit([part]))
         quiet = quiet_policy(policy)               # the call was charged on the way in
         gate = asyncio.Semaphore(self.config.settings.max_parallel_checks)
 
-        async def check(i: int, part: fmts.Part) -> _Verdict:
+        async def check(i: int, unit: _Unit) -> _Verdict:
+            part = unit.first
             kind = "tool_call" if part.kind == "tool_call" else "text"
             # The hidden-context leak check reads what the user is shown, not the model's
             # reasoning (which often restates its instructions) or quoted documents.
             ctx = context if part.kind in ("text", "audio") else None
             async with gate:
-                return await self._check_text(part.text, kind, "assistant", part.tool_name, "output",
+                return await self._check_text(unit.text, kind, "assistant", part.tool_name, "output",
                                               scope, record, quiet, quiet, f"output{i}", ctx)
 
         t0 = time.perf_counter()
-        verdicts = await asyncio.gather(*(check(i, p) for i, p in enumerate(parts)))
+        verdicts = await asyncio.gather(*(check(i, u) for i, u in enumerate(units)))
         record.guard_ms += int((time.perf_counter() - t0) * 1000)
         withheld, rewritten = set(), set()
-        for part, verdict in zip(parts, verdicts):
+        for unit, verdict in zip(units, verdicts):
+            part = unit.first
             record.output_decision = _worst(record.output_decision, verdict.decision)
             record.rule_ids.extend(verdict.rule_ids)
             if verdict.decision == "BLOCK":
@@ -1352,13 +1509,15 @@ class Gateway:
                     record.note("output_rewritten")
                 elif verdict.wants_change:
                     withheld.add(part.choice)
-            elif verdict.sanitized_text is not None and verdict.sanitized_text != part.text:
+            elif verdict.sanitized_text is not None and verdict.sanitized_text != unit.text:
                 if part.kind in ("audio", "thinking"):
                     # Audio cannot be edited to match its transcript, nor a signed
                     # thinking block: either is passed on clean or not at all.
                     withheld.add(part.choice)
                 else:
                     fmt.set_text(response, part, verdict.sanitized_text)
+                    for rest in unit.parts[1:]:
+                        fmt.set_text(response, rest, "")
                     rewritten.add(part.choice)
                     record.note("output_rewritten")
             elif verdict.wants_change:
@@ -1369,6 +1528,27 @@ class Gateway:
             fmt.withhold_choice(response, choice, self.config.settings.output_block_message)
         if withheld:
             record.outcome = "blocked_output"
+        await self._guard_media_output(fmt, response, scope, policy, record)
+
+    async def _guard_media_output(self, fmt, response, scope, policy, record):
+        if not self.config.settings.media_inspection:
+            return
+        from znyx_runtime.gateway import media
+        try:
+            await media.inspect_body(self, response, scope, policy, record, "output")
+            if fmt is fmts.OpenAIChat:
+                for choice in response.get("choices") or []:
+                    audio = (choice.get("message") or {}).get("audio")
+                    if isinstance(audio, dict) and audio.get("data"):
+                        data, _ = media.decode(audio["data"])
+                        await media.check(self, data, "audio/wav", scope, policy, record, "output")
+        except Denied:
+            indices = [choice.get("index", i) for i, choice in enumerate(response.get("choices") or [])]
+            for index in indices or [0]:
+                fmt.withhold_choice(response, index, self.config.settings.output_block_message)
+            record.output_decision = "BLOCK"
+            record.outcome = "blocked_output"
+            record.note("media_withheld")
 
     # -- the call ----------------------------------------------------------------
 
@@ -1432,6 +1612,14 @@ class Gateway:
         self._check_provider_side_calls(api, body)
         self._note_prompt(fmt, body, request, record)
         self._filter_tools(api, body, policy, record)
+        if fmt.is_stream(body):
+            from znyx_runtime.gateway.optimise.verify import contract_of
+            contract = contract_of(policy)
+            if contract is not None and str(contract.on_fail or "").lower() == "block":
+                # A complete JSON contract cannot be checked before streaming text is
+                # released. Refuse this combination rather than weaken the policy.
+                raise Denied(400, "This policy requires a complete output contract; send stream=false",
+                             "streaming_contract_not_supported", error_type="invalid_request_error")
         plan = record.plan = self.optimiser.plan(key, api, provider, body, request.headers,
                                                  self._caller_id(key), record.model)
         plan.session = self._session_of(request, record)
@@ -1453,6 +1641,7 @@ class Gateway:
                     request=request, client_credential=client_credential, deployment=deployment,
                     api_version=api_version)
         if (plan.on("parallel_input") and not fmt.is_stream(body)
+                and not any(p.kind == "opaque" for p in fmt.input_parts(body, self.config.settings.check_roles))
                 and not stage_b.input_may_be_rewritten(policy)):
             # Technique 40: send while the input checks run. The policy cannot rewrite the
             # input, so what is sent is what the checks read; it is used only if they pass and
@@ -1464,6 +1653,7 @@ class Gateway:
             expected = self._sent_texts(fmt, early_body)
             context, url, headers = await self._prepare_send(body=early_body, **send)
             early = asyncio.ensure_future(self.upstream.send(provider, url, headers, early_body))
+            record._upstream_started = True
             try:
                 await self._guard_input(api, fmt, body, scope, input_policy, record)
             except BaseException:
@@ -1525,6 +1715,10 @@ class Gateway:
             plan.near_budget = self._near_budget(key, member, plan)
         self._right_size(fmt, body, key, policy, record, plan)
         plan.before_send(fmt, provider, body, record, self.optimiser.seen, self._caller_id(key))
+        factor = max(plan.vote_count(body, request.headers),
+                     body.get("n") if isinstance(body.get("n"), int) and not isinstance(body.get("n"), bool) else 1, 1)
+        self._reserve_call(key, record, body, provider, factor=factor,
+                           discount=BATCH_PRICE_SHARE if self._batchable(request, fmt, provider, body, plan) else 1.0)
         self._plan_shadow(fmt, body, key, policy, record, plan, url)
         await self._permit_egress(provider, policy, len(json.dumps(body)), scope, record)
         record.stream = fmt.is_stream(body)
@@ -1616,14 +1810,21 @@ class Gateway:
         reserve_tokens = record.estimated_input_tokens + asked
         standard = self.prices_for(record.member).cost(record.model, fmts.Usage(record.estimated_input_tokens, asked))
         reserve_cost = round((standard or 0.0) * BATCH_PRICE_SHARE, 8)
-        self._charge_usage(key, reserve_tokens, reserve_cost, requests=1)
+        reserved = getattr(record, "_reservation", None)
+        if reserved is not None:
+            reserve_tokens, reserve_cost = reserved[1:]
+        else:
+            self._charge_usage(key, reserve_tokens, reserve_cost, requests=1)
         self._count_loop(key, record, reserve_tokens)
         fields = {f.name: getattr(record, f.name) for f in dataclasses.fields(record) if f.name != "plan"}
-        fields.update(profile=plan.profile, scope=scope, reserved={"tokens": reserve_tokens, "cost": reserve_cost})
+        fields.update(profile=plan.profile, scope=scope, reserved={"tokens": reserve_tokens, "cost": reserve_cost,
+                                                                 "day": reserved[0] if reserved else self._day_key(key),
+                                                                 "held": reserved is not None})
         provider_key = f"{provider.member}/{provider.name}" if provider.member else provider.name
         job_id = await asyncio.to_thread(
             self.batch_store().add, key_sha256=key.key_sha256 or key.id, member=key.member, api=record.api,
             provider=provider_key, url=url, body=body, record=fields)
+        record._reservation = None                  # ownership passes to the durable job
         headers = self.trace_headers(record)
         return JSONResponse({"id": job_id, "object": "znyx.batch_job", "status": "queued",
                              "poll": f"/v1/znyx/batches/{job_id}"}, status_code=202, headers=headers)
@@ -1716,10 +1917,12 @@ class Gateway:
                 record.cost_usd = round(standard * BATCH_PRICE_SHARE, 8)
                 effect = record.plan.effect("batch")
                 effect.basis, effect.saved_usd = "fixed", round(standard - record.cost_usd, 8)
-        if owner is not None:
+        if owner is not None and reserved.get("held", bool(owner.limits.tokens_per_day or owner.limits.spend_usd_per_day)):
             actual_tokens = (record.input_tokens or 0) + (record.output_tokens or 0)
-            self._charge_usage(owner, actual_tokens - int(reserved.get("tokens", 0)),
-                               (record.cost_usd or 0.0) - float(reserved.get("cost", 0.0)))
+            from znyx_core.state_store import get_state_store
+            get_state_store().incr(reserved.get("day") or self._day_key(owner), {
+                "tokens": actual_tokens - int(reserved.get("tokens", 0)),
+                "cost": (record.cost_usd or 0.0) - float(reserved.get("cost", 0.0))}, 2 * 86400)
         try:
             if key is None:
                 raise Denied(403, "the gateway key is no longer valid", "batch_failed", outcome="error",
@@ -1912,6 +2115,13 @@ class Gateway:
         technique = test["technique"]
         effect = plan.effect(technique)
         effect.shadow, effect.basis, effect.saved_usd = True, "fixed", 0.0
+        from znyx_core.optimisation import shadow_config_hash
+        effect.config_hash = shadow_config_hash(
+            technique, choices={"enable": key.optimisation.enable, "disable": key.optimisation.disable,
+                                "approved": key.optimisation.approved, "settings": dict(key.optimisation.settings)},
+            profile=key.profile if key.profile_chosen else None, providers=key.providers,
+            default_provider=key.default_provider, allowed_models=key.allowed_models,
+            app_id=key.app_id, agent_id=key.agent_id)
         effect.routed, effect.features = test.get("routed"), test.get("features")
         try:
             if test.get("answer") is not None:
@@ -1944,7 +2154,7 @@ class Gateway:
                     record.note("shadow_failed")
                     return
             await self._permit_egress(provider, policy, len(json.dumps(variant)), scope, record)
-            response = await self.upstream.send(provider, url, headers, variant)
+            response = await self._send_extra(provider, url, headers, variant, key, record)
             if response.status_code != 200:
                 record.note("shadow_failed")
                 return
@@ -1956,7 +2166,7 @@ class Gateway:
             prices = self.prices_for(record.member)
             if usage.input_tokens is not None:
                 cost = prices.cost(model, usage)
-                self._extra_call(plan, record, technique, model, usage)
+                self._extra_call(plan, record, technique, model, usage, charged=True)
                 served_cost = prices.cost(record.response_model or record.model, served_usage)
                 if served_cost is not None and cost is not None:
                     effect.projected_saved_usd = round(served_cost - cost, 8)
@@ -2022,7 +2232,7 @@ class Gateway:
             ask = stage_c.summary_request(model, record.api, stage_c.transcript(body, cut))
             try:
                 await self._permit_egress(provider, policy, len(json.dumps(ask)), scope, record)
-                response = await self.upstream.send(provider, url, headers, ask)
+                response = await self._send_extra(provider, url, headers, ask, key, record)
                 answer = fmts.parse_response(response.content) if response.status_code == 200 else None
             except (Denied, UpstreamError, ValueError, RecursionError):
                 answer = None
@@ -2030,7 +2240,7 @@ class Gateway:
             if isinstance(answer, dict):
                 usage = fmt.usage(answer)
                 if usage.input_tokens is not None:
-                    self._extra_call(plan, record, owner, model, usage)     # billed, charged at once
+                    self._extra_call(plan, record, owner, model, usage, charged=True)
             if not summary:
                 record.note("summary_failed")
                 return False
@@ -2192,14 +2402,14 @@ class Gateway:
             big = {**fmts.deep_copy(body), "model": plan.right_sized_from}
             try:
                 await self._permit_egress(provider, policy, len(json.dumps(big)), scope, record)
-                response = await self.upstream.send(provider, url, headers, big)
+                response = await self._send_extra(provider, url, headers, big, key, record)
                 answer = fmts.parse_response(response.content) if response.status_code == 200 else None
             except (Denied, UpstreamError, ValueError, RecursionError):
                 answer = None
             expected = "content" if fmt is fmts.AnthropicMessages else "choices"
             if isinstance(answer, dict) and isinstance(answer.get(expected), list):
                 served = answer.get("model") if isinstance(answer.get("model"), str) else plan.right_sized_from
-                self._extra_call(plan, record, "right_size", served, fmt.usage(answer))
+                self._extra_call(plan, record, "right_size", served, fmt.usage(answer), charged=True)
                 record.response_model = served
                 record.note("right_size_retried")
                 effect.verified = "fail"
@@ -2292,6 +2502,7 @@ class Gateway:
             def start():
                 return upstream.send(provider, url, headers, body)
         flight, leader = self.optimiser.coalescer.join(shared_key, start)
+        record._upstream_started = True
         # Stop waiting if the client goes away; the provider call is cancelled when no
         # one else waits for it (it would be paid for nothing).
         try:
@@ -2322,6 +2533,9 @@ class Gateway:
             big = {**fmts.deep_copy(body), "model": plan.right_sized_from}
             try:
                 await self._permit_egress(provider, policy, len(json.dumps(big)), scope, record)
+                # The smaller model refused without usage. Replace its reservation
+                # with one priced for the requested model before the fallback.
+                self._reserve_call(key, record, big, provider)
                 retried = await self.upstream.send(provider, url, headers, big)
             except (Denied, UpstreamError):
                 retried = None
@@ -2340,6 +2554,7 @@ class Gateway:
             # The provider's own error, as the provider sent it: SDK retry and error
             # handling keep working.
             record.status, record.outcome, record.reason = response.status_code, "error", "provider_error"
+            self._charge(key, record)
             self._record(record)
             return Response(content=response.content, status_code=response.status_code,
                             media_type=response.headers.get("content-type", "application/json"),
@@ -2563,8 +2778,39 @@ class Gateway:
                 record.output_decision = "BLOCK"
                 record.rule_ids.append("output_contract.invalid")
 
+    async def _send_extra(self, provider, url, headers, body, key, record):
+        """Reserve and settle an auxiliary provider call before its ledger entry is
+        added. Optional optimisation calls cannot spend capacity already reserved
+        by another caller, including across replicas."""
+        if key is None or key.instance_key or not (key.limits.tokens_per_day or key.limits.spend_usd_per_day):
+            return await self.upstream.send(provider, url, headers, body)
+        ticket = CallRecord(request_id=record.request_id, key_id=key.id, member=key.member,
+                            tenant_id=key.tenant_id, app_id=key.app_id, agent_id=key.agent_id,
+                            api=record.api, model=body.get("model") or record.model)
+        self._reserve_call(key, ticket, body, provider)
+        try:
+            response = await self.upstream.send(provider, url, headers, body)
+            if response.status_code == 200:
+                try:
+                    payload = fmts.parse_response(response.content)
+                    fmt = fmts.FORMATS[record.api]
+                    if isinstance(payload, dict):
+                        ticket.response_model = payload.get("model") if isinstance(payload.get("model"), str) else None
+                        self._apply_usage(ticket, fmt.usage(payload))
+                        self.estimate_missing_usage(ticket, sum(len(p.text) for p in fmt.output_parts(payload)))
+                    else:
+                        self.estimate_missing_usage(ticket, 0)
+                except (ValueError, TypeError, RecursionError):
+                    self.estimate_missing_usage(ticket, 0)
+            return response
+        except BaseException:
+            self.estimate_missing_usage(ticket, 0)
+            raise
+        finally:
+            self._charge(key, ticket)
+
     def _extra_call(self, plan, record: CallRecord, owner: str, model: Optional[str], usage: fmts.Usage,
-                    estimated: bool = False) -> None:
+                    estimated: bool = False, charged: bool = False) -> None:
         """An extra call the provider billed (a retry, an escalation, a vote): its usage is
         added to the call's, and its cost is the owning technique's negative saving."""
         served = model or record.model
@@ -2574,7 +2820,7 @@ class Gateway:
         plan.extra_calls.append((served, usage, cost))
         # Charged to the key's day now: it was billed whatever happens to the call after.
         tokens = (usage.input_tokens or 0) + (usage.output_tokens or 0)
-        if plan.key is not None:
+        if plan.key is not None and not charged:
             self._charge_usage(plan.key, tokens, cost or 0.0)
         plan.extra_tokens += tokens
         plan.extra_cost += cost or 0.0
@@ -2605,11 +2851,14 @@ class Gateway:
         t0 = time.perf_counter()
         estimate = fmts.Usage(estimate_tokens(len(raw)), 0)
         try:
-            response = await self.upstream.send(provider, url, headers, retry)
+            response = await self._send_extra(provider, url, headers, retry, plan.key, record)
+        except Denied:
+            record.note("retry_refused")
+            return None
         except UpstreamError as exc:
             record.note("retry_failed")
             if exc.status == 504:              # timed out: the provider may have billed it
-                self._extra_call(plan, record, owner, model, estimate, estimated=True)
+                self._extra_call(plan, record, owner, model, estimate, estimated=True, charged=True)
             return None
         expected = "content" if fmt is fmts.AnthropicMessages else "choices"
         try:
@@ -2619,11 +2868,11 @@ class Gateway:
         if not isinstance(again, dict) or not isinstance(again.get(expected), list):
             record.note("retry_failed")
             if response.status_code == 200:    # answered, but unreadable: billed all the same
-                self._extra_call(plan, record, owner, model, estimate, estimated=True)
+                self._extra_call(plan, record, owner, model, estimate, estimated=True, charged=True)
             return None
         usage = fmt.usage(again)
         served = again.get("model") if isinstance(again.get("model"), str) else (model or record.model)
-        self._extra_call(plan, record, owner, served, usage)
+        self._extra_call(plan, record, owner, served, usage, charged=True)
         effect = plan.effect(owner)
         effect.latency_ms = (effect.latency_ms or 0) + int((time.perf_counter() - t0) * 1000)
         record.note("escalated" if model else "asked_again")

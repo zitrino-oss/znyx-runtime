@@ -181,6 +181,8 @@ def whole_response_checks(policy: Dict[str, Any]) -> List[str]:
         return value if isinstance(value, dict) and value.get("enabled") else None
 
     found: List[str] = []
+    if section("shared_defence"):
+        found.append("shared_defence")
     if str(policy.get("on_fail") or "").lower() == "filter_field" or any(
             isinstance(v, dict) and str(v.get("on_fail") or "").lower() == "filter_field"
             for v in policy.values()):

@@ -300,6 +300,31 @@ def test_control_agent_stop_during_approval_withholds_the_tool_call(client, cont
     assert resp.json()["choices"][0]["finish_reason"] == "content_filter"
 
 
+@pytest.mark.parametrize("change", ["revoke", "expire", "permissions", "key"])
+def test_identity_is_revalidated_after_a_model_tool_approval(client, controls, monkeypatch, change):
+    token = exchange(client, key="approvey").json()["access_token"]
+
+    async def ask(**_kw):
+        if change == "revoke":
+            assert client.gateway.delegations.revoke(token)
+        elif change == "expire":
+            import time
+            from znyx_runtime.gateway.identity import _STORE_PREFIX, _digest
+            entry = client.gateway.delegations.resolve(token)
+            entry["exp"] = time.time() - 1
+            client.gateway.delegations._store().set_value(_STORE_PREFIX + _digest(token), json.dumps(entry), 60)
+        elif change == "permissions":
+            controls(agents=[{"agent_id": "agent-approvey", "groups": {"support": ["delete_*"]}}])
+        else:
+            controls(live_keys=[])
+        return True, "approved"
+
+    monkeypatch.setattr(client.gateway.approvals, "ask", ask)
+    response = chat(client, token, content='TOOL:search:{"q":"x"}', tools=SEARCH)
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "content_filter"
+
+
 # -- F6: a token keeps acting for the person after the rules stop granting them anything ----------
 
 def test_token_refused_once_the_rules_grant_the_person_nothing(client, monkeypatch):

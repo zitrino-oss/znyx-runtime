@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 #
-# One product, two images:
+# One product, three image variants:
 #
 #   docker build --target znyx    -t znyx/znyx .       # rules-only, small
 #   docker build --target znyx-ml -t znyx/znyx:ml .    # plus the ML model server runtime
+#   docker build --target znyx-media -t znyx/znyx:media . # offline OCR/PDF/speech
 #
 #   docker run -p 8080:8080 znyx/znyx
 #
@@ -67,6 +68,27 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 FROM base AS znyx
 RUN --mount=type=bind,from=wheels,source=/wheels,target=/wheels \
     pip install --no-cache-dir /wheels/*.whl
+USER appuser
+CMD ["znyx", "serve"]
+
+# -- znyx-media: rules plus offline OCR/PDF/speech service ---------------------------
+FROM znyx AS znyx-media
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,from=wheels,source=/wheels,target=/wheels \
+    pip install --no-cache-dir "$(ls /wheels/znyx_inference-*.whl)[media]"
+COPY <<EOF /app/znyx-defaults.yaml
+version: 1
+server:
+  host: 0.0.0.0
+  port: 8080
+policy: /app/config/policies.yaml
+ml:
+  enabled: true
+  artifacts_dir: /models
+EOF
+ENV ZNYX_SPEECH_MODEL_PATH=/models/speech
 USER appuser
 CMD ["znyx", "serve"]
 
