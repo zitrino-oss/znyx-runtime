@@ -298,8 +298,8 @@ async def _mcp(request: Request, sse: bool):
         return Response(status_code=202)
     headers = {}
     if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
-                  "serverInfo": {"name": "fake-crm", "version": "1"}}
+        result = mcp_results.get("initialize") or {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                                                   "serverInfo": {"name": "fake-crm", "version": "1"}}
         headers["mcp-session-id"] = "upstream-session-1"
     elif method == "tools/list":
         result = {"tools": [dict(t) for t in MCP_TOOLS]}

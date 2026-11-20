@@ -24,11 +24,23 @@ from znyx_core.core.risk import calculate_risk_score
 from znyx_core.detectors._injection_patterns import scan_injection, scan_patterns
 from znyx_core.detectors.exfiltration import ExfiltrationDetector
 
-# Tool descriptions that try to manipulate the agent's tool-selection behaviour.
+# Tool descriptions that try to steer the agent: which tools it picks, what it reads, what it hides.
 _DESC_MANIPULATION_PATTERNS = [
     (r'\balways\s+(?:call|use|prefer|invoke|select)\s+this\s+(?:tool|function)\b', Severity.HIGH, "description_self_promotion"),
     (r'\b(?:ignore|do\s+not\s+use|avoid|never\s+use)\s+(?:the\s+)?other\s+(?:tools?|functions?)\b', Severity.HIGH, "description_competitor_suppression"),
     (r'\buse\s+this\s+(?:tool\s+)?for\s+(?:everything|all\s+(?:requests?|queries|tasks?))\b', Severity.MEDIUM, "description_overuse_directive"),
+    # A credential file named in a description: the classic way to have the agent read it and
+    # pass it to the tool as an argument.
+    (r'(?:~|\$HOME|%USERPROFILE%)[\\/]\.(?:ssh|aws|gnupg|kube|docker)\b|\bid_(?:rsa|dsa|ecdsa|ed25519)\b|'
+     r'/etc/(?:passwd|shadow|sudoers)\b|\.(?:git-credentials|netrc|npmrc|pypirc)\b|\baws[\\/]credentials\b',
+     Severity.HIGH, "description_sensitive_file"),
+    # Told to keep what it does from the person it works for.
+    (r'\b(?:do\s+not|don\'?t|never)\s+(?:tell|inform)\s+the\s+(?:user|person|human)\b|'
+     r'\b(?:do\s+not|don\'?t|never)\s+(?:tell|mention|reveal|show|disclose|say)\b[^.\n]{0,40}?'
+     r'\b(?:to|from)\s+the\s+(?:user|person|human)\b|'
+     r'\bwithout\s+(?:telling|informing)\s+the\s+(?:user|person|human)\b|'
+     r'\bkeep\s+(?:this|it)\s+(?:secret|hidden)\s+from\s+the\s+(?:user|person|human)\b',
+     Severity.HIGH, "description_concealment"),
 ]
 _COMPILED_DESC = [(re.compile(p, re.IGNORECASE), s, n) for p, s, n in _DESC_MANIPULATION_PATTERNS]
 

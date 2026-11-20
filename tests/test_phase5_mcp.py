@@ -55,6 +55,9 @@ tenants:
           tools: ["send_*"]
           share: metadata
           timeout_seconds: 10
+      app-masker:
+        secrets:
+          enabled: false
 """
 
 INSTANCE_KEY = "zx_phase5_mcp_instance"  # gitleaks:allow (test value)
@@ -66,7 +69,7 @@ def _sha(value):
 
 
 KEYS = {name: f"zxg_mcp_{name}" for name in ("plain", "other", "approver", "limited", "sampler", "quiet", "own",
-                                             "batcher")}
+                                             "batcher", "masker")}
 
 
 def _key_entry(name):
@@ -192,7 +195,7 @@ def start(client, server="crm", key="plain", capabilities=None):
     resp = rpc(client, server, "initialize", {"protocolVersion": "2025-06-18",
                                               "capabilities": capabilities or {"elicitation": {}},
                                               "clientInfo": {"name": "agent", "version": "1"}}, key=key)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 200 and "result" in resp.json(), resp.text      # the server's answer, not withheld
     return resp.headers["mcp-session-id"]
 
 

@@ -34,7 +34,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
@@ -217,6 +217,15 @@ class Denied(Exception):
         super().__init__(message)
         self.status, self.message, self.code, self.outcome = status, message, code, outcome
         self.error_type, self.retry_after = error_type, retry_after
+
+
+# Rules that find a credential. A policy keeps one from leaving by redacting it, but the
+# arguments of a tool call are sent as they are, so there a credential blocks instead.
+_CREDENTIAL_RULES = ("secrets.", "pii.api_key", "pii.password")
+
+
+def credential_rules(rule_ids: Iterable[str]) -> List[str]:
+    return [r for r in rule_ids if r.startswith(_CREDENTIAL_RULES)]
 
 
 @dataclass
@@ -1239,13 +1248,19 @@ class Gateway:
                     args = {"raw": text}
             content_block = None
             if kind == "tool_call" and text:
-                # What the call would send (a secret, say) under the policy's content checks; only
-                # a block counts: a tool needs the values it is given, so nothing is redacted.
+                # What the call would send (a secret, say) under the policy's content checks; a
+                # tool needs the values it is given, so nothing is redacted: a block counts, and
+                # so does a credential the policy would redact (it would go unredacted).
                 content_req = self._request(scope, record, label + "c", text, role, None)
                 content = await self.evaluator.evaluate(content_req, context="output", policy=policy,
                                                         judge_ctx=runtime_judge_ctx(policy, content_req))
                 if content.decision.value == "BLOCK":
                     content_block = _Verdict.of(content)
+                elif content.decision.value in ("REDACT", "TRANSFORM"):
+                    credentials = credential_rules(h.rule_id for h in content.rule_hits)
+                    if credentials:
+                        content_block = _Verdict("BLOCK", credentials, hits=len(credentials),
+                                                 user_message="This tool call would send a credential")
             tool_req = ToolEvaluationRequest(
                 request_id=f"{record.request_id}-{label}", tenant_id=scope["tenant_id"],
                 app_id=scope["app_id"], agent_id=scope["agent_id"], env=scope["env"],

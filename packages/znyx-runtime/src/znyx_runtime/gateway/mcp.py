@@ -69,6 +69,11 @@ MAX_BLOB_CHECK = 1024 * 1024
 _TEXT_MIME = re.compile(r"^(text/|application/(json|xml|yaml|x-yaml|javascript)\b)")
 _PROTOCOL = re.compile(r"\d{4}-\d{2}-\d{2}")
 _EVENT_ID = re.compile(r"[\x21-\x7e]{1,200}")
+# Protocol fields holding a date or a timestamp (the protocol version, a resource's lastModified,
+# a task's times). When they are exactly that, they are not text anyone wrote: checked as text,
+# a date-of-birth rule would withhold every initialize answer.
+_DATE_FIELDS = frozenset({"protocolVersion", "version", "lastModified", "createdAt", "lastUpdatedAt"})
+_DATE_VALUE = re.compile(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
 
 # Requests forwarded as they are (they carry no data of the agent's own beyond small params).
 _FORWARDED = frozenset({"ping", "resources/list", "resources/templates/list", "resources/subscribe",
@@ -164,7 +169,7 @@ async def _sse_messages(response) -> AsyncIterator[Dict[str, Any]]:
 class McpGateway:
     def __init__(self, gateway) -> None:
         self.gw = gateway
-        self._defs: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+        self._defs: Dict[str, Tuple[float, Dict[str, Dict[str, Any]], str]] = {}
         self._pins_memo: Optional[tuple] = None
 
     # -- entry point ----------------------------------------------------------------
@@ -418,9 +423,10 @@ class McpGateway:
 
     async def _outgoing_blocked(self, ctx, record, value: Any, label: str) -> Optional[str]:
         """Data going to the server, checked for content the policy blocks (secrets, say).
-        Redactions are not applied: a tool needs the values it is given. Returns why when
+        Redactions are not applied: a tool needs the values it is given. A credential the
+        policy would redact blocks instead, since it would go unredacted. Returns why when
         blocked."""
-        from znyx_runtime.gateway.pipeline import quiet_policy
+        from znyx_runtime.gateway.pipeline import credential_rules, quiet_policy
         if value in (None, {}, [], ""):
             return None
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
@@ -429,6 +435,8 @@ class McpGateway:
         record.rule_ids.extend(verdict.rule_ids)
         if verdict.decision == "BLOCK":
             return verdict.user_message or "the data would send content the policy blocks"
+        if verdict.wants_change and credential_rules(verdict.rule_ids):
+            return "the data would send a credential"
         return None
 
     async def _keep_relayed(self, ctx, record, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -563,19 +571,21 @@ class McpGateway:
     async def _checked_data(self, ctx, record, answer: Dict[str, Any], label: str) -> Dict[str, Any]:
         """Guard text in protocol results (lists, completions, initialize, task metadata).
         Identifiers and schemas cannot safely be rewritten: any required change withholds
-        the result. Text content with an editable schema uses _checked_items instead."""
+        the result. Text content with an editable schema uses _checked_items instead.
+        Protocol dates (``_DATE_FIELDS``) are not text and are left out."""
         if "error" in answer:
             return await self._checked_error(ctx, record, answer, label)
         texts: List[str] = []
-        pending = [answer.get("result")]
+        pending: List[Tuple[Optional[str], Any]] = [(None, answer.get("result"))]
         while pending:
-            value = pending.pop()
+            field, value = pending.pop()
             if isinstance(value, str):
-                texts.append(value)
+                if not (field in _DATE_FIELDS and _DATE_VALUE.fullmatch(value)):
+                    texts.append(value)
             elif isinstance(value, dict):
-                pending.extend(reversed(list(value.values())))
+                pending.extend(reversed(list(value.items())))
             elif isinstance(value, list):
-                pending.extend(reversed(value))
+                pending.extend((field, item) for item in reversed(value))
         for text in texts + (["".join(texts)] if len(texts) > 1 else []):
             verdict = await self._check(ctx, record, text, label)
             if (verdict.decision == "BLOCK" or verdict.wants_change
@@ -816,11 +826,12 @@ class McpGateway:
         if not isinstance(name, str) or not name or len(name) > 200 or not self._allowed(ctx, name):
             return False
         state, digest = self._pin_state(ctx, tool)
+        # Scanned changed or not: the findings on a changed tool are what its reviewer reads.
+        result = scanner.detect({"tools": [tool]})
+        record.rule_ids.extend(h.rule_id for h in result.rule_hits)
         if state == "changed":
             changed.append(f"{name}@{digest}")
             return False
-        result = scanner.detect({"tools": [tool]})
-        record.rule_ids.extend(h.rule_id for h in result.rule_hits)
         return result.decision.value != "BLOCK"
 
     async def _tools_list(self, request: Request, ctx, record, body: Dict[str, Any]) -> Response:
@@ -848,17 +859,31 @@ class McpGateway:
                                      if isinstance(t.get("name"), str) and self._allowed(ctx, t["name"])][:50]
         return self._reply(request, record, answer, relay)
 
+    def _defs_key(self, ctx) -> str:
+        server = ctx["server"]
+        material = json.dumps([server.member or "-", server.name])
+        return "pin:gw:mcp-defs:" + hashlib.sha256(material.encode("utf-8", "surrogatepass")).hexdigest()
+
     def _remember(self, ctx, tools: List[Dict[str, Any]], replace: bool) -> None:
+        from znyx_core.state_store import get_state_store
         key = f"{ctx['server'].member}/{ctx['server'].name}"
         known = {} if replace or key not in self._defs else dict(self._defs[key][1])
         known.update({str(t.get("name")): t for t in tools if t.get("name")})
-        self._defs[key] = (time.monotonic(), dict(list(known.items())[:MAX_TOOLS_PER_LIST * MAX_LIST_PAGES]))
+        known = dict(list(known.items())[:MAX_TOOLS_PER_LIST * MAX_LIST_PAGES])
+        version = hashlib.sha256(json.dumps(sorted((n, tool_hash(t)) for n, t in known.items())).encode()).hexdigest()
+        self._defs[key] = (time.monotonic(), known, version)
+        # Which list every worker saw last: a worker holding another one asks the server again.
+        get_state_store().set_value(self._defs_key(ctx), version, DEFS_TTL)
 
     async def _definition(self, request: Request, ctx, name: str) -> Optional[Dict[str, Any]]:
-        """The tool's current definition: from the last list, else asked of the server."""
+        """The tool's current definition: from the last list, else asked of the server. This
+        process's copy of the list counts only while it is the one every worker saw last, so a
+        change another worker found (a held tool, say) is never called on an older copy."""
+        from znyx_core.state_store import get_state_store
         key = f"{ctx['server'].member}/{ctx['server'].name}"
         cached = self._defs.get(key)
-        if cached is not None and time.monotonic() - cached[0] < DEFS_TTL and name in cached[1]:
+        if (cached is not None and time.monotonic() - cached[0] < DEFS_TTL and name in cached[1]
+                and get_state_store().get_value(self._defs_key(ctx)) == cached[2]):
             return cached[1][name]
         cursor, found = None, []
         for _page in range(MAX_LIST_PAGES):
