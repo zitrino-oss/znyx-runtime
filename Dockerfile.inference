@@ -10,8 +10,14 @@ RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 # with CUDA) — the export pipeline never uses GPU.
 COPY packages/znyx-core /app/packages/znyx-core
 COPY packages/znyx-inference /app/packages/znyx-inference
+#
+# pip is uninstalled afterwards: the sidecar never needs pip at runtime (model download +
+# export go through huggingface-hub / optimum, not pip), and pip ships its own vendored
+# copies of urllib3, msgpack, etc. (plus a bom.cdx.json SBOM that Trivy ingests) which lag
+# behind upstream fixes and fail image scans even though nothing in our code imports them.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir ./packages/znyx-core "./packages/znyx-inference[onnx,export]"
+    pip install --no-cache-dir ./packages/znyx-core "./packages/znyx-inference[onnx,export]" && \
+    pip uninstall -y pip
 
 # Non-root. /models holds the sha256-verified weights. It must be a WRITABLE mount: the
 # sidecar provisions models itself from the control plane (see pin_sync.py), so this is no
